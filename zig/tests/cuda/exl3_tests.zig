@@ -24,10 +24,10 @@ const f64_cfgs = [_]Cfg{
 };
 
 /// One check's outcome: a failure prints its FAIL line (TestFailed ones already printed theirs) and fails the run.
-const Run = struct {
+pub const Run = struct {
     failed: bool = false,
 
-    fn fail(self: *Run, e: anyerror, id: []const u8) void {
+    pub fn fail(self: *Run, e: anyerror, id: []const u8) void {
         if (e != error.TestFailed) std.debug.print("FAIL {s}: {t}\n", .{ id, e });
         self.failed = true;
     }
@@ -80,12 +80,13 @@ pub fn run(gpu: Gpu, dir: []const u8) !void {
     pythonChecks(&r, &lin, dir, &state) catch |e| {
         state.fail(e, "exl3.linear.python");
     };
+    try @import("exl3_dense_tests.zig").run(&r, &state, dir);
     if (state.failed) return error.TestFailed;
     try bench(&r, &lin);
 }
 
 /// A zeroed device buffer (counters must read zero, unlike zeros()'s 0xff canaries).
-fn zeroed(r: *Rig, bytes: usize) !u64 {
+pub fn zeroed(r: *Rig, bytes: usize) !u64 {
     const b = try cuda.DeviceBuffer.alloc(r.gpu.d, @max(bytes, 16));
     try r.bufs.append(r.gpu.gpa, b);
     try b.fill8(0, r.s.handle);
@@ -182,7 +183,7 @@ fn reference(r: *Rig, width: exl3fmt.Width, cb: exl3fmt.Codebook, trellis: []con
 }
 
 /// bf16 outputs within the f64 reference's tolerance, with the exact FAIL line.
-fn closeOut(r: *Rig, id: []const u8, ptr: u64, len: usize, want: []const f64, tol: []const f64) !void {
+pub fn closeOut(r: *Rig, id: []const u8, ptr: u64, len: usize, want: []const f64, tol: []const f64) !void {
     const raw = try r.back(ptr, len * 2);
     var most: f64 = 0;
     var at: usize = 0;
@@ -331,7 +332,7 @@ fn pythonLinear(r: *Rig, lin: *const exl3.Linear, dir: []const u8, o: std.json.O
     }
 }
 
-fn readFile(r: *Rig, dir: []const u8, name: []const u8) ![]u8 {
+pub fn readFile(r: *Rig, dir: []const u8, name: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(r.gpu.io, try std.fs.path.join(r.a, &.{ dir, name }), r.a, .limited(1 << 30));
 }
 
