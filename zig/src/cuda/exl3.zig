@@ -5,7 +5,7 @@ const module = @import("module.zig");
 const launch_ = @import("launch.zig");
 const stream_ = @import("stream.zig");
 const kernels = @import("kernels.zig");
-
+const memory = @import("memory.zig");
 const Driver = driver.Driver;
 const Module = module.Module;
 const Function = module.Function;
@@ -177,6 +177,73 @@ pub const Linear = struct {
             .block = .{ .x = @intCast(p.wk * 32), .y = 1, .z = 1 },
             .shared = sharedBytes(w, m),
         }, s, &args);
+    }
+
+    /// y [m, n] = x [m, k] for any row count: 128-row blocks of `matmul` (the Python engine's exl3_mm), one
+    /// plan per layer, so a row's bits never depend on where its chunk starts or how long it is.
+    pub fn prompt(l: *const Linear, s: Stream, w: Weight, x: u64, x_dtype: DType, m: usize, y: u64, y_dtype: DType, xh: u64, z: u64, counters: u64) !void {
+        const xe: u64 = if (x_dtype == .f32) 4 else 2;
+        const ye: u64 = if (y_dtype == .f32) 4 else 2;
+        var r: usize = 0;
+        while (r < m) : (r += 128) {
+            const rows = @min(m - r, 128);
+            try l.matmul(s, w, x + @as(u64, r) * w.k * xe, x_dtype, rows, y + @as(u64, r) * w.n * ye, y_dtype, xh, z, counters);
+        }
+    }
+};
+
+/// The loaded kernels plus the scratch one stream's dense calls share: prompt rows run in 128-row blocks
+/// (forward.py's exl3_mm), decode rows go through the same row-invariant kernel.
+pub const Dense = struct {
+    d: *const Driver,
+    lin: Linear,
+    xh: ?memory.DeviceBuffer = null, // the rotated inputs, 128 rows of the widest layer at most
+    z: ?memory.DeviceBuffer = null, // the split partials, 128 rows at most
+    counters: ?memory.DeviceBuffer = null, // per pass and block, zeroed before every call
+
+    pub fn load(d: *const Driver) !Dense {
+        return .{ .d = d, .lin = try Linear.load(d) };
+    }
+
+    pub fn unload(de: *Dense) void {
+        de.lin.unload();
+        const slots = [_]*?memory.DeviceBuffer{ &de.xh, &de.z, &de.counters };
+        for (slots) |slot| {
+            if (slot.* != null) slot.*.?.free();
+            slot.* = null;
+        }
+    }
+
+    /// A scratch buffer's address, grown when a layer needs more than it holds.
+    fn scratch(de: *Dense, slot: *?memory.DeviceBuffer, bytes: usize) !u64 {
+        if (slot.* != null and slot.*.?.len >= bytes) return slot.*.?.ptr;
+        if (slot.* != null) slot.*.?.free();
+        slot.* = try memory.DeviceBuffer.alloc(de.d, bytes);
+        return slot.*.?.ptr;
+    }
+
+    /// Decode rows: one call (the kernel takes 1..128), any count above in 128-row blocks.
+    pub fn decode(de: *Dense, s: Stream, w: Weight, x: u64, x_dtype: DType, rows: usize, y: u64, y_dtype: DType) !void {
+        return de.blocks(s, w, x, x_dtype, rows, y, y_dtype);
+    }
+
+    /// Prompt rows: 128-row blocks of `matmul`, so a row's bits never depend on where its chunk starts.
+    pub fn prompt(de: *Dense, s: Stream, w: Weight, x: u64, x_dtype: DType, rows: usize, y: u64, y_dtype: DType) !void {
+        return de.blocks(s, w, x, x_dtype, rows, y, y_dtype);
+    }
+    fn blocks(de: *Dense, s: Stream, w: Weight, x: u64, x_dtype: DType, rows: usize, y: u64, y_dtype: DType) !void {
+        const p = plan(w.k, w.n, 192, 8);
+        const z: u64 = if (p.sk > 1) try de.scratch(&de.z, Linear.zBytes(w, 128)) else 0;
+        const counters = try de.scratch(&de.counters, Linear.counterBytes(w));
+        const xe: u64 = if (x_dtype == .f32) 4 else 2;
+        const ye: u64 = if (y_dtype == .f32) 4 else 2;
+        var r: usize = 0;
+        while (r < rows) : (r += 128) {
+            const m = @min(rows - r, 128);
+            const xh = try de.scratch(&de.xh, m * w.k * 2);
+            try de.counters.?.fill8(0, s.handle);
+            try de.lin.matmul(s, w, x + @as(u64, r) * w.k * xe, x_dtype, m, y + @as(u64, r) * w.n * ye, y_dtype, xh, z, counters);
+        }
     }
 };
 
