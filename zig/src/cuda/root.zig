@@ -33,6 +33,7 @@ pub const qlinear = @import("qlinear.zig");
 pub const experts = @import("experts.zig");
 pub const modelopt = @import("modelopt.zig");
 pub const exl3 = @import("exl3.zig");
+pub const exl3_experts = @import("exl3_experts.zig");
 
 test {
     _ = @import("memory.zig");
@@ -48,5 +49,6 @@ test {
     _ = carveout;
     _ = @import("nvfp4.zig");
     _ = exl3;
+    _ = exl3_experts;
     _ = @import("modelopt.zig");
 }
