@@ -81,6 +81,7 @@ pub fn run(gpu: Gpu, dir: []const u8) !void {
         state.fail(e, "exl3.linear.python");
     };
     try @import("exl3_dense_tests.zig").run(&r, &state, dir);
+    try @import("exl3_experts_tests.zig").run(&r, &state, dir);
     if (state.failed) return error.TestFailed;
     try bench(&r, &lin);
 }

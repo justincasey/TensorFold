@@ -18,8 +18,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# the dense fixture: siblings in this folder, which leads sys.path when the script runs
+# the dense and experts fixtures: siblings in this folder, which leads sys.path when the script runs
 import exl3_oracle_dense
+import exl3_oracle_experts
 
 ROWS = (1, 3, 16)
 SEED = 1234
@@ -115,7 +116,8 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     linears = [one(out, model_dir, t, marker) for t, marker in pick(model_dir)]
     dense = exl3_oracle_dense.write(out, model_dir)
-    manifest = {"version": 1, "linears": linears, "dense": dense, "model": str(model_dir)}
+    experts = exl3_oracle_experts.write(out, model_dir)
+    manifest = {"version": 1, "linears": linears, "dense": dense, "experts": experts, "model": str(model_dir)}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     print(f"{len(linears)} linears -> {out / 'manifest.json'}")
     return 0
