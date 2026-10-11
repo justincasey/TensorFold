@@ -259,22 +259,16 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
         tf_exl3::linear_body<K2, CB, WK>(a);                                             \
     }
 
-TF_EXL3_LINEAR(8, 2, 4)
-TF_EXL3_LINEAR(8, 2, 8)
-TF_EXL3_LINEAR(9, 2, 4)
-TF_EXL3_LINEAR(9, 2, 8)
-TF_EXL3_LINEAR(10, 2, 4)
-TF_EXL3_LINEAR(10, 2, 8)
-TF_EXL3_LINEAR(11, 2, 4)
-TF_EXL3_LINEAR(11, 2, 8)
-TF_EXL3_LINEAR(12, 2, 4)
-TF_EXL3_LINEAR(12, 2, 8)
-TF_EXL3_LINEAR(14, 2, 4)
-TF_EXL3_LINEAR(14, 2, 8)
-TF_EXL3_LINEAR(16, 2, 4)
-TF_EXL3_LINEAR(16, 2, 8)
-TF_EXL3_LINEAR(8, 1, 4)
-TF_EXL3_LINEAR(8, 1, 8)
-TF_EXL3_LINEAR(8, 0, 4)
-TF_EXL3_LINEAR(8, 0, 8)
+// Every width the format serves (linear.cu TF_EXL3_ALL plus 4.5-6.5): whole bits, all codebooks; 7.5 is not a width.
+#define TF_EXL3_WIDTHS(K2, CB) TF_EXL3_LINEAR(K2, CB, 4) TF_EXL3_LINEAR(K2, CB, 8)
+#define TF_EXL3_CODEBOOK(CB)                                                                                \
+    TF_EXL3_WIDTHS(2, CB) TF_EXL3_WIDTHS(4, CB) TF_EXL3_WIDTHS(6, CB) TF_EXL3_WIDTHS(8, CB)                 \
+    TF_EXL3_WIDTHS(10, CB) TF_EXL3_WIDTHS(12, CB) TF_EXL3_WIDTHS(14, CB) TF_EXL3_WIDTHS(16, CB)
+TF_EXL3_CODEBOOK(2) // mul1
+TF_EXL3_WIDTHS(3, 2) TF_EXL3_WIDTHS(5, 2) TF_EXL3_WIDTHS(7, 2) TF_EXL3_WIDTHS(9, 2)
+TF_EXL3_WIDTHS(11, 2) TF_EXL3_WIDTHS(13, 2)
+TF_EXL3_CODEBOOK(1) // mcg
+TF_EXL3_CODEBOOK(0) // inst3
+#undef TF_EXL3_CODEBOOK
+#undef TF_EXL3_WIDTHS
 }  // namespace tf_exl3

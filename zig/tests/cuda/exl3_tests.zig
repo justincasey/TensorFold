@@ -15,12 +15,36 @@ const Cfg = struct { id: []const u8, halves: u32, codebook: exl3fmt.Codebook, k:
 
 const f64_cfgs = [_]Cfg{
     .{ .id = "exl3.linear.f64.mul1.4", .halves = 8, .codebook = .mul1, .k = 4096, .n = 1024 },
+    .{ .id = "exl3.linear.f64.mul1.4", .halves = 2, .codebook = .mul1, .k = 512, .n = 512 }, // 1 bit
+    .{ .id = "exl3.linear.f64.mul1.4", .halves = 4, .codebook = .mul1, .k = 512, .n = 512 }, // 2 bits
     .{ .id = "exl3.linear.f64.mul1.5", .halves = 10, .codebook = .mul1, .k = 1024, .n = 4096 },
+    .{ .id = "exl3.linear.f64.mul1.5", .halves = 6, .codebook = .mul1, .k = 512, .n = 512 }, // 3 bits
     .{ .id = "exl3.linear.f64.mul1.6", .halves = 12, .codebook = .mul1, .k = 2048, .n = 8192 }, // 8 warps a block
     .{ .id = "exl3.linear.f64.mul1.7", .halves = 14, .codebook = .mul1, .k = 512, .n = 1024 },
     .{ .id = "exl3.linear.f64.mul1.8", .halves = 16, .codebook = .mul1, .k = 2048, .n = 4096 },
     .{ .id = "exl3.linear.f64.mcg", .halves = 8, .codebook = .mcg, .k = 1024, .n = 512 },
+    .{ .id = "exl3.linear.f64.mcg", .halves = 2, .codebook = .mcg, .k = 512, .n = 512 },
+    .{ .id = "exl3.linear.f64.mcg", .halves = 4, .codebook = .mcg, .k = 512, .n = 512 },
+    .{ .id = "exl3.linear.f64.mcg", .halves = 6, .codebook = .mcg, .k = 512, .n = 512 },
+    .{ .id = "exl3.linear.f64.mcg", .halves = 10, .codebook = .mcg, .k = 512, .n = 512 },
+    .{ .id = "exl3.linear.f64.mcg", .halves = 12, .codebook = .mcg, .k = 512, .n = 512 },
+    .{ .id = "exl3.linear.f64.mcg", .halves = 14, .codebook = .mcg, .k = 512, .n = 512 },
+    .{ .id = "exl3.linear.f64.mcg", .halves = 16, .codebook = .mcg, .k = 512, .n = 512 },
     .{ .id = "exl3.linear.f64.inst3", .halves = 8, .codebook = .inst3, .k = 1024, .n = 1024 },
+    .{ .id = "exl3.linear.f64.inst3", .halves = 2, .codebook = .inst3, .k = 512, .n = 512 },
+    .{ .id = "exl3.linear.f64.inst3", .halves = 4, .codebook = .inst3, .k = 512, .n = 512 },
+    .{ .id = "exl3.linear.f64.inst3", .halves = 6, .codebook = .inst3, .k = 512, .n = 512 },
+    .{ .id = "exl3.linear.f64.inst3", .halves = 10, .codebook = .inst3, .k = 512, .n = 512 },
+    .{ .id = "exl3.linear.f64.inst3", .halves = 12, .codebook = .inst3, .k = 512, .n = 512 },
+    .{ .id = "exl3.linear.f64.inst3", .halves = 14, .codebook = .inst3, .k = 512, .n = 512 },
+    .{ .id = "exl3.linear.f64.inst3", .halves = 16, .codebook = .inst3, .k = 512, .n = 512 },
+    // the mul1 half steps, 1.5 to 6.5 bits, under one check
+    .{ .id = "exl3.linear.f64.halfstep", .halves = 3, .codebook = .mul1, .k = 512, .n = 512 },
+    .{ .id = "exl3.linear.f64.halfstep", .halves = 5, .codebook = .mul1, .k = 512, .n = 512 },
+    .{ .id = "exl3.linear.f64.halfstep", .halves = 7, .codebook = .mul1, .k = 512, .n = 512 },
+    .{ .id = "exl3.linear.f64.halfstep", .halves = 9, .codebook = .mul1, .k = 1024, .n = 1024 },
+    .{ .id = "exl3.linear.f64.halfstep", .halves = 11, .codebook = .mul1, .k = 2048, .n = 1024 },
+    .{ .id = "exl3.linear.f64.halfstep", .halves = 13, .codebook = .mul1, .k = 512, .n = 512 },
 };
 
 /// One check's outcome: a failure prints its FAIL line (TestFailed ones already printed theirs) and fails the run.
@@ -48,34 +72,31 @@ pub fn run(gpu: Gpu, dir: []const u8) !void {
     defer lin.unload();
 
     var state = Run{};
+    var last: ?[]const u8 = null;
+    var ok = true;
     for (f64_cfgs) |c| {
-        var ok = true;
+        if (last) |prev| {
+            if (!std.mem.eql(u8, prev, c.id)) {
+                if (ok) check.pass("{s}", .{prev});
+                ok = true;
+            }
+        }
         f64Linear(&r, &lin, c) catch |e| {
             state.fail(e, c.id);
             ok = false;
         };
-        if (ok) check.pass("{s}", .{c.id});
+        last = c.id;
     }
-    // the mul1 half steps, 4.5 and 5.5 bits, under one check
-    {
-        var ok = true;
-        f64Linear(&r, &lin, .{ .id = "exl3.linear.f64.halfstep", .halves = 9, .codebook = .mul1, .k = 1024, .n = 1024 }) catch |e| {
-            state.fail(e, "exl3.linear.f64.halfstep");
-            ok = false;
-        };
-        f64Linear(&r, &lin, .{ .id = "exl3.linear.f64.halfstep", .halves = 11, .codebook = .mul1, .k = 2048, .n = 1024 }) catch |e| {
-            state.fail(e, "exl3.linear.f64.halfstep");
-            ok = false;
-        };
-        if (ok) check.pass("exl3.linear.f64.halfstep", .{});
+    if (last) |prev| {
+        if (ok) check.pass("{s}", .{prev});
     }
     {
-        var ok = true;
+        var rows_ok = true;
         rowsInvariant(&r, &lin) catch |e| {
             state.fail(e, "exl3.linear.rows");
-            ok = false;
+            rows_ok = false;
         };
-        if (ok) check.pass("exl3.linear.rows", .{});
+        if (rows_ok) check.pass("exl3.linear.rows", .{});
     }
     pythonChecks(&r, &lin, dir, &state) catch |e| {
         state.fail(e, "exl3.linear.python");

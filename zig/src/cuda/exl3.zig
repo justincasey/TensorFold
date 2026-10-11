@@ -20,26 +20,28 @@ pub const Codebook = enum(u3) { inst3 = 0, mcg = 1, mul1 = 2 };
 /// One compiled kernel: 2 * bits halves, a codebook, and the warps one block runs.
 pub const Variant = struct { halves: u32, codebook: Codebook, warps: u32 };
 
-/// Every instantiation of exl3_linear.cu: mul1 for 4 to 8 bits and the 4.5/5.5 half steps, mcg and inst3 at 4 bits.
-pub const variants = [_]Variant{
-    .{ .halves = 8, .codebook = .mul1, .warps = 4 },
-    .{ .halves = 8, .codebook = .mul1, .warps = 8 },
-    .{ .halves = 10, .codebook = .mul1, .warps = 4 },
-    .{ .halves = 10, .codebook = .mul1, .warps = 8 },
-    .{ .halves = 12, .codebook = .mul1, .warps = 4 },
-    .{ .halves = 12, .codebook = .mul1, .warps = 8 },
-    .{ .halves = 14, .codebook = .mul1, .warps = 4 },
-    .{ .halves = 14, .codebook = .mul1, .warps = 8 },
-    .{ .halves = 16, .codebook = .mul1, .warps = 4 },
-    .{ .halves = 16, .codebook = .mul1, .warps = 8 },
-    .{ .halves = 9, .codebook = .mul1, .warps = 4 },
-    .{ .halves = 9, .codebook = .mul1, .warps = 8 },
-    .{ .halves = 11, .codebook = .mul1, .warps = 4 },
-    .{ .halves = 11, .codebook = .mul1, .warps = 8 },
-    .{ .halves = 8, .codebook = .mcg, .warps = 4 },
-    .{ .halves = 8, .codebook = .mcg, .warps = 8 },
-    .{ .halves = 8, .codebook = .inst3, .warps = 4 },
-    .{ .halves = 8, .codebook = .inst3, .warps = 8 },
+/// Every instantiation of exl3_linear.cu: every width (whole bits all codebooks, the mul1 half steps), 4 and 8 warps.
+pub const variants = blk: {
+    var vs: [60]Variant = undefined;
+    var i: usize = 0;
+    for (0..2) |w| {
+        const warps: u32 = if (w == 0) 4 else 8;
+        for ([_]u32{ 2, 1, 0 }) |cbi| {
+            const cb: Codebook = @fromBackingInt(@intCast(cbi));
+            var halves: u32 = 2;
+            while (halves <= 16) : (halves += 2) {
+                vs[i] = .{ .halves = halves, .codebook = cb, .warps = warps };
+                i += 1;
+            }
+            if (cb != .mul1) continue; // the half steps exist only with mul1
+            halves = 3;
+            while (halves <= 13) : (halves += 2) { // the mul1 half steps, 1.5 to 6.5 bits (format.py's BITS)
+                vs[i] = .{ .halves = halves, .codebook = cb, .warps = warps };
+                i += 1;
+            }
+        }
+    }
+    break :blk vs;
 };
 
 /// The kernel's extern "C" name for an instantiation (linear.cu's TF_EXL3_LINEAR macro).
@@ -134,12 +136,13 @@ pub const Linear = struct {
 
     /// y [m, n] = x [m, k] through the weight; `xh` is fp16 [m, k] scratch, `z` the split partials, `counters` zeroed.
     pub fn matmul(l: *const Linear, s: Stream, w: Weight, x: u64, x_dtype: DType, m: usize, y: u64, y_dtype: DType, xh: u64, z: u64, counters: u64) !void {
-        std.debug.assert(m >= 1 and m <= 128);
-        std.debug.assert(w.k % 16 == 0 and w.n % 128 == 0);
+        // Shapes the loader admits (linear.py's k % 128 and n % 128, 1..128 rows) are returned errors here too.
+        if (m < 1 or m > 128) return error.Exl3Shape;
+        if (w.k % 128 != 0 or w.n % 128 != 0) return error.Exl3Shape;
         const p = plan(w.k, w.n, 192, 8);
+        if ((w.k / 16) % (p.sk * p.wk) != 0) return error.Exl3Shape;
         const idx = variantIndex(w.halves, w.codebook, p.wk) orelse return error.UnsupportedExl3Width;
-        std.debug.assert((w.k / 16) % (p.sk * p.wk) == 0);
-        std.debug.assert(p.sk == 1 or z != 0);
+        if (p.sk > 1 and z == 0) return error.Exl3Scratch;
 
         var r: launch_.Args = .{};
         r.add(x);
@@ -247,8 +250,25 @@ test "the stored and strips strides of one layout" {
 
 test "every variant's symbol is its instantiation's name" {
     try std.testing.expectEqualStrings("tf_exl3_linear_8_2_4", symbol(8, .mul1, 4));
-    try std.testing.expectEqualStrings("tf_exl3_linear_11_2_8", symbol(11, .mul1, 8));
+    try std.testing.expectEqualStrings("tf_exl3_linear_7_2_8", symbol(7, .mul1, 8));
     try std.testing.expectEqualStrings("tf_exl3_linear_8_0_4", symbol(8, .inst3, 4));
-    try std.testing.expectEqual(@as(?usize, 4), variantIndex(12, .mul1, 4));
-    try std.testing.expectEqual(@as(?usize, null), variantIndex(6, .mul1, 4));
+    try std.testing.expectEqual(@as(?usize, 5), variantIndex(12, .mul1, 4));
+    try std.testing.expectEqual(@as(?usize, 2), variantIndex(6, .mul1, 4));
+    try std.testing.expectEqual(@as(?usize, null), variantIndex(3, .mcg, 4)); // the half steps are mul1's alone
+}
+
+test "matmul refuses shapes the loader would refuse, before any launch" {
+    const l: Linear = .{ .mod = undefined, .fns = undefined, .rot_in = undefined };
+    const s: Stream = undefined; // never reached: the refusal comes first
+    const st = strides(4096, 1024, 8, false);
+    const w: Weight = .{ .trellis = 0, .suh = 0, .svh = 0, .bias = 0, .k = 4096, .n = 1024, .halves = 8, .codebook = .mul1, .stride_k = st.k, .stride_nb = st.nb };
+    try std.testing.expectError(error.Exl3Shape, l.matmul(s, w, 0, .bf16, 0, 0, .bf16, 0, 0, 0));
+    try std.testing.expectError(error.Exl3Shape, l.matmul(s, w, 0, .bf16, 129, 0, .bf16, 0, 0, 0));
+    var kbad = w;
+    kbad.k = 144; // k % 16 == 0 but not a multiple of 128
+    try std.testing.expectError(error.Exl3Shape, l.matmul(s, kbad, 0, .bf16, 8, 0, .bf16, 0, 0, 0));
+    var nbad = w;
+    nbad.n = 100;
+    try std.testing.expectError(error.Exl3Shape, l.matmul(s, nbad, 0, .bf16, 8, 0, .bf16, 0, 0, 0));
+    try std.testing.expectError(error.Exl3Scratch, l.matmul(s, w, 0, .bf16, 8, 0, .bf16, 0, 0, 0)); // plan(4096, 1024) splits K
 }
