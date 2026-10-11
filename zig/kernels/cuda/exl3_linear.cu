@@ -1,7 +1,4 @@
-// EXL3 decode-row linear: any codebook and width, 1-128 rows. A row's bits depend only on it (the mma keeps rows
-// apart, K ranges are fixed by (K, N), and the sums after it are in a fixed order).
-// Port of tensorfold's linear.cu: G = 0 (the original walk), V = 0, no programmatic dependent launch, one layer per
-// launch (the Python engine's multi-layer jobs only move work between launches).
+// EXL3 decode-row linear: any codebook, width, 1-128 rows, a row's bits only its own; port of tensorfold's linear.cu.
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>

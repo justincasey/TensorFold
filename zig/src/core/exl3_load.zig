@@ -1,5 +1,4 @@
-//! EXL3 checkpoint groups: every `{prefix}.trellis` and its parts, admitted from the safetensors headers
-//! alone (format.py's scan and parse_group: docs/recipes/exl3.md).
+//! EXL3 checkpoint groups: every `{prefix}.trellis` and its parts, admitted from the safetensors headers (format.py).
 const std = @import("std");
 const checkpoint = @import("checkpoint.zig");
 const st = @import("safetensors.zig");
@@ -152,8 +151,7 @@ fn admit(a: std.mem.Allocator, ck: *checkpoint.Checkpoint, prefix: []const u8, e
 
 const Scales = enum { f16, words }; // fp16 per row, or the packed sign words
 
-/// One part's admission: present means the right dtype and length; the fp16 name may fall back to the
-/// packed words; a missing input scale (or its fallback) is refused.
+/// One part's admission: the fp16 name, or the packed-words fallback; a missing input scale (or fallback) is refused.
 fn scale(a: std.mem.Allocator, ck: *checkpoint.Checkpoint, prefix: []const u8, name: []const u8, len: usize, packed_name: []const u8, packed_len: usize) !?Scales {
     const full = try std.mem.concat(a, u8, &.{ prefix, ".", name });
     if (!ck.has(full)) {

@@ -1,5 +1,4 @@
-//! EXL3 in tensor parallel: each rank's shard of real RED-SNOW projections and routed experts against the
-//! Python engine's bytes on the same shards, all-gathered and summed rank 0 first (the GLM engine's gather).
+//! EXL3 tensor parallel: each rank's shard of real RED-SNOW projections and experts vs the engine's, all-gathered.
 const std = @import("std");
 const posix = std.posix;
 const cuda = @import("cuda");
@@ -117,8 +116,7 @@ fn tp2Section(r: *Rig, dir: []const u8) !std.json.ObjectMap {
     return parsed.value.object.get("tp2").?.object;
 }
 
-/// The two fixture linears, the out-split ('dim1') and the in-split ('row') one: each reports its own line, and
-/// exl3.tp2.linear passes when both do.
+/// The two fixture linears, the out-split ('dim1') and the in-split ('row') one: each reports its own line.
 fn linearChecks(r: *Rig, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, lin: *const exl3.Linear, dir: []const u8, rank: u8, failed: *bool) void {
     const tp2 = tp2Section(r, dir) catch |e| {
         fail0(rank, "exl3.tp2.linear", e);

@@ -1,12 +1,4 @@
-"""The whole-layer fixtures: every EXL3 group of one KDA and one DSA MoE layer through the Python engine.
-
-Each layer's non-routed groups (attention projections, the fused qkv_proj / q_a / kv_a / q_b where EXL3,
-o_proj, shared_experts gate/up/down) load through Exl3Linear and run the seeded hidden state (k == hidden)
-or their own seeded input; the routed experts are one grouped call over ALL experts with the GLM engine's
-routing (glue.router + glue.select on mlp.gate.weight and mlp.gate.e_score_correction_bias over the same
-hidden state, sliced to the top-k routed slots). The fixture holds inputs, routing and expected outputs
-only: the Zig side loads every group's tensors from the checkpoint itself (core/exl3_load).
-"""
+"""The whole-layer fixtures: every EXL3 group of one KDA and one DSA MoE layer through the Python engine."""
 from __future__ import annotations
 
 import hashlib
@@ -122,8 +114,7 @@ def expert_part(out: Path, model_dir: Path, cp, base: str, hidden: torch.Tensor,
         + sum(t.element_size() * t.numel() for t in (ex.suh_g, ex.suh_u, ex.svh_g, ex.svh_u, ex.suh_d, ex.svh_d))
     print(f"  experts: {ex.count} experts, {ex.dims}x{ex.width}, {nbytes / (1 << 30):.2f} GiB")
 
-    # the routing, exactly as the GLM engine's moe_block routes: glue.router on the bf16 gate weight,
-    # glue.select with the fp32 correction bias; the fixture keeps the top-k routed slots only
+    # the routing, as the GLM engine's moe_block routes: glue.router on the bf16 gate weight, glue.select on the bias
     gate_w = load_tensor(model_dir, f"{base}.mlp.gate.weight", "cuda").to(torch.bfloat16).contiguous()
     bias = load_tensor(model_dir, f"{base}.mlp.gate.e_score_correction_bias", "cuda").float().contiguous()
     logits = torch.empty((hidden.shape[0], ex.count), dtype=torch.float32, device="cuda")

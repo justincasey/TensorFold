@@ -1,6 +1,4 @@
-// EXL3 routed experts: grouping, a width per expert, the grouped GEMMs and the epilogues; every row's bits its own.
-// Port of tensorfold's experts.cu and experts_grouped.cuh (after ExLlamaV3, MIT, Copyright (c) 2025 Turboderp);
-// the tile settings are GLM's (8 tiles, 4 warps, pf 1), 32-bit trellis loads.
+// EXL3 routed experts: grouping, grouped GEMMs, epilogues; port of tensorfold's experts.cu (ExLlamaV3, Turboderp).
 
 #include <cstdint>
 #include <cuda_bf16.h>
@@ -25,8 +23,7 @@ struct GroupedArgs {
     int k, n, p, sk, maxm, slots, nexp_max, mats, ns;
 };
 
-// One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads and the shared decode (the
-// same words per lane as the cooperative 32-bit path, so the same values and the same bits).
+// One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads and the shared decode (same bits).
 template <int CB, int K2, int NT>
 __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* x0,
                                            const half* x1, bool ok0, bool ok1, int lane, float (&acc)[NT][2][4]) {
@@ -52,8 +49,7 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt
     }
 }
 
-// Program (expert u, n block, split and member tile): up to 16 members times W_q over the split's K range; the
-// warps' partial sums through shared memory, added in warp order.
+// Program (expert u, n block, split, member tile): 16 members times W_q over the split's K range, summed in warp order.
 template <int CB, int NT, int W>
 __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nblock, int zz) {
     if (u >= a.ucount[0]) return;
@@ -261,8 +257,7 @@ extern "C" __global__ void tf_exl3_experts_rot_in(const RotInArgs a) {
 
 __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 
-// Program (slot, 128-block of the width): splits summed in order, rotated, * svh, SwiGLU (0: GLM's bf16 roundings,
-// 1: fp32), then Xd = fp16((act * suh_d) @ H).
+// Program (slot, 128-block of the width): splits summed in order, rotated, * svh, SwiGLU (0: bf16, 1: fp32), then Xd.
 struct GateUpArgs {
     const float* z; // [(mat * sk + split) * P + p] * N + col
     const int* pick; // int32 [P]
@@ -317,8 +312,7 @@ extern "C" __global__ void tf_exl3_gateup_epilogue(const GateUpArgs a) {
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
 }
 
-// Program (member row, 128-block of the model width): the down epilogue and the combine in one launch, the same
-// arithmetic in the same order as the two of them (the same bits): Y fp32 per slot, out = the wts-weighted sum.
+// Program (member row, 128-block of the width): down epilogue and combine in one launch, the same bits as the two.
 struct DownArgs {
     const float* z; // [split * P + p] * D + col
     const int* pick; // int32 [P]

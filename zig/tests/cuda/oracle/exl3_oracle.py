@@ -1,12 +1,4 @@
-"""Fixtures for `tf-cuda-test exl3`: the Python engine's EXL3 linear outputs on real RED-SNOW tensors.
-
-Run from the Python engine's checkout with its venv on a CUDA box:
-  cd ~/redsnow/tensorfold && ~/redsnow/venv/bin/python exl3_oracle.py --model ~/models/redsnow-serve --out ~/fix
-
-Writes <out>/manifest.json ({"version": 1, "linears": [...]}) plus one raw little-endian file per tensor:
-the checkpoint's trellis int16 [K/16, N/16, 16 * bits] bytes exactly as stored, suh/svh/bias fp16, and
-per row count m of rows (1, 3, 16) the bf16 input x [m, K] and the Python engine's bf16 output y [m, N].
-"""
+"""Fixtures for `tf-cuda-test exl3`: the Python engine's EXL3 linear outputs on real RED-SNOW tensors."""
 from __future__ import annotations
 
 import argparse

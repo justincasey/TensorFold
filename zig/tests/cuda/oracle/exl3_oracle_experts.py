@@ -1,10 +1,4 @@
-"""The routed-experts fixture: nine real experts of one MoE layer through the Python engine's generic.routed.
-
-The pool holds the three lowest expert ids of each of 4, 5 and 6 bits at the first layer (sorted) that has all
-three (remapped to 0..8), so one call mixes widths. Writes each expert's three trellises as stored, the stacked
-suh/svh, and per row count m of rows (1, 3, 16) the bf16 x, int32 pick, fp32 wts, the per-slot y and the
-combined out. Returns the manifest's "experts" entry.
-"""
+"""The routed-experts fixture: nine real experts of one MoE layer through the Python engine's generic.routed."""
 from __future__ import annotations
 
 import hashlib

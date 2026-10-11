@@ -1,4 +1,4 @@
-//! EXL3: the decode-row linear against float64 references, row invariance, the Python engine's fixture bytes, bandwidth.
+//! EXL3: the decode-row linear against float64 references, row invariance, the engine's fixture bytes, bandwidth.
 const std = @import("std");
 const cuda = @import("cuda");
 const check = @import("check.zig");
@@ -177,7 +177,7 @@ fn reference(r: *Rig, width: exl3fmt.Width, cb: exl3fmt.Codebook, trellis: []con
         const scale: f64 = @floatCast(@as(f16, @bitCast(svh[col])));
         for (0..m) |row| {
             want[row * n + col] = ypre[col * m + row] * scale;
-            // bf16 output ulp (2^-7 of the value) plus fp32 accumulation and fp16 xh boundary cases, 2^-11 of the |t| sum
+            // bf16 output ulp (2^-7 of the value) plus fp32 accumulation and fp16 xh cases, 2^-11 of the |t| sum
             tol[row * n + col] = @abs(want[row * n + col]) / 128 + s1[row * n + col] / 2048 + 1e-30;
         }
     }

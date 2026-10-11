@@ -1,12 +1,4 @@
-"""The tensor-parallel fixture: two real projections and one MoE layer's routed experts, split as the GLM
-engine's ranks are (split.py's EXL3_RULES) and run per rank on those shards.
-
-The out-split ("dim1") layer cuts trellis tile columns and svh rows; the in-split ("row") layer cuts trellis
-tile rows, suh rows and the input columns. Writes each layer's full stored tensors, the bf16 x, and per rank
-the Python engine's output on ITS shard: bf16 halves for the out-split, fp32 partials for the in-split, plus
-the bf16 rounding of the partials summed rank 0 first (forward.py's gather + hc_post). The routed experts run
-the same way on each rank's gate/up/down shards. Returns the manifest's "tp2" entry.
-"""
+"""The tensor-parallel fixture: two real projections and one MoE layer's routed experts, split as the ranks are."""
 from __future__ import annotations
 
 import hashlib

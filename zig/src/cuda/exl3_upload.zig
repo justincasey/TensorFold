@@ -1,5 +1,4 @@
-//! Uploading core exl3_load groups to the device as the exl3 kernels' weights: one dense group an
-//! `exl3.Weight`, one layer's routed experts an `exl3_experts.Layer` (the engine's load path).
+//! Uploading core exl3_load groups to the device as the exl3 kernels' weights (the engine's load path).
 const std = @import("std");
 const driver = @import("driver.zig");
 const memory = @import("memory.zig");
@@ -26,9 +25,7 @@ pub const Uploader = struct {
         return b.ptr;
     }
 
-    /// One dense group: `parts` (core exl3_load.Parts: trellis, suh, svh, bias) and `g` (core
-    /// exl3_load.Group: k, n, halves, codebook) as the linear's Weight. The scales must be fp16
-    /// (the packed su/sv sign words would need unpacking, which no engine path runs).
+    /// One dense group: `parts` (exl3_load.Parts) and `g` (exl3_load.Group) as the Weight; the scales must be fp16.
     pub fn dense(u: *Uploader, parts: anytype, g: anytype) !exl3.Weight {
         if (parts.suh_packed) return error.PackedScales;
         const st = exl3.strides(g.k, g.n, g.halves, false);
@@ -51,14 +48,11 @@ pub const Uploader = struct {
     }
 };
 
-/// One expert projection's tensors (fp16 scales) and half-bit width: the core exl3_load Parts'
-/// bytes and the group's halves.
+/// One expert projection's tensors (fp16 scales) and half-bit width: the exl3_load Parts' bytes, the group's halves.
 pub const Proj = struct { trellis: []const u8, suh: []const u8, svh: []const u8, k2: u32 };
 
-/// One layer's routed experts: every expert's trellis in place (one buffer a tensor, pointers
-/// stacked), the scales stacked [E, n] fp16, the widths as int32 [E].
-pub fn layer(u: *Uploader, a: std.mem.Allocator, dims: usize, width: usize, cb: exl3.Codebook,
-    limit: f32, act_mode: i32, gate: []const Proj, up: []const Proj, down: []const Proj) !exl3e.Layer {
+/// One layer's routed experts: trellises in place (pointers stacked), scales stacked [E, n] fp16, widths int32 [E].
+pub fn layer(u: *Uploader, a: std.mem.Allocator, dims: usize, width: usize, cb: exl3.Codebook, limit: f32, act_mode: i32, gate: []const Proj, up: []const Proj, down: []const Proj) !exl3e.Layer {
     const e = gate.len;
     if (up.len != e or down.len != e or e == 0) return error.BadExperts;
     const gt = try pointers(u, a, gate);

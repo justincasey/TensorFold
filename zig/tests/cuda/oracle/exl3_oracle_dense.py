@@ -1,9 +1,4 @@
-"""The dense prompt fixture: one real projection's 300-row prompt chunk through forward.py's exl3_mm path.
-
-The layer loads exactly as the "linears" fixtures do (Exl3Linear, "stored" trellis layout); x comes from
-its own generator so the decode fixtures stay byte-identical. Writes the layer's tensors, the bf16 input,
-and the engine's bf16 output bytes, and returns the manifest's "dense" entry.
-"""
+"""The dense prompt fixture: one real projection's 300-row prompt chunk through forward.py's exl3_mm path."""
 from __future__ import annotations
 
 import hashlib

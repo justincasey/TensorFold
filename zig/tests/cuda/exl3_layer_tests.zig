@@ -1,6 +1,4 @@
-//! EXL3 whole layers: one KDA and one DSA MoE layer of the real RED-SNOW checkpoint, every EXL3
-//! group loaded through core/exl3_load (never from fixture copies) and run against the Python
-//! engine's fixture bytes (exl3_oracle_layer.py's manifest and raw files).
+//! EXL3 whole layers: a KDA and a DSA MoE layer of real RED-SNOW through core/exl3_load vs the engine's fixture bytes.
 const std = @import("std");
 const cuda = @import("cuda");
 const check = @import("check.zig");
@@ -48,8 +46,7 @@ pub fn run(r: *Rig, state: *Run, dir: []const u8) !void {
     if (ok) check.pass("exl3.layer.python", .{});
 }
 
-fn layerChecks(r: *Rig, scan: *exl3_load.Scan, idx: *std.StringHashMapUnmanaged(usize),
-    dense: *exl3.Dense, exp: *const exl3e.Experts, dir: []const u8, layers: []std.json.Value) !void {
+fn layerChecks(r: *Rig, scan: *exl3_load.Scan, idx: *std.StringHashMapUnmanaged(usize), dense: *exl3.Dense, exp: *const exl3e.Experts, dir: []const u8, layers: []std.json.Value) !void {
     const t0 = check.now(r.gpu.io);
     var total: usize = 0;
     for (layers) |item| {
@@ -66,10 +63,8 @@ fn layerChecks(r: *Rig, scan: *exl3_load.Scan, idx: *std.StringHashMapUnmanaged(
     std.debug.print("RESULT exl3.layer.python: {d} layers, {d:.1} MiB uploaded, {d:.2} s\n", .{ layers.len, @as(f64, @floatFromInt(total)) / (1 << 20), dt });
 }
 
-/// One non-routed group: the checkpoint's tensors through the uploader, the fixture's inputs and
-/// bytes through the dense prompt path.
-fn denseGroup(r: *Rig, scan: *exl3_load.Scan, idx: *std.StringHashMapUnmanaged(usize),
-    dense: *exl3.Dense, dir: []const u8, up: *exl3_upload.Uploader, o: std.json.ObjectMap) !void {
+/// One non-routed group: checkpoint tensors through the uploader, fixture inputs and bytes through the prompt path.
+fn denseGroup(r: *Rig, scan: *exl3_load.Scan, idx: *std.StringHashMapUnmanaged(usize), dense: *exl3.Dense, dir: []const u8, up: *exl3_upload.Uploader, o: std.json.ObjectMap) !void {
     const name = o.get("name").?.string;
     const gi = idx.get(name) orelse return error.TestFailed;
     const g = scan.groups[gi];
@@ -91,10 +86,8 @@ fn denseGroup(r: *Rig, scan: *exl3_load.Scan, idx: *std.StringHashMapUnmanaged(u
     }
 }
 
-/// One layer's routed experts: all E experts' three projections uploaded as an exl3_experts.Layer,
-/// the fixture's routing and inputs through one grouped call a row count.
-fn expertLayer(r: *Rig, scan: *exl3_load.Scan, idx: *std.StringHashMapUnmanaged(usize),
-    exp: *const exl3e.Experts, dir: []const u8, up: *exl3_upload.Uploader, o: std.json.ObjectMap) !void {
+/// One layer's routed experts: all E experts' projections uploaded, the fixture's routing and inputs per row count.
+fn expertLayer(r: *Rig, scan: *exl3_load.Scan, idx: *std.StringHashMapUnmanaged(usize), exp: *const exl3e.Experts, dir: []const u8, up: *exl3_upload.Uploader, o: std.json.ObjectMap) !void {
     const base = o.get("name").?.string;
     const e_count: usize = @intCast(o.get("count").?.integer);
     const dims: usize = @intCast(o.get("dims").?.integer);

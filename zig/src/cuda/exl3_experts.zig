@@ -14,8 +14,7 @@ const Stream = stream_.Stream;
 pub const DType = exl3.DType;
 pub const Codebook = exl3.Codebook;
 
-/// One layer's routed experts on the device (exl3/experts.py's Exl3RoutedExperts): per-expert trellis pointers
-/// and half-bit widths (one layer mixes 4/5/6-bit experts), stacked suh/svh, the SwiGLU clamp.
+/// One layer's routed experts (experts.py's Exl3RoutedExperts): per-expert trellis pointers, stacked scales, the clamp.
 pub const Layer = struct {
     gate: u64, // int64 [E], one trellis pointer per expert
     up: u64,
@@ -38,8 +37,7 @@ pub const Layer = struct {
     act_mode: i32 = 0, // 0: GLM's bf16 roundings (the route RED-SNOW runs), 1: fp32
 };
 
-/// What one projection launches (experts.py default_config): the K splits of GLM's 8-tile 4-warp setting, which
-/// must divide the shape (the shape's alone, so a row's bits never depend on the row count).
+/// What one projection launches (experts.py default_config): the K splits of GLM's 8-tile 4-warp setting, shape-fixed.
 pub fn plan(k: usize, n: usize, gateup: bool) !u32 {
     const cands = [_]usize{ if (gateup) 4 else 1, 2, 1 };
     for (cands) |sk| {
@@ -138,10 +136,7 @@ pub const Experts = struct {
         e.mod.unload();
     }
 
-    /// The routed experts of `rows` rows (experts.py routed with weights): group, rotate in, grouped gate and
-    /// up, the SwiGLU, grouped down, and the wts-weighted combine. `pick` int32 [rows, slots] (picks >= E are
-    /// skipped, their slots left to the caller), `x` [rows, x_stride] bf16 or fp16, `wts` fp32 [rows, slots],
-    /// `out` fp32 [rows, D].
+    /// The routed experts of `rows` rows: group, rotate in, grouped gate/up, SwiGLU, grouped down, wts-weighted sum.
     pub fn run(e: *const Experts, s: Stream, l: Layer, x: u64, x_stride: usize, x_dtype: DType, pick: u64, wts: u64, rows: usize, out: u64, sc: Scratch) !void {
         const d = l.dims;
         const w = l.width;
@@ -174,7 +169,7 @@ pub const Experts = struct {
         var r: launch_.Args = .{};
         r.add(x);
         r.add(i32d(x_stride));
-        r.add(@as(i32, @intFromEnum(x_dtype)));
+        r.add(@as(i32, @backingInt(x_dtype)));
         r.add(pick);
         r.add(l.suh_g);
         r.add(l.suh_u);
@@ -205,7 +200,7 @@ pub const Experts = struct {
         g.add(i32d(maxu));
         g.add(@as(i32, 2));
         g.add(i32d(l.gu_stride));
-        try launch_.launch(e.grouped[@intFromEnum(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / 128), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
+        try launch_.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / 128), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
 
         var ep: launch_.Args = .{};
         ep.add(sc.z);
@@ -242,7 +237,7 @@ pub const Experts = struct {
         dn.add(i32d(maxu));
         dn.add(@as(i32, 1));
         dn.add(@as(i32, 0));
-        try launch_.launch(e.grouped[@intFromEnum(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / 128), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
+        try launch_.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / 128), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
 
         var cb: launch_.Args = .{};
         cb.add(sc.z);
@@ -270,8 +265,21 @@ test "the plan matches experts.py's for known shapes" {
 
 test "the scratch layout is 256-aligned and covered by scratchBytes" {
     const l: Layer = .{
-        .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0,
-        .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .experts = 9, .dims = 512, .width = 256,
+        .gate = 0,
+        .up = 0,
+        .down = 0,
+        .gate_k2 = 0,
+        .up_k2 = 0,
+        .down_k2 = 0,
+        .suh_g = 0,
+        .suh_u = 0,
+        .svh_g = 0,
+        .svh_u = 0,
+        .suh_d = 0,
+        .svh_d = 0,
+        .experts = 9,
+        .dims = 512,
+        .width = 256,
         .codebook = .mul1,
     };
     const bytes = scratchBytes(l, 64, 8);

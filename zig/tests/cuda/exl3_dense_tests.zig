@@ -1,5 +1,4 @@
-//! EXL3 dense prompt path: qlinear's dispatch, float64 references, chunk invariance, the Python engine's
-//! prompt bytes, and the checkpoint loader.
+//! EXL3 dense prompt path: qlinear's dispatch, float64 references, chunk invariance, the engine's prompt bytes.
 const std = @import("std");
 const cuda = @import("cuda");
 const check = @import("check.zig");
@@ -51,8 +50,7 @@ pub fn run(r: *Rig, state: *Run, dir: []const u8) !void {
     }) check.pass("exl3.load.redsnow", .{});
 }
 
-/// Through qlinear.Linear's decode and prompt dispatch, 1, 17 and 300 rows byte-equal the direct
-/// cuda.exl3 block loop.
+/// Through qlinear.Linear's decode and prompt dispatch, 1, 17 and 300 rows byte-equal the direct block loop.
 fn qlinearCheck(r: *Rig, ql: *const qlinear.Linear, lin: *const exl3.Linear) !void {
     const k = 1024;
     const n = 512;
@@ -112,8 +110,7 @@ fn promptF64(r: *Rig, lin: *const exl3.Linear) !void {
     }
 }
 
-/// A row's bytes are identical whether the prompt runs as one call, 128-row calls, a split at 37, or
-/// 2048-aligned chunks.
+/// A row's bytes are identical whether the prompt runs as one call, 128-row calls, a split at 37, or 2048 chunks.
 fn chunks(r: *Rig, de: *exl3.Dense) !void {
     const k = 512;
     const n = 512;
@@ -178,8 +175,7 @@ fn pythonPrompt(r: *Rig, de: *exl3.Dense, dir: []const u8) !bool {
     return true;
 }
 
-/// The checkpoint loader over the real RED-SNOW model: every EXL3 group admitted with the expected counts,
-/// then one layer's dense projection through the same prompt path as the fixture's bytes.
+/// The checkpoint loader over real RED-SNOW: every EXL3 group admitted, one layer's prompt vs the fixture bytes.
 fn loadRedsnow(r: *Rig, de: *exl3.Dense, dir: []const u8) !bool {
     if (std.mem.eql(u8, dir, "none")) {
         std.debug.print("SKIP exl3.load.redsnow\n", .{});
@@ -325,7 +321,7 @@ fn promptReference(r: *Rig, width: exl3fmt.Width, cb: exl3fmt.Codebook, trellis:
         const scale: f64 = @floatCast(@as(f16, @bitCast(svh[col])));
         for (0..m) |row| {
             want[row * n + col] = ypre[col * m + row] * scale;
-            // bf16 output ulp (2^-7 of the value) plus fp32 accumulation and fp16 xh boundary cases, 2^-11 of the |t| sum
+            // bf16 output ulp (2^-7 of the value) plus fp32 accumulation and fp16 xh cases, 2^-11 of the |t| sum
             tol[row * n + col] = @abs(want[row * n + col]) / 128 + s1[row * n + col] / 2048 + 1e-30;
         }
     }

@@ -44,7 +44,7 @@ pub const variants = [_]Variant{
 
 /// The kernel's extern "C" name for an instantiation (linear.cu's TF_EXL3_LINEAR macro).
 pub fn symbol(comptime halves: u32, comptime codebook: Codebook, comptime warps: u32) [:0]const u8 {
-    return std.fmt.comptimePrint("tf_exl3_linear_{d}_{d}_{d}", .{ halves, @intFromEnum(codebook), warps });
+    return std.fmt.comptimePrint("tf_exl3_linear_{d}_{d}_{d}", .{ halves, @backingInt(codebook), warps });
 }
 
 pub const rot_in_symbol = "tf_exl3_rot_in";
@@ -56,9 +56,7 @@ pub fn variantIndex(halves: u32, codebook: Codebook, warps: u32) ?usize {
     return null;
 }
 
-/// What one shape launches, from the shape alone so a row's bits never depend on the row count (linear.py plan):
-/// the K splits, and the warps a block runs. nb < 64 layers chase the block count first, wider ones use 8 warps;
-/// then K must split into whole tiles with at least `min_tiles` per warp, else the splits or the warps shrink.
+/// What one shape launches, from the shape alone so a row's bits never depend on the row count (linear.py plan).
 pub fn plan(k: usize, n: usize, blocks: usize, min_tiles: usize) struct { sk: u32, wk: u32 } {
     const kt = k / 16;
     const nb = n / 128;
@@ -73,8 +71,7 @@ pub fn plan(k: usize, n: usize, blocks: usize, min_tiles: usize) struct { sk: u3
     return .{ .sk = @intCast(sk), .wk = @intCast(wk) };
 }
 
-/// Words between k tiles, and between 128-column blocks, of one layout: strips [N/128, K/16, 8, W] or the stored
-/// [K/16, N/16, W] (whose 128-column blocks are 8 back-to-back tiles, so 8 * W apart).
+/// Words between k tiles and 128-column blocks of one layout: strips [N/128, K/16, 8, W] or stored [K/16, N/16, W].
 pub fn strides(k: usize, n: usize, halves: usize, strips: bool) struct { k: usize, nb: usize } {
     const words = halves * 4;
     return if (strips)
@@ -148,7 +145,7 @@ pub const Linear = struct {
         r.add(x);
         r.add(w.suh);
         r.add(xh);
-        r.add(@as(i32, @intFromEnum(x_dtype)));
+        r.add(@as(i32, @backingInt(x_dtype)));
         r.add(@as(i32, @intCast(m)));
         r.add(@as(i32, @intCast(w.k)));
         try launch_.launch(l.rot_in, .{
@@ -167,7 +164,7 @@ pub const Linear = struct {
         args.add(y);
         args.add(if (p.sk > 1) z else @as(u64, 0));
         args.add(counters);
-        args.add(@as(i32, @intFromEnum(y_dtype)));
+        args.add(@as(i32, @backingInt(y_dtype)));
         args.add(@as(i32, @intCast(w.n)));
         args.add(@as(i32, @intCast(p.sk)));
         args.add(@as(i32, @intCast(m)));
@@ -178,22 +175,9 @@ pub const Linear = struct {
             .shared = sharedBytes(w, m),
         }, s, &args);
     }
-
-    /// y [m, n] = x [m, k] for any row count: 128-row blocks of `matmul` (the Python engine's exl3_mm), one
-    /// plan per layer, so a row's bits never depend on where its chunk starts or how long it is.
-    pub fn prompt(l: *const Linear, s: Stream, w: Weight, x: u64, x_dtype: DType, m: usize, y: u64, y_dtype: DType, xh: u64, z: u64, counters: u64) !void {
-        const xe: u64 = if (x_dtype == .f32) 4 else 2;
-        const ye: u64 = if (y_dtype == .f32) 4 else 2;
-        var r: usize = 0;
-        while (r < m) : (r += 128) {
-            const rows = @min(m - r, 128);
-            try l.matmul(s, w, x + @as(u64, r) * w.k * xe, x_dtype, rows, y + @as(u64, r) * w.n * ye, y_dtype, xh, z, counters);
-        }
-    }
 };
 
-/// The loaded kernels plus the scratch one stream's dense calls share: prompt rows run in 128-row blocks
-/// (forward.py's exl3_mm), decode rows go through the same row-invariant kernel.
+/// The loaded kernels plus the scratch one stream's dense calls share; prompt rows run in 128-row blocks (forward.py).
 pub const Dense = struct {
     d: *const Driver,
     lin: Linear,
