@@ -203,8 +203,8 @@ pub fn runRows(r: *Rig, exp: *const exl3e.Experts, b: *const Built, rows_n: usiz
 }
 
 pub fn runSlice(r: *Rig, exp: *const exl3e.Experts, layer: exl3e.Layer, x: u64, pick: u64, wts: u64, rows_n: usize) !struct { out: u64, y: u64 } {
-    const sb = try r.zeros(exl3e.scratchBytes(layer, rows_n, SLOTS));
-    const sc = exl3e.scratch(sb, layer, rows_n, SLOTS);
+    const sb = try r.zeros(try exl3e.scratchBytes(layer, rows_n, SLOTS));
+    const sc = try exl3e.scratch(sb, layer, rows_n, SLOTS);
     const out = try r.zeros(rows_n * D * 4);
     try exp.run(r.s, layer, x, D, .bf16, pick, wts, rows_n, out, sc);
     return .{ .out = out, .y = sc.y };

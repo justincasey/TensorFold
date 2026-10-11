@@ -37,7 +37,7 @@ pub const Layer = struct {
     act_mode: i32 = 0, // 0: GLM's bf16 roundings (the route RED-SNOW runs), 1: fp32
 };
 
-/// What one projection launches (experts.py default_config): the K splits of GLM's 8-tile 4-warp setting, shape-fixed.
+/// What one projection launches (experts.py default_config): the 8-tile 4-warp K splits, shape-fixed; n % 128 required.
 pub fn plan(k: usize, n: usize, gateup: bool) !u32 {
     const cands = [_]usize{ if (gateup) 4 else 1, 2, 1 };
     for (cands) |sk| {
@@ -59,10 +59,11 @@ pub const Scratch = struct {
     rows: usize, // the row capacity the buffers hold
     slots: usize, // slots a row, at most 32
 };
-/// The byte size of the scratch buffers for a layer and row capacity.
-pub fn scratchBytes(l: Layer, rows: usize, slots: usize) usize {
-    const g_sk = plan(l.dims, l.width, true) catch return 0;
-    const d_sk = plan(l.width, l.dims, false) catch return 0;
+
+/// The byte size of the scratch buffers for a layer and row capacity, or error.TileNotBuilt when plan() fails.
+pub fn scratchBytes(l: Layer, rows: usize, slots: usize) !usize {
+    const g_sk = try plan(l.dims, l.width, true);
+    const d_sk = try plan(l.width, l.dims, false);
     const p = rows * slots;
     const maxu = @min(p, l.experts);
     return align256(p * l.dims * 2) + align256(p * l.dims * 2) + align256(p * l.width * 2) +
@@ -74,11 +75,11 @@ fn align256(n: usize) usize {
     return (n + 255) / 256 * 256;
 }
 
-/// The pointers into one allocation of scratchBytes().
-pub fn scratch(base: u64, l: Layer, rows: usize, slots: usize) Scratch {
+/// The pointers into one allocation of scratchBytes(), or error.TileNotBuilt when plan() fails.
+pub fn scratch(base: u64, l: Layer, rows: usize, slots: usize) !Scratch {
     const p = rows * slots;
-    const g_sk = plan(l.dims, l.width, true) catch unreachable;
-    const d_sk = plan(l.width, l.dims, false) catch unreachable;
+    const g_sk = try plan(l.dims, l.width, true);
+    const d_sk = try plan(l.width, l.dims, false);
     const maxu = @min(p, l.experts);
     var at = base;
     const take = struct {
@@ -282,9 +283,9 @@ test "the scratch layout is 256-aligned and covered by scratchBytes" {
         .width = 256,
         .codebook = .mul1,
     };
-    const bytes = scratchBytes(l, 64, 8);
+    const bytes = try scratchBytes(l, 64, 8);
     var buf: [4096]u8 align(256) = undefined;
-    const sc = scratch(@intFromPtr(&buf), l, 64, 8);
+    const sc = try scratch(@intFromPtr(&buf), l, 64, 8);
     try std.testing.expectEqual(@as(u64, @intFromPtr(&buf)), sc.xg);
     try std.testing.expectEqual(@as(u64, 0), sc.xg % 256);
     try std.testing.expectEqual(@as(u64, 0), sc.xu % 256);

@@ -181,8 +181,8 @@ fn python(r: *Rig, exp: *const exl3e.Experts, dir: []const u8, state: *Run) !voi
         const dx = try r.dev(try readFile(r, dir, xmap.get(key).?.string));
         const dpick = try r.dev(try readFile(r, dir, pickmap.get(key).?.string));
         const dwts = try r.dev(try readFile(r, dir, wtsmap.get(key).?.string));
-        const sb = try r.zeros(exl3e.scratchBytes(layer, m, slots));
-        const sc = exl3e.scratch(sb, layer, m, slots);
+        const sb = try r.zeros(try exl3e.scratchBytes(layer, m, slots));
+        const sc = try exl3e.scratch(sb, layer, m, slots);
         const out = try r.zeros(m * dims * 4);
         try exp.run(r.s, layer, dx, dims, .bf16, dpick, dwts, m, out, sc);
         const got_y = try r.back(sc.y, m * slots * dims * 4);

@@ -126,8 +126,8 @@ fn expertLayer(r: *Rig, scan: *exl3_load.Scan, idx: *std.StringHashMapUnmanaged(
         const dx = try r.dev(try readFile(r, dir, xmap.get(key).?.string));
         const dpick = try r.dev(try readFile(r, dir, pickmap.get(key).?.string));
         const dwts = try r.dev(try readFile(r, dir, wtsmap.get(key).?.string));
-        const sb = try r.zeros(exl3e.scratchBytes(l, m, slots));
-        const sc = exl3e.scratch(sb, l, m, slots);
+        const sb = try r.zeros(try exl3e.scratchBytes(l, m, slots));
+        const sc = try exl3e.scratch(sb, l, m, slots);
         const out = try r.zeros(m * dims * 4);
         try exp.run(r.s, l, dx, dims, .bf16, dpick, dwts, m, out, sc);
         const got_out = try r.back(out, m * dims * 4);

@@ -297,8 +297,8 @@ fn expertsRun(r: *Rig, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, exp:
         const dx = try r.dev(try exl3t.readFile(r, dir, xmap.get(key).?.string));
         const dpick = try r.dev(try exl3t.readFile(r, dir, pickmap.get(key).?.string));
         const dwts = try r.dev(try exl3t.readFile(r, dir, wtsmap.get(key).?.string));
-        const sb = try r.zeros(exl3e.scratchBytes(layer, m, slots));
-        const sc = exl3e.scratch(sb, layer, m, slots);
+        const sb = try r.zeros(try exl3e.scratchBytes(layer, m, slots));
+        const sc = try exl3e.scratch(sb, layer, m, slots);
         const out = try r.zeros(m * dims * 4);
         try exp.run(r.s, layer, dx, dims, .bf16, dpick, dwts, m, out, sc);
         const recv = try r.zeros(2 * m * dims * 4);
@@ -398,10 +398,21 @@ fn receive(gpu: Gpu, addr_text: []const u8, bytes: []u8) !void {
         }
     }
     var off: usize = 0;
+    var read_waited: u64 = 0;
     while (off < bytes.len) {
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        const ready = posix.poll(&fds, 500) catch return error.ReadFailed;
+        if (ready == 0) {
+            read_waited += 500;
+            if (read_waited > 60_000) return error.PeerTimeout;
+            continue;
+        }
         const n = posix.system.read(fd, bytes.ptr + off, bytes.len - off);
         switch (posix.errno(n)) {
-            .SUCCESS => off += @intCast(n),
+            .SUCCESS => {
+                if (n == 0) return error.PeerClosed; // the peer died before its id arrived
+                off += @intCast(n);
+            },
             .INTR => {},
             else => return error.ReadFailed,
         }
