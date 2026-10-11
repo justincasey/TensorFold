@@ -32,6 +32,7 @@ pub const grouped = @import("grouped.zig");
 pub const qlinear = @import("qlinear.zig");
 pub const experts = @import("experts.zig");
 pub const modelopt = @import("modelopt.zig");
+pub const exl3 = @import("exl3.zig");
 
 test {
     _ = @import("memory.zig");
@@ -46,5 +47,6 @@ test {
     _ = @import("fp8.zig");
     _ = carveout;
     _ = @import("nvfp4.zig");
+    _ = exl3;
     _ = @import("modelopt.zig");
 }
