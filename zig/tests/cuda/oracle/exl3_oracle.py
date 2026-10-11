@@ -22,6 +22,7 @@ import torch
 import exl3_oracle_dense
 import exl3_oracle_experts
 import exl3_oracle_layer
+import exl3_oracle_tp2
 
 ROWS = (1, 3, 16)
 SEED = 1234
@@ -119,7 +120,8 @@ def main() -> int:
     dense = exl3_oracle_dense.write(out, model_dir)
     experts = exl3_oracle_experts.write(out, model_dir)
     layers = exl3_oracle_layer.write(out, model_dir)
-    manifest = {"version": 1, "linears": linears, "dense": dense, "experts": experts, "layers": layers,
+    tp2 = exl3_oracle_tp2.write(out, model_dir)
+    manifest = {"version": 1, "linears": linears, "dense": dense, "experts": experts, "layers": layers, "tp2": tp2,
                 "model": str(model_dir)}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     print(f"{len(linears)} linears -> {out / 'manifest.json'}")
