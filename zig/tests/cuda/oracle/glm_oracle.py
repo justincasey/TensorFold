@@ -9,7 +9,6 @@ from pathlib import Path
 import glm_oracle_glue
 import glm_oracle_kda
 
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True, help="the checkpoint folder (the recipe's serve view)")

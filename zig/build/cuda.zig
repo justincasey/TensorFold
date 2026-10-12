@@ -42,6 +42,7 @@ const kernels = [_]Kernel{
     .{ .name = "glm_kda_chunk", .flags = &.{ "-O3", "--fmad=false" } }, // glm5_next/cuda/kda_chunk.cu's device code (32-row WY sub-chunks)
     .{ .name = "glm_bmm", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // glm5_next/cuda's bf16 matmul and router dots (qmm._bmm, glue._router)
     .{ .name = "glm_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // glm5_next/cuda/glue.py's Triton kernels as device code
+    .{ .name = "glm_sparse", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // glm5_next/cuda/sparse.py's Triton kernels as device code
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
     .{ .name = "torch_pointwise", .src = "torch_ops/pointwise", .flags = torch_ops },
