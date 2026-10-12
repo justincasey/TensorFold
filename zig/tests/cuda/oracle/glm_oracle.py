@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 # the families' fixtures: siblings in this folder, which leads sys.path when the script runs
+import glm_oracle_glue
 
 
 def main() -> int:
@@ -16,6 +17,7 @@ def main() -> int:
     out, model_dir = Path(a.out), Path(a.model)
     out.mkdir(parents=True, exist_ok=True)
     manifest = {"version": 1, "model": str(model_dir)}
+    manifest["glue"] = glm_oracle_glue.write(out, model_dir)
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     print(f"{len(manifest) - 2} families -> {out / 'manifest.json'}")
     return 0

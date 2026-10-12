@@ -21,5 +21,6 @@ pub fn run(gpu: check.Gpu, dir: []const u8) !void {
         r.bufs.deinit(gpu.gpa);
     }
     var state = Run{};
+    try @import("glm_glue_tests.zig").run(&r, &state, dir);
     if (state.failed) return error.TestFailed;
 }
