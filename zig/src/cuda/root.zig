@@ -35,6 +35,8 @@ pub const modelopt = @import("modelopt.zig");
 pub const exl3 = @import("exl3.zig");
 pub const exl3_experts = @import("exl3_experts.zig");
 pub const exl3_upload = @import("exl3_upload.zig");
+pub const glm_bmm = @import("glm_bmm.zig");
+pub const glm_glue = @import("glm_glue.zig");
 
 test {
     _ = @import("memory.zig");
@@ -52,5 +54,7 @@ test {
     _ = exl3;
     _ = exl3_experts;
     _ = exl3_upload;
+    _ = glm_bmm;
+    _ = glm_glue;
     _ = @import("modelopt.zig");
 }

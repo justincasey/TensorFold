@@ -21,8 +21,5 @@ pub fn run(gpu: check.Gpu, dir: []const u8) !void {
         r.bufs.deinit(gpu.gpa);
     }
     var state = Run{};
-    _ = &r; // each family's run(&r, &state, dir) goes here
-    _ = &state;
-    _ = dir;
     if (state.failed) return error.TestFailed;
 }

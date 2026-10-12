@@ -5,6 +5,8 @@ import argparse
 import json
 from pathlib import Path
 
+# the families' fixtures: siblings in this folder, which leads sys.path when the script runs
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
