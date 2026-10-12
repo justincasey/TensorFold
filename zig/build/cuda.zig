@@ -38,6 +38,8 @@ const kernels = [_]Kernel{
     .{ .name = "modelopt_pack", .flags = &.{"-O3"} }, // ours: ModelOpt tensors into the lane, prompt and expert layouts
     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5
     .{ .name = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/experts.cu's device code, tensorfold_exl3_experts
+    .{ .name = "glm_kda", .flags = &.{ "-O3", "--fmad=false" } }, // glm5_next/cuda/kda.cu's device code (chain, replay, wide trio, conv shift)
+    .{ .name = "glm_kda_chunk", .flags = &.{ "-O3", "--fmad=false" } }, // glm5_next/cuda/kda_chunk.cu's device code (32-row WY sub-chunks)
     .{ .name = "glm_bmm", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // glm5_next/cuda's bf16 matmul and router dots (qmm._bmm, glue._router)
     .{ .name = "glm_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // glm5_next/cuda/glue.py's Triton kernels as device code
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
