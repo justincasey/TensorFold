@@ -24,5 +24,6 @@ pub fn run(gpu: check.Gpu, dir: []const u8) !void {
     try @import("glm_glue_tests.zig").run(&r, &state, dir);
     try @import("glm_kda_tests.zig").run(&r, &state, dir);
     try @import("glm_sparse_tests.zig").run(&r, &state, dir);
+    try @import("glm_latent_tests.zig").run(&r, &state, dir);
     if (state.failed) return error.TestFailed;
 }
