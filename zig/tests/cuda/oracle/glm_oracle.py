@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 # the families' fixtures: siblings in this folder, which leads sys.path when the script runs
+import glm_oracle_gaps
 import glm_oracle_glue
 import glm_oracle_kda
 import glm_oracle_sparse
@@ -22,6 +23,7 @@ def main() -> int:
     manifest["glue"] = glm_oracle_glue.write(out, model_dir)
     manifest["kda"] = glm_oracle_kda.write(out, model_dir)
     manifest["sparse"] = glm_oracle_sparse.write(out, model_dir)
+    manifest["gaps"] = glm_oracle_gaps.write(out, model_dir)
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     print(f"{len(manifest) - 2} families -> {out / 'manifest.json'}")
     return 0

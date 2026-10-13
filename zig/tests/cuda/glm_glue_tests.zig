@@ -5,6 +5,7 @@ const check = @import("check.zig");
 const quant_ref_tests = @import("quant_ref_tests.zig");
 const exl3_tests = @import("exl3_tests.zig");
 const ref = @import("glm_kda_ref.zig");
+const gaps = @import("glm_gaps_tests.zig");
 const glue = cuda.glm_glue;
 
 const Run = exl3_tests.Run;
@@ -14,6 +15,7 @@ const Failed = check.Failed;
 pub fn run(r: *Rig, state: *Run, dir: []const u8) !void {
     embedCheck(r, state, dir) catch |e| state.fail(e, "glm.glue.embed");
     rmsnorm(r, state, dir) catch |e| state.fail(e, "glm.glue.rmsnorm");
+    try rmsnormGaps(r, state, dir);
     hcPre(r, state, dir) catch |e| state.fail(e, "glm.glue.hc_pre");
     hcPost(r, state, dir) catch |e| state.fail(e, "glm.glue.hc_post");
     residual(r, state, dir) catch |e| state.fail(e, "glm.glue.residual");
@@ -21,6 +23,7 @@ pub fn run(r: *Rig, state: *Run, dir: []const u8) !void {
     router(r, state, dir) catch |e| state.fail(e, "glm.glue.router");
     select(r, state, dir) catch |e| state.fail(e, "glm.glue.select");
     combine(r, state, dir) catch |e| state.fail(e, "glm.glue.combine");
+    try combineGaps(r, state, dir);
     bmm(r, state, dir) catch |e| state.fail(e, "glm.bmm");
     greedy(r, state, dir) catch |e| state.fail(e, "glm.sample.greedy");
 }
@@ -63,20 +66,19 @@ fn sigmoid(x: f64) f64 {
     return 1.0 / (1.0 + @exp(-x));
 }
 
-/// One check's float64 comparisons; fail when the worst error leaves its tolerance.
-const Tol = struct {
+pub const Tol = struct {
     worst: f64 = 0,
 
-    fn f64v(t: *Tol, got: f64, want: f64, scale: f64, floor: f64) void {
+    pub fn f64v(t: *Tol, got: f64, want: f64, scale: f64, floor: f64) void {
         const q = @abs(got - want) / (@abs(want) * scale + floor);
         if (q > t.worst) t.worst = q;
     }
 
-    fn f32v(t: *Tol, arr: []const f32, i: usize, want: f64, scale: f64, floor: f64) void {
+    pub fn f32v(t: *Tol, arr: []const f32, i: usize, want: f64, scale: f64, floor: f64) void {
         t.f64v(arr[i], want, scale, floor);
     }
 
-    fn done(t: *Tol, name: []const u8) Failed!void {
+    pub fn done(t: *Tol, name: []const u8) Failed!void {
         if (t.worst > 1.0) {
             std.debug.print("FAIL {s}: f64 worst {d:.4} of tolerance\n", .{ name, t.worst });
             return error.TestFailed;
@@ -452,8 +454,11 @@ fn combine(r: *Rig, state: *Run, dir: []const u8) !void {
     const out = try r.zeros(want.len);
     try k.combine(r.s, y, wts, out, rows, d, 9);
     try check.sameBytes("glm.glue.combine", try r.back(out, want.len), want);
+    std.debug.print("DBG c_y={s} c_wts={s} rows={d} d={d}\n", .{ ref.str(o, "c_y"), ref.str(o, "c_wts"), rows, d });
     const yv = try bf4(r.a, try ref.readFile(r.a, r.gpu.io, dir, ref.str(o, "c_y")));
+    std.debug.print("DBG yv len={d}\n", .{yv.len});
     const wv = f32s(try ref.readFile(r.a, r.gpu.io, dir, ref.str(o, "c_wts")));
+    std.debug.print("DBG wv len={d} ptr={*}\n", .{ wv.len, wv.ptr });
     const gotv = f32s(try r.back(out, want.len));
     var t = Tol{};
     for (0..rows) |i| for (0..d) |j| {
@@ -520,4 +525,15 @@ fn greedy(r: *Rig, state: *Run, dir: []const u8) !void {
         if (got[i] != @as(i32, @intCast(bi))) return error.TestFailed;
     }
     check.pass("glm.sample.greedy", .{});
+}
+
+// -- the gap fixtures (glm_oracle_gaps.py's "gaps"): folded into the rmsnorm and combine ids above ---
+
+fn rmsnormGaps(r: *Rig, state: *Run, dir: []const u8) !void {
+    gaps.rmsnorm(r, dir) catch |e| state.fail(e, "glm.glue.rmsnorm");
+}
+
+fn combineGaps(r: *Rig, state: *Run, dir: []const u8) !void {
+    gaps.combine(r, dir) catch |e| state.fail(e, "glm.glue.combine");
+    gaps.combineMoe(r, dir) catch |e| state.fail(e, "glm.glue.combine");
 }
