@@ -43,6 +43,7 @@ pub const glm_glue2 = @import("glm_glue2.zig");
 pub const glm_sparse = @import("glm_sparse.zig");
 pub const glm_latent = @import("glm_latent.zig");
 pub const glm_layer = @import("glm_layer.zig");
+pub const glm_head = @import("glm_head.zig");
 pub const glm_dsa = @import("glm_dsa.zig");
 
 test {
@@ -69,6 +70,7 @@ test {
     _ = glm_sparse;
     _ = glm_latent;
     _ = glm_layer;
+    _ = glm_head;
     _ = glm_dsa;
     _ = @import("modelopt.zig");
 }

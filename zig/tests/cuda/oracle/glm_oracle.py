@@ -15,6 +15,7 @@ import glm_oracle_layer
 import glm_oracle_dsa
 import glm_oracle_layer_dsa
 import glm_oracle_mlp
+import glm_oracle_head
 
 
 def main() -> int:
@@ -34,6 +35,7 @@ def main() -> int:
     manifest["dsa"] = glm_oracle_dsa.write(out, model_dir)
     manifest["mlp"] = glm_oracle_mlp.write(out, model_dir)
     manifest["layer_dsa"] = glm_oracle_layer_dsa.write(out, model_dir)
+    manifest["head"] = glm_oracle_head.write(out, model_dir)
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     print(f"{len(manifest) - 2} families -> {out / 'manifest.json'}")
     return 0

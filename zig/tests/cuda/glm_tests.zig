@@ -29,5 +29,6 @@ pub fn run(gpu: check.Gpu, dir: []const u8) !void {
     try @import("glm_mlp_tests.zig").run(&r, &state, dir);
     try @import("glm_dsa_block_tests.zig").run(&r, &state, dir);
     try @import("glm_layer_dsa_tests.zig").run(&r, &state, dir);
+    try @import("glm_head_tests.zig").run(&r, &state, dir);
     if (state.failed) return error.TestFailed;
 }

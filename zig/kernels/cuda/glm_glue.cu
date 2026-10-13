@@ -470,7 +470,7 @@ __device__ __forceinline__ void combine(const u16* y, const float* wts, float* o
 }
 
 // -- greedy sampling over a rank's logits (decode.py sample_rows greedy path) ----------------------
-__device__ __forceinline__ void greedy(const u16* lg, int* tok, int n) {
+__device__ __forceinline__ void greedy(const u16* lg, int* tok, float* packed, int n, int offset) {
     __shared__ float sv[8];
     __shared__ int si[8];
     int r = blockIdx.x, t = threadIdx.x;
@@ -505,7 +505,11 @@ __device__ __forceinline__ void greedy(const u16* lg, int* tok, int n) {
                 bv = sv[i];
                 bidx = si[i];
             }
-        tok[r] = bidx;
+        if (tok) tok[r] = bidx;
+        if (packed) {  // sample_rows' all-gather payload: the value, then the vocab id's bits
+            packed[2 * r] = bv;
+            packed[2 * r + 1] = __int_as_float(bidx + offset);
+        }
     }
 }
 
@@ -551,4 +555,7 @@ extern "C" __global__ void tf_glm_combine(const u16* y, const float* wts, float*
     combine(y, wts, out, slots);
 }
 
-extern "C" __global__ void tf_glm_greedy(const u16* lg, int* tok, int n) { greedy(lg, tok, n); }
+extern "C" __global__ void tf_glm_greedy(const u16* lg, int* tok, int n) { greedy(lg, tok, nullptr, n, 0); }
+extern "C" __global__ void tf_glm_greedy_pack(const u16* lg, float* packed, int n, int offset) {
+    greedy(lg, nullptr, packed, n, offset);
+}

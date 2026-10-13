@@ -35,6 +35,7 @@ pub const Glue = struct {
     topk_fn: Function,
     combine_fn: Function,
     greedy_fn: Function,
+    greedy_pack_fn: Function,
 
     pub fn load(d: *const driver.Driver) !Glue {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -51,6 +52,7 @@ pub const Glue = struct {
             .topk_fn = undefined,
             .combine_fn = undefined,
             .greedy_fn = undefined,
+            .greedy_pack_fn = undefined,
         };
         errdefer g.mod.unload();
         g.embed_b16_fn = try g.mod.function("tf_glm_embed_b16");
@@ -64,6 +66,7 @@ pub const Glue = struct {
         g.topk_fn = try g.mod.function("tf_glm_topk");
         g.combine_fn = try g.mod.function("tf_glm_combine");
         g.greedy_fn = try g.mod.function("tf_glm_greedy");
+        g.greedy_pack_fn = try g.mod.function("tf_glm_greedy_pack");
         return g;
     }
 
@@ -215,5 +218,16 @@ pub const Glue = struct {
         r.add(tok);
         r.add(@as(u32, @intCast(n)));
         try launch_.launch(g.greedy_fn, .{ .grid = grid1(rows), .block = block(256), .shared = 0 }, s, &r);
+    }
+
+    /// sample_rows' greedy candidate per row: packed [rows, 2] f32 of the top value and its vocab id's bits (+offset).
+    pub fn greedyPack(g: *const Glue, s: Stream, lg: u64, packed_: u64, rows: usize, n: usize, offset: u32) !void {
+        if (rows == 0 or n == 0) return error.GlmGlueShape;
+        var r: launch_.Args = .{};
+        r.add(lg);
+        r.add(packed_);
+        r.add(@as(u32, @intCast(n)));
+        r.add(offset);
+        try launch_.launch(g.greedy_pack_fn, .{ .grid = grid1(rows), .block = block(256), .shared = 0 }, s, &r);
     }
 };
