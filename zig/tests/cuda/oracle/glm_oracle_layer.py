@@ -1,4 +1,4 @@
-"""glm.layer.kda fixtures: one real KDA MoE layer's whole forward at TP=2, both ranks' engines in one process."""
+"""glm.layer.kda/mlp fixtures: a real KDA layer's forward (MoE or dense MLP) at TP=2, both ranks in one process."""
 from __future__ import annotations
 
 import dataclasses
@@ -157,6 +157,11 @@ def _weights(out: Path, L, c, pre: str = "lkw") -> dict:
                      "scale": plain(f"{site}_scale", h.scale, torch.float32)}
     man["in_norm"] = plain("in_norm", L.in_norm, torch.bfloat16)
     man["post_norm"] = plain("post_norm", L.post_norm, torch.bfloat16)
+    if m is None:            # a dense layer: the MLP's gate, up (the rank's columns) and down (its rows)
+        d = L.mlp
+        assert d.gu is None, "a fused gate|up pack"
+        man["mlp"] = {"gate": lin("mlp_gate", d.gate), "up": lin("mlp_up", d.up), "down": lin("mlp_down", d.down)}
+        return man
     ex = m.experts
     E = ex.count
     assert len(ex.keep) == 3 * E and ex.gu_stride == 0
@@ -180,7 +185,7 @@ def _weights(out: Path, L, c, pre: str = "lkw") -> dict:
     return man
 
 
-def _case(out: Path, W, tag: str, R: int, pos: int, prefill: bool) -> dict:
+def _case(out: Path, W, tag: str, R: int, pos: int, prefill: bool, pre: str = "lk") -> dict:
     """One window from a seeded state: rank 0's bits at every stage, rank 1's two partials, the final x and state."""
     from tensorfold.families.glm5_next.cuda import kda_chunked
 
@@ -206,6 +211,9 @@ def _case(out: Path, W, tag: str, R: int, pos: int, prefill: bool) -> dict:
             if not prefill:
                 for key in ("k", "v", "g", "b"):
                     site[f"s{key}"] = getattr(sc, key)[:R].clone()
+        elif W[0].layers[0].moe is None:   # a dense MLP: gate, up and the SwiGLU, under the engine's names
+            for key, src in (("smg", "mg"), ("smu", "mu"), ("sact", "act")):
+                site[key] = getattr(b, src)[:R].clone()
         else:                # the MoE site: route, per-slot y (shared expert in slot 8)
             for key in ("mlog", "pick", "wts", "sy", "smg", "smu", "sact"):
                 site[key] = getattr(b, key)[:R].clone()
@@ -214,21 +222,21 @@ def _case(out: Path, W, tag: str, R: int, pos: int, prefill: bool) -> dict:
 
     res = _run(W, R, pos, prefill, False, states, x0, snap)
     assert len(snaps) == 2, len(snaps)
-    e = {"rows": R, "pos": pos, "prefill": prefill, "x0": save(out, f"lk_{tag}_x0", x0),
-         "conv0": save(out, f"lk_{tag}_conv0", states[0][0]), "rec0": save(out, f"lk_{tag}_rec0", states[0][1]),
-         "x": save(out, f"lk_{tag}_x", res[0]["x"]), "rec": save(out, f"lk_{tag}_rec", res[0]["rec"]),
-         "conv": save(out, f"lk_{tag}_conv", res[0]["conv"])}
+    e = {"rows": R, "pos": pos, "prefill": prefill, "x0": save(out, f"{pre}_{tag}_x0", x0),
+         "conv0": save(out, f"{pre}_{tag}_conv0", states[0][0]), "rec0": save(out, f"{pre}_{tag}_rec0", states[0][1]),
+         "x": save(out, f"{pre}_{tag}_x", res[0]["x"]), "rec": save(out, f"{pre}_{tag}_rec", res[0]["rec"]),
+         "conv": save(out, f"{pre}_{tag}_conv", res[0]["conv"])}
     assert torch.equal(res[0]["x"], res[1]["x"]), "the two ranks' x differ"
     n = R * c.hidden
     for i, site in enumerate(snaps):
         gath = site.pop("gath")
-        e[f"s{i}"] = {"part": save(out, f"lk_{tag}_s{i}_part", gath[:n]),
-                      "peer": save(out, f"lk_{tag}_s{i}_peer", gath[n:2 * n])}
+        e[f"s{i}"] = {"part": save(out, f"{pre}_{tag}_s{i}_part", gath[:n]),
+                      "peer": save(out, f"{pre}_{tag}_s{i}_peer", gath[n:2 * n])}
         for key, t in site.items():
-            e[f"s{i}"][key] = save(out, f"lk_{tag}_s{i}_{key}", t)
+            e[f"s{i}"][key] = save(out, f"{pre}_{tag}_s{i}_{key}", t)
     prep = kda_chunked.prep_reference(snaps[0]["p"], k.b_off, snaps[0]["ka"], states[0][0], k.conv, k.a_log,
                                       k.dt_bias, c.lower, R)
-    e["prep"] = {key: save(out, f"lk_{tag}_prep_{key}", t) for key, t in zip(("q", "k", "v", "lg", "beta"), prep)}
+    e["prep"] = {key: save(out, f"{pre}_{tag}_prep_{key}", t) for key, t in zip(("q", "k", "v", "lg", "beta"), prep)}
     if prefill:              # the same chunk row-split between the ranks: every rank's own rows and state equal
         sres = _run(W, R, pos, prefill, True, states, x0)
         h = R // 2
@@ -240,28 +248,28 @@ def _case(out: Path, W, tag: str, R: int, pos: int, prefill: bool) -> dict:
     elif R == max(DECODE):   # commit(R, keep < R): the engine's replay of the kept rows, the conv shifted by keep
         kres = _run(W, R, pos, prefill, False, states, x0, keep=KEEP)
         assert torch.equal(kres[0]["x"], res[0]["x"]), "keep changed x"
-        e["keep"] = {"keep": KEEP, "rec": save(out, f"lk_{tag}_keep_rec", kres[0]["rec"]),
-                     "conv": save(out, f"lk_{tag}_keep_conv", kres[0]["conv"])}
+        e["keep"] = {"keep": KEEP, "rec": save(out, f"{pre}_{tag}_keep_rec", kres[0]["rec"]),
+                     "conv": save(out, f"{pre}_{tag}_keep_conv", kres[0]["conv"])}
     print(f"  layer {tag}: {R} rows at {pos}, x {res[0]['x'].float().abs().max():.3g} max")
     return e
 
 
-def write(out: Path, model_dir: Path) -> dict:
+def write(out: Path, model_dir: Path, layer: int = LAYER, pre: str = "lk") -> dict:
     from tensorfold.families.glm5_next.cuda import kda
 
-    W = [_load(model_dir, rank) for rank in (0, 1)]
+    W = [_load(model_dir, rank, layer) for rank in (0, 1)]
     c, L = W[0].cfg, W[0].layers[0]
-    assert L.kind == "kda" and L.moe is not None and L.moe.shared is not None and c.norm_topk
-    man = {"layer": LAYER, "params": {"eps": c.eps, "hc_eps": c.hc_eps, "hc_iters": c.hc_iters, "lower": c.lower,
+    assert L.kind == "kda" and (L.moe is None or L.moe.shared is not None) and c.norm_topk
+    man = {"layer": layer, "params": {"eps": c.eps, "hc_eps": c.hc_eps, "hc_iters": c.hc_iters, "lower": c.lower,
                                       "limit": c.limit, "routed_scale": c.routed_scale, "top_k": c.top_k,
                                       "experts": c.experts, "hidden": c.hidden, "streams": c.streams},
-           "weights": _weights(out, L, c), "cases": {}}
+           "weights": _weights(out, L, c, f"{pre}w"), "cases": {}}
     chunked = kda.CHUNKED
     try:
         kda.CHUNKED = True       # the recipe's TF_GLM_KDA_CHUNKED=1 (read per call)
         for R in DECODE:
-            man["cases"][f"d{R}"] = _case(out, W, f"d{R}", R, DECODE_POS, False)
-        man["cases"][f"p{PROMPT}"] = _case(out, W, f"p{PROMPT}", PROMPT, PROMPT_POS, True)
+            man["cases"][f"d{R}"] = _case(out, W, f"d{R}", R, DECODE_POS, False, pre)
+        man["cases"][f"p{PROMPT}"] = _case(out, W, f"p{PROMPT}", PROMPT, PROMPT_POS, True, pre)
     finally:
         kda.CHUNKED = chunked
     return man

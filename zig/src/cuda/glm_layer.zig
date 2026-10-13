@@ -1,4 +1,4 @@
-//! One GLM-5.3-Flash MoE layer on one rank (forward.py layer_forward): HC glue, the KDA or DSA mixer, MoE, two gathers.
+//! One GLM-5.3-Flash layer on one rank (forward.py layer_forward): HC glue, the KDA or DSA mixer, MoE or dense MLP.
 const std = @import("std");
 const driver = @import("driver.zig");
 const memory = @import("memory.zig");
@@ -109,10 +109,16 @@ pub const KdaW = struct {
 /// The rank's MoE: router [E, D] bf16 and bias [E] fp32, routed EXL3 experts, the shared expert's three linears.
 pub const MoeW = struct { router: u64, bias: u64, experts: exl3e.Layer, gate: exl3.Weight, up: exl3.Weight, down: exl3.Weight };
 
+/// A dense layer's MLP (layers 0-2): gate and up (the rank's columns), down (the rank's rows, an fp32 partial).
+pub const MlpW = struct { gate: exl3.Weight, up: exl3.Weight, down: exl3.Weight };
+
 /// The layer's mixer: the KDA block's weights or the DSA block's.
 pub const Mixer = union(enum) { kda: KdaW, dsa: dsa_.DsaW };
 
-pub const LayerW = struct { attn_hc: Hc, ffn_hc: Hc, in_norm: u64, post_norm: u64, mixer: Mixer, moe: MoeW };
+/// The layer's feed-forward: routed experts plus the shared one, or a dense SwiGLU MLP.
+pub const Ffn = union(enum) { moe: MoeW, mlp: MlpW };
+
+pub const LayerW = struct { attn_hc: Hc, ffn_hc: Hc, in_norm: u64, post_norm: u64, mixer: Mixer, ffn: Ffn };
 
 /// This layer's KDA state for one forward: the conv window [3, 3 H 128] bf16, the fp32 state read and written.
 pub const KdaState = struct { conv: u64, rec_in: u64, rec_out: u64 };
@@ -144,7 +150,31 @@ const Lay = struct {
     }
 };
 
-/// A forward's buffers for up to `rows` rows (forward.Buffers' slice for one KDA layer), one allocation.
+/// What a Scratch holds: the KDA mixer's buffers (null: none), the routed experts' (null: none), the widest SwiGLU.
+pub const Shape = struct {
+    kda: ?*const KdaW = null,
+    experts: ?exl3e.Layer = null,
+    width: u32,
+
+    /// One layer's needs.
+    pub fn of(w: *const LayerW) Shape {
+        return .{
+            .kda = if (w.mixer == .kda) &w.mixer.kda else null,
+            .experts = if (w.ffn == .moe) w.ffn.moe.experts else null,
+            .width = switch (w.ffn) {
+                .moe => |m| m.gate.n,
+                .mlp => |m| m.gate.n,
+            },
+        };
+    }
+
+    /// Both shapes' needs: one Scratch then serves layers of either (every KDA layer has the same heads).
+    pub fn widen(a: Shape, b: Shape) Shape {
+        return .{ .kda = a.kda orelse b.kda, .experts = a.experts orelse b.experts, .width = @max(a.width, b.width) };
+    }
+};
+
+/// A forward's buffers for up to `rows` rows (forward.Buffers' slice for the layers of a Shape), one allocation.
 pub const Scratch = struct {
     buf: memory.DeviceBuffer,
     rows: usize,
@@ -170,8 +200,9 @@ pub const Scratch = struct {
     pick: u64,
     wts: u64,
     ey: u64, // [rows, slots, D] fp32: routed slots, then the shared expert in the last
-    esc: exl3e.Scratch,
+    esc: ?exl3e.Scratch, // the routed experts' (null: the Shape has none)
     esc_len: usize,
+    width: usize, // the widest SwiGLU the next buffers hold
     smg: u64,
     smu: u64,
     sgu: u64,
@@ -179,16 +210,18 @@ pub const Scratch = struct {
     sxs: u64,
     sy: u64,
 
-    fn place(l: *Lay, c: Config, w: *const LayerW, rows: usize, world: u32) !Scratch {
+    fn place(l: *Lay, c: Config, sh: Shape, rows: usize, world: u32) !Scratch {
         const d: usize = c.d;
-        // a DSA layer takes no KDA buffers (their sizes are 0; dsa.Scratch holds its own)
-        const kd: ?*const KdaW = if (w.mixer == .kda) &w.mixer.kda else null;
+        // a DSA layer takes no KDA buffers (their sizes are 0; dsa.Scratch holds its own); a dense MLP none of MoE's
+        const kd = sh.kda;
         const per: usize = if (kd) |v| @as(usize, v.heads) * kda_.d_k else 0;
         const heads: usize = if (kd) |v| v.heads else 0;
         const p_stride: usize = if (kd) |v| v.p_stride else 0;
         const slots: usize = c.top_k + 1;
-        const sw: usize = w.moe.gate.n;
-        var mp: usize = @as(usize, bmm_.router_ks) * rows * c.experts * 4;
+        const ne: usize = if (sh.experts != null) c.experts else 0;
+        const er: usize = if (sh.experts != null) rows else 0;
+        const sw: usize = sh.width;
+        var mp: usize = @as(usize, bmm_.router_ks) * rows * ne * 4;
         if (kd) |v| for ([_]B16{ v.fa, v.ga, v.b, v.fb, v.gb }) |q| {
             mp = @max(mp, bmm_.Bmm.partBytes(q, rows));
         };
@@ -212,35 +245,46 @@ pub const Scratch = struct {
         sc.kda = .{ .k = l.take(rows * per * 4), .v = l.take(rows * per * 2), .g = l.take(rows * per * 4), .b = l.take(rows * heads * 4), .q = l.take(rows * per * 4), .y = l.take(rows * per * 2) };
         sc.part = l.take(rows * d * 4);
         sc.gath = l.take(@as(usize, world) * rows * d * 4);
-        sc.mlog = l.take(rows * @as(usize, c.experts) * 4);
-        sc.pick = l.take(rows * slots * 4);
-        sc.wts = l.take(rows * slots * 4);
-        sc.ey = l.take(rows * slots * d * 4);
-        sc.esc_len = try exl3e.scratchBytes(w.moe.experts, rows, slots);
-        sc.esc = try exl3e.scratch(l.take(sc.esc_len), w.moe.experts, rows, slots);
+        sc.mlog = l.take(rows * ne * 4);
+        sc.pick = l.take(er * slots * 4);
+        sc.wts = l.take(er * slots * 4);
+        sc.ey = l.take(er * slots * d * 4);
+        sc.esc = null;
+        sc.esc_len = 0;
+        if (sh.experts) |ex| {
+            sc.esc_len = try exl3e.scratchBytes(ex, rows, slots);
+            sc.esc = try exl3e.scratch(l.take(sc.esc_len), ex, rows, slots);
+        }
+        sc.width = sw;
         sc.smg = l.take(rows * sw * 2);
         sc.smu = l.take(rows * sw * 2);
         sc.sgu = l.take(rows * 2 * sw * 2);
         sc.sact = l.take(rows * sw * 2);
         sc.sxs = l.take(rows * sw / 64 * 4);
-        sc.sy = l.take(rows * d * 4);
+        sc.sy = l.take(er * d * 4);
         return sc;
     }
 
     /// Zeroed buffers (torch.zeros' experts scratch, its members list at -1); `world` ranks' partials gathered.
-    pub fn init(d: *const driver.Driver, s: Stream, c: Config, w: *const LayerW, rows: usize, world: u32) !Scratch {
+    pub fn initFor(d: *const driver.Driver, s: Stream, c: Config, sh: Shape, rows: usize, world: u32) !Scratch {
         var probe: Lay = .{ .at = 0 };
-        _ = try place(&probe, c, w, rows, world);
+        _ = try place(&probe, c, sh, rows, world);
         var buf = try memory.DeviceBuffer.alloc(d, probe.at);
         errdefer buf.free();
         try buf.fill8(0, s.handle);
         var l: Lay = .{ .at = buf.ptr };
-        var sc = try place(&l, c, w, rows, world);
+        var sc = try place(&l, c, sh, rows, world);
         sc.buf = buf;
-        const m_len = sc.esc.xg + sc.esc_len - sc.esc.members;
-        const mb: memory.DeviceBuffer = .{ .d = d, .ptr = sc.esc.members, .len = m_len, .borrowed = true };
-        try mb.fill8(0xff, s.handle);
+        if (sc.esc) |esc| {
+            const mb: memory.DeviceBuffer = .{ .d = d, .ptr = esc.members, .len = esc.xg + sc.esc_len - esc.members, .borrowed = true };
+            try mb.fill8(0xff, s.handle);
+        }
         return sc;
+    }
+
+    /// One layer's buffers (Shape.of).
+    pub fn init(d: *const driver.Driver, s: Stream, c: Config, w: *const LayerW, rows: usize, world: u32) !Scratch {
+        return initFor(d, s, c, Shape.of(w), rows, world);
     }
 
     pub fn deinit(sc: *Scratch) void {
@@ -309,23 +353,36 @@ pub fn commit(k: *Kernels, s: *Stream, w: *const KdaW, st: KdaState, sc: *const 
     try shiftConv(k, s, w, st, sc, keep);
 }
 
+/// A SwiGLU MLP on normed (shared expert or dense layer): EXL3 gate and up, the fused pair, down into out fp32.
+fn swigluMlp(k: *Kernels, s: Stream, c: Config, gate: exl3.Weight, up: exl3.Weight, down: exl3.Weight, sc: *const Scratch, rows: usize, out: u64) !void {
+    const sw: usize = gate.n;
+    if (sw > sc.width or up.n != sw or down.k != sw) return error.GlmLayerWidth;
+    try k.dense.prompt(s, gate, sc.normed, .bf16, rows, sc.smg, .bf16);
+    try k.dense.prompt(s, up, sc.normed, .bf16, rows, sc.smu, .bf16);
+    try copyRows(k.d, s, sc.sgu, 4 * sw, sc.smg, 2 * sw, 2 * sw, rows);
+    try copyRows(k.d, s, sc.sgu + 2 * sw, 4 * sw, sc.smu, 2 * sw, 2 * sw, rows);
+    try k.glue.swiglu(s, sc.sgu, sc.sact, sc.sxs, c.limit, rows, sw);
+    try k.dense.prompt(s, down, sc.sact, .bf16, rows, out, .f32);
+}
+
 /// moe_block on the EXL3 route: router, select, routed per-slot y, the shared expert into the last slot, combine.
 pub fn moeBlock(k: *Kernels, s: Stream, c: Config, w: *const MoeW, sc: *const Scratch, rows: usize) !void {
     if (rows == 0 or rows > sc.rows) return error.GlmLayerRows;
+    const esc = sc.esc orelse return error.GlmLayerScratch;
     const d: usize = c.d;
     const slots: usize = c.top_k + 1;
     try k.bmm.router(s, sc.normed, c.d, w.router, rows, c.experts, d, sc.mlog, sc.mpart);
     try k.glue.topk(s, sc.mlog, w.bias, sc.pick, sc.wts, c.routed_scale, rows, c.experts, c.top_k);
-    try k.experts.runPerSlot(s, w.experts, sc.normed, d, .bf16, sc.pick, rows, sc.ey, sc.esc);
-    const sw: usize = w.gate.n;
-    try k.dense.prompt(s, w.gate, sc.normed, .bf16, rows, sc.smg, .bf16);
-    try k.dense.prompt(s, w.up, sc.normed, .bf16, rows, sc.smu, .bf16);
-    try copyRows(k.d, s, sc.sgu, 4 * sw, sc.smg, 2 * sw, 2 * sw, rows);
-    try copyRows(k.d, s, sc.sgu + 2 * sw, 4 * sw, sc.smu, 2 * sw, 2 * sw, rows);
-    try k.glue.swiglu(s, sc.sgu, sc.sact, sc.sxs, c.limit, rows, sw);
-    try k.dense.prompt(s, w.down, sc.sact, .bf16, rows, sc.sy, .f32);
+    try k.experts.runPerSlot(s, w.experts, sc.normed, d, .bf16, sc.pick, rows, sc.ey, esc);
+    try swigluMlp(k, s, c, w.gate, w.up, w.down, sc, rows, sc.sy);
     try copyRows(k.d, s, sc.ey + (slots - 1) * d * 4, slots * d * 4, sc.sy, d * 4, d * 4, rows);
     try k.glue2.combineF32(s, sc.ey, sc.wts, sc.part, rows, d, slots);
+}
+
+/// mlp_block: a dense layer's MLP, the rank's fp32 partial into part.
+pub fn mlpBlock(k: *Kernels, s: Stream, c: Config, w: *const MlpW, sc: *const Scratch, rows: usize) !void {
+    if (rows == 0 or rows > sc.rows) return error.GlmLayerRows;
+    try swigluMlp(k, s, c, w.gate, w.up, w.down, sc, rows, sc.part);
 }
 
 /// hc_post of the gathered partials (rank 0's first) into x in place.
@@ -348,6 +405,9 @@ pub fn forward(k: *Kernels, s: *Stream, c: Config, w: *const LayerW, mix: MixSta
     }
     try post(k, s.*, c, x, sc, g, .attn, rows);
     try hcPre(k, s.*, c, w.ffn_hc, w.post_norm, x, sc, rows);
-    try moeBlock(k, s.*, c, &w.moe, sc, rows);
+    switch (w.ffn) {
+        .moe => |*m| try moeBlock(k, s.*, c, m, sc, rows),
+        .mlp => |*m| try mlpBlock(k, s.*, c, m, sc, rows),
+    }
     try post(k, s.*, c, x, sc, g, .ffn, rows);
 }

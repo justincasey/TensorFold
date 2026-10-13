@@ -1,4 +1,4 @@
-//! glm.layer.kda: a real RED-SNOW KDA MoE layer at TP=2 rank 0 vs the Python engine's layer_forward, bit for bit.
+//! glm.layer.kda (glm.layer.mlp: a dense layer): a real KDA layer at TP=2 rank 0 vs Python's layer_forward, bit-exact.
 const std = @import("std");
 const cuda = @import("cuda");
 const check = @import("check.zig");
@@ -16,11 +16,11 @@ const Obj = std.json.ObjectMap;
 const id = "glm.layer.kda";
 
 pub fn run(r: *Rig, state: *Run, dir: []const u8) !void {
-    kdaLayer(r, dir) catch |e| state.fail(e, id);
+    kdaLayer(r, dir, "layer", id) catch |e| state.fail(e, id);
 }
 
-fn skip() void {
-    std.debug.print("SKIP {s}\n", .{id});
+fn skip(lid: []const u8) void {
+    std.debug.print("SKIP {s}\n", .{lid});
 }
 
 pub fn file(r: *Rig, dir: []const u8, name: []const u8) ![]u8 {
@@ -51,11 +51,12 @@ pub fn config(p: Obj) lay.Config {
     };
 }
 
-fn kdaLayer(r: *Rig, dir: []const u8) !void {
-    if (std.mem.eql(u8, dir, "none")) return skip();
+/// The manifest section's KDA layer (MoE or dense MLP) through every window, reported as `lid`.
+pub fn kdaLayer(r: *Rig, dir: []const u8, section: []const u8, lid: []const u8) !void {
+    if (std.mem.eql(u8, dir, "none")) return skip(lid);
     var man = try ref.Manifest.open(r.gpu.gpa, r.gpu.io, dir);
     defer man.deinit();
-    const o = (man.root().get("layer") orelse return skip()).object;
+    const o = (man.root().get(section) orelse return skip(lid)).object;
     const c = config(o.get("params").?.object);
     const host = try lref.Host.read(r.a, r.gpu.io, dir, o.get("weights").?.object);
     const w = try weights(r, &host, c);
@@ -68,14 +69,14 @@ fn kdaLayer(r: *Rig, dir: []const u8) !void {
         const t0 = check.now(r.gpu.io);
         const tag = kv.key_ptr.*;
         const e = kv.value_ptr.object;
-        try window(r, &k, dir, c, &w, tag, e);
-        const q = try lref.layerF64(r.a, r.gpu.io, dir, c, &host, tag, e);
+        try window(r, &k, dir, c, &w, tag, e, lid);
+        const q = try lref.layerF64(r.a, r.gpu.io, dir, c, &host, tag, e, lid);
         worst = @max(worst, q);
         const dt = @as(f64, @floatFromInt(check.now(r.gpu.io) - t0)) / 1e9;
-        std.debug.print("RESULT {s} {s}: bit-exact, f64 worst {d:.4} of tolerance ({d:.1} s)\n", .{ id, tag, q, dt });
+        std.debug.print("RESULT {s} {s}: bit-exact, f64 worst {d:.4} of tolerance ({d:.1} s)\n", .{ lid, tag, q, dt });
     }
-    std.debug.print("RESULT {s}: {d} windows bit-exact, f64 worst {d:.4} of tolerance\n", .{ id, cases.count(), worst });
-    check.pass("{s}", .{id});
+    std.debug.print("RESULT {s}: {d} windows bit-exact, f64 worst {d:.4} of tolerance\n", .{ lid, cases.count(), worst });
+    check.pass("{s}", .{lid});
 }
 
 pub fn linW(r: *Rig, l: lref.Lin) !exl3.Weight {
@@ -163,7 +164,7 @@ fn weights(r: *Rig, h: *const lref.Host, c: lay.Config) !lay.LayerW {
             .b_off = kd.b_off,
             .p_stride = kd.p_stride,
         } },
-        .moe = try moeW(r, h, c),
+        .ffn = if (h.dense) .{ .mlp = .{ .gate = try linW(r, h.sh[0]), .up = try linW(r, h.sh[1]), .down = try linW(r, h.sh[2]) } } else .{ .moe = try moeW(r, h, c) },
     };
 }
 
@@ -210,12 +211,12 @@ pub const Ctx = struct {
     }
 };
 
-fn sameAt(r: *Rig, dir: []const u8, tag: []const u8, what: []const u8, ptr: u64, name: []const u8) !void {
-    try same(r, dir, try std.fmt.allocPrint(r.a, "{s} {s} {s}", .{ id, tag, what }), ptr, name);
+fn sameAt(r: *Rig, dir: []const u8, lid: []const u8, tag: []const u8, what: []const u8, ptr: u64, name: []const u8) !void {
+    try same(r, dir, try std.fmt.allocPrint(r.a, "{s} {s} {s}", .{ lid, tag, what }), ptr, name);
 }
 
 /// One window from the fixture's state: forward (+ commit for decode), every stage's bits, x and the KDA state.
-fn window(r: *Rig, k: *lay.Kernels, dir: []const u8, c: lay.Config, w: *const lay.LayerW, tag: []const u8, e: Obj) !void {
+fn window(r: *Rig, k: *lay.Kernels, dir: []const u8, c: lay.Config, w: *const lay.LayerW, tag: []const u8, e: Obj, lid: []const u8) !void {
     const rows: usize = @intCast(ref.int(e, "rows"));
     const prefill = e.get("prefill").?.bool;
     var sc = try lay.Scratch.init(r.gpu.d, r.s, c, w, rows, 2);
@@ -227,22 +228,22 @@ fn window(r: *Rig, k: *lay.Kernels, dir: []const u8, c: lay.Config, w: *const la
         .{ "p", sc.p },      .{ "ka", sc.ka },    .{ "kg", sc.kg },    .{ "kout", sc.kout },
         .{ "sk", sc.kda.k }, .{ "sv", sc.kda.v }, .{ "sg", sc.kda.g }, .{ "sb", sc.kda.b },
     };
-    var ctx: Ctx = .{ .r = r, .id = id, .dir = dir, .tag = tag, .e = e, .sc = &sc, .attn = &attn, .x = x, .d = c.d };
+    var ctx: Ctx = .{ .r = r, .id = lid, .dir = dir, .tag = tag, .e = e, .sc = &sc, .attn = &attn, .x = x, .d = c.d };
     const g: lay.Gather = .{ .ctx = &ctx, .world = 2, .run = Ctx.gather };
     const mode: lay.Mode = if (prefill) .{ .prompt = @intCast(ref.int(e, "pos")) } else .decode;
     try lay.forward(k, &r.s, c, w, .{ .kda = .{ .st = st, .mode = mode } }, &sc, x, rows, g);
     const kw = &w.mixer.kda;
     if (!prefill) try lay.commit(k, &r.s, kw, st, &sc, rows, rows);
-    try sameAt(r, dir, tag, "x", x, ref.str(e, "x"));
-    try sameAt(r, dir, tag, "rec", st.rec_out, ref.str(e, "rec"));
-    try sameAt(r, dir, tag, "conv", st.conv, ref.str(e, "conv"));
+    try sameAt(r, dir, lid, tag, "x", x, ref.str(e, "x"));
+    try sameAt(r, dir, lid, tag, "rec", st.rec_out, ref.str(e, "rec"));
+    try sameAt(r, dir, lid, tag, "conv", st.conv, ref.str(e, "conv"));
     // the oracle ran the chunk row-split too (HC_SPLIT=1, PREFILL_OVERLAP=2): own rows and both states equal unsplit
-    if (prefill) try check.expect(if (e.get("split_equal")) |v| v.bool else false, "{s} {s}: no split check", .{ id, tag });
+    if (prefill) try check.expect(if (e.get("split_equal")) |v| v.bool else false, "{s} {s}: no split check", .{ lid, tag });
     if (e.get("keep")) |kv| {
         const ko = kv.object;
         const kst: lay.KdaState = .{ .conv = try up(r, dir, ref.str(e, "conv0")), .rec_in = st.rec_in, .rec_out = try r.zeros(rec0.len) };
         try lay.commit(k, &r.s, kw, kst, &sc, rows, @intCast(ref.int(ko, "keep")));
-        try sameAt(r, dir, tag, "keep rec", kst.rec_out, ref.str(ko, "rec"));
-        try sameAt(r, dir, tag, "keep conv", kst.conv, ref.str(ko, "conv"));
+        try sameAt(r, dir, lid, tag, "keep rec", kst.rec_out, ref.str(ko, "rec"));
+        try sameAt(r, dir, lid, tag, "keep conv", kst.conv, ref.str(ko, "conv"));
     }
 }

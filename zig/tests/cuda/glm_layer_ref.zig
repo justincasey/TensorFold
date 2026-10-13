@@ -1,4 +1,4 @@
-//! glm.layer.kda's float64 part: every stage of the layer recomputed in f64 from the stage's fixture inputs.
+//! glm.layer.kda and glm.layer.mlp's float64 part: every stage of the layer recomputed in f64 from its fixture inputs.
 const std = @import("std");
 const cuda = @import("cuda");
 const ref = @import("glm_kda_ref.zig");
@@ -59,7 +59,7 @@ pub const ExpertsHost = struct {
     }
 };
 
-/// Rank 0's layer tensors from the fixture (manifest "layer"."weights"), read once.
+/// Rank 0's layer tensors from the fixture (manifest section's "weights"), read once; ffn MoE or dense MLP.
 pub const Host = struct {
     attn_hc: [3][]const u8,
     ffn_hc: [3][]const u8,
@@ -68,8 +68,9 @@ pub const Host = struct {
     router: []const u8,
     bias: []const u8,
     kda: ?KdaHost,
-    ex: ExpertsHost,
-    sh: [3]Lin,
+    ex: ExpertsHost, // undefined for a dense layer
+    sh: [3]Lin, // the shared expert's gate, up, down; a dense layer's MLP
+    dense: bool,
 
     pub fn read(a: std.mem.Allocator, io: std.Io, dir: []const u8, o: Obj) !Host {
         const R = struct {
@@ -91,17 +92,16 @@ pub const Host = struct {
             }
         };
         const s: R = .{ .a = a, .io = io, .dir = dir };
-        const m = o.get("moe").?.object;
-        const ex = m.get("experts").?.object;
-        const sh = m.get("shared").?.object;
-        if (ref.int(ex, "cb") != 2) return error.GlmLayerCodebook;
+        const mo = o.get("moe");
+        const m = (mo orelse o.get("mlp").?).object;
+        const sh = if (mo != null) m.get("shared").?.object else m;
         var h: Host = .{
             .attn_hc = try s.hc(o.get("attn_hc").?.object),
             .ffn_hc = try s.hc(o.get("ffn_hc").?.object),
             .in_norm = try s.f(o, "in_norm"),
             .post_norm = try s.f(o, "post_norm"),
-            .router = try s.f(m, "router"),
-            .bias = try s.f(m, "bias"),
+            .router = if (mo != null) try s.f(m, "router") else "",
+            .bias = if (mo != null) try s.f(m, "bias") else "",
             .kda = if (o.get("kda")) |kv| kda: { // a DSA layer's fixture has none
                 const k = kv.object;
                 break :kda .{
@@ -125,7 +125,11 @@ pub const Host = struct {
             } else null,
             .ex = undefined,
             .sh = .{ try s.lin(sh.get("gate").?.object), try s.lin(sh.get("up").?.object), try s.lin(sh.get("down").?.object) },
+            .dense = mo == null,
         };
+        if (h.dense) return h;
+        const ex = m.get("experts").?.object;
+        if (ref.int(ex, "cb") != 2) return error.GlmLayerCodebook;
         const count: usize = @intCast(ref.int(ex, "count"));
         h.ex = .{ .proj = undefined, .offs = undefined, .k2 = undefined, .suh_g = try s.f(ex, "suh_g"), .suh_u = try s.f(ex, "suh_u"), .svh_g = try s.f(ex, "svh_g"), .svh_u = try s.f(ex, "svh_u"), .suh_d = try s.f(ex, "suh_d"), .svh_d = try s.f(ex, "svh_d"), .count = count, .dims = @intCast(ref.int(ex, "dims")), .width = @intCast(ref.int(ex, "width")) };
         const names = [3][3][]const u8{ .{ "gate", "gate_offs", "gate_k2" }, .{ "up", "up_offs", "up_k2" }, .{ "down", "down_offs", "down_k2" } };
@@ -401,12 +405,12 @@ pub const Win = struct {
 };
 
 /// The whole layer in f64, stage by stage from each stage's inputs; returns the worst fraction of tolerance.
-pub fn layerF64(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: lay.Config, h: *const Host, tag: []const u8, e: Obj) !f64 {
+pub fn layerF64(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: lay.Config, h: *const Host, tag: []const u8, e: Obj, lid: []const u8) !f64 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
     const w: Win = .{ .a = a, .io = io, .dir = dir, .e = e };
-    var rp: Report = .{ .a = a, .tag = tag };
+    var rp: Report = .{ .a = a, .tag = tag, .id = lid };
     const rows: usize = @intCast(ref.int(e, "rows"));
     const d: usize = c.d;
     const kd = if (h.kda) |*v| v else return error.GlmLayerKind;
@@ -431,12 +435,12 @@ pub fn layerF64(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: lay.Conf
     try exl3Stage(&rp, a, "o_proj", kd.o, kout, sm, part0v, d, 0, true);
     const x1 = try w.bf("s1", "x");
     try hcPostStage(&rp, "attn hc_post", d, x0, part0, try w.f("s0", "peer"), try w.f("s0", "post"), try w.f("s0", "comb"), rows, x1);
-    // the MoE site: hc_pre, router, select, routed and shared experts, combine, hc_post
+    // the ffn site: hc_pre, the MoE (router, select, routed and shared experts, combine) or the dense MLP, hc_post
     const n1 = try w.bf("s1", "normed");
     try hcPreStage(&rp, a, "ffn hc_pre", c, h.ffn_hc, h.post_norm, x1, rows, n1, try w.f("s1", "post"), try w.f("s1", "comb"));
-    try moeStage(&rp, a, w, c, h, n1, rows);
+    if (h.dense) _ = try swigluStage(&rp, a, w, c, h.sh, n1, rows, "mlp", "part") else try moeStage(&rp, a, w, c, h, n1, rows);
     try hcPostStage(&rp, "ffn hc_post", d, x1, try w.f("s1", "part"), try w.f("s1", "peer"), try w.f("s1", "post"), try w.f("s1", "comb"), rows, try w.bf(null, "x"));
-    std.debug.print("RESULT {s} {s} f64 per stage (fraction of tolerance):{s}\n", .{ id, tag, rp.line });
+    std.debug.print("RESULT {s} {s} f64 per stage (fraction of tolerance):{s}\n", .{ lid, tag, rp.line });
     return rp.worst;
 }
 
@@ -518,25 +522,7 @@ pub fn moeStage(rp: *Report, a: std.mem.Allocator, w: Win, c: lay.Config, h: *co
     }
     try rp.stage("select", bw);
     try expertStage(rp, a, w, c, h, n1, picks, rows);
-    // the shared expert: gate and up (EXL3), SwiGLU, down (EXL3, fp32), then the slot-weighted combine
-    const sm = samples(rows);
-    const sw: usize = h.sh[0].n;
-    const smg = try w.bf("s1", "smg");
-    const smu = try w.bf("s1", "smu");
-    try exl3Stage(rp, a, "shared gate", h.sh[0], n1, sm, smg, sw, 0, false);
-    try exl3Stage(rp, a, "shared up", h.sh[1], n1, sm, smu, sw, 0, false);
-    const sact = try w.bf("s1", "sact");
-    var bs = Bound{};
-    for (0..rows * sw) |i| {
-        const g = @min(smg[i], c.limit);
-        const u = std.math.clamp(smu[i], -c.limit, c.limit);
-        bs.rel(sact[i], bf16r(bf16r(g * sigmoid(g)) * u), 1.0 / 64.0, 3e-3, i);
-    }
-    try rp.stage("shared swiglu", bs);
-    const sy = try w.f("s1", "sy");
-    const syv = try a.alloc(f64, sy.len);
-    for (syv, sy) |*o, v| o.* = v;
-    try exl3Stage(rp, a, "shared down", h.sh[2], sact, sm, syv, d, 0, true);
+    _ = try swigluStage(rp, a, w, c, h.sh, n1, rows, "shared", "sy");
     const ey = try w.f("s1", "ey");
     const part = try w.f("s1", "part");
     var bc = Bound{};
@@ -546,6 +532,29 @@ pub fn moeStage(rp: *Report, a: std.mem.Allocator, w: Win, c: lay.Config, h: *co
         bc.rel(part[i * d + j], acc, 1.0 / 1024.0, 1e-5, i * d + j);
     };
     try rp.stage("combine", bc);
+}
+
+/// A SwiGLU MLP (the shared expert, or a dense layer's): gate and up (EXL3), SwiGLU, down (EXL3, fp32 into `out`).
+fn swigluStage(rp: *Report, a: std.mem.Allocator, w: Win, c: lay.Config, lin: [3]Lin, n1: []const f64, rows: usize, label: []const u8, out: []const u8) ![]const f32 {
+    const sm = samples(rows);
+    const sw: usize = lin[0].n;
+    const smg = try w.bf("s1", "smg");
+    const smu = try w.bf("s1", "smu");
+    try exl3Stage(rp, a, try std.fmt.allocPrint(a, "{s} gate", .{label}), lin[0], n1, sm, smg, sw, 0, false);
+    try exl3Stage(rp, a, try std.fmt.allocPrint(a, "{s} up", .{label}), lin[1], n1, sm, smu, sw, 0, false);
+    const sact = try w.bf("s1", "sact");
+    var bs = Bound{};
+    for (0..rows * sw) |i| {
+        const g = @min(smg[i], c.limit);
+        const u = std.math.clamp(smu[i], -c.limit, c.limit);
+        bs.rel(sact[i], bf16r(bf16r(g * sigmoid(g)) * u), 1.0 / 64.0, 3e-3, i);
+    }
+    try rp.stage(try std.fmt.allocPrint(a, "{s} swiglu", .{label}), bs);
+    const y = try w.f("s1", out);
+    const yv = try a.alloc(f64, y.len);
+    for (yv, y) |*o, v| o.* = v;
+    try exl3Stage(rp, a, try std.fmt.allocPrint(a, "{s} down", .{label}), lin[2], sact, sm, yv, c.d, 0, true);
+    return y;
 }
 
 /// Routed slots of the first and last rows: gate/up, the bf16 SwiGLU the epilogue rounds, down, each slot's y.

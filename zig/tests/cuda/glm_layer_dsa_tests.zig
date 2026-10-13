@@ -84,7 +84,7 @@ fn dsaLayer(r: *Rig, dir: []const u8) !void {
             .wv = try r.dev(dh.wv),
             .index = .{ .kw = try lt.b16W(r, dh.kw), .qb = try lt.b16W(r, dh.qb), .gate = try r.dev(dh.gate), .ln_w = try r.dev(dh.ln_w), .ln_b = try r.dev(dh.ln_b), .ape = try r.dev(dh.ape) },
         } },
-        .moe = try lt.moeW(r, h, c),
+        .ffn = .{ .moe = try lt.moeW(r, h, c) },
     };
     for (names, 0..) |n, i| l.pre[i] = try lt.file(r, dir, ref.str(o.get("pre").?.object, n));
     var k = try lay.Kernels.load(r.gpu.d);
