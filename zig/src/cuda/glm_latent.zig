@@ -103,7 +103,6 @@ pub const Latent = struct {
         try launch_.launch(self.expand_fn, .{ .grid = .{ .x = heads, .y = 256 / 16, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s.*, &args);
     }
 
-
     /// One 512-key chunk a block (z), a 16/32-row qk group a block (y; 32 qk rows when rows >= 64).
     pub fn attnChunks(
         self: *Latent,
@@ -125,7 +124,9 @@ pub const Latent = struct {
         scale: f32,
     ) !void {
         const hbt: u32 = if (rows >= 64) 32 else 16;
-        const idx: u32 = (if (hbt == 32) @as(u32, 2) else 0) + (if (fp8) @as(u32, 1) else 0) + (if (sparse) @as(u32, 4) else 0);
+        if (sparse and !fp8) return error.SparseNeedsFp8;
+        const wide: u32 = if (hbt == 32) 1 else 0;
+        const idx: u32 = if (sparse) 4 + wide else 2 * wide + (if (fp8) @as(u32, 1) else 0);
         var args = launch_.Args{};
         args.add(qa);
         args.add(cache);

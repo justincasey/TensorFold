@@ -254,7 +254,7 @@ fn sparseAttn(r: *Rig, state: *Run, dir: []const u8) !void {
             const want64 = try sref.sparseRef(r.a, u16s(qa), cache, f32s(scales), i32s(tokens), cnts, 32, 512, scale);
             for (0..rows) |row| {
                 if (cnts[row] == 0) continue;
-                try t.close(try std.fmt.allocPrint(r.a, "glm.dsa.sparse {s} r{d} f64", .{ tag, row }), got[row * 32 * 512 * 2 ..][0..32 * 512 * 2], want64[row * 32 * 512 ..][0..32 * 512], false, 1.0 / 64.0, 2.0e-3);
+                try t.close(try std.fmt.allocPrint(r.a, "glm.dsa.sparse {s} r{d} f64", .{ tag, row }), got[row * 32 * 512 * 2 ..][0 .. 32 * 512 * 2], want64[row * 32 * 512 ..][0 .. 32 * 512], false, 1.0 / 64.0, 2.0e-3);
             }
         }
         try check.sameBytes(try std.fmt.allocPrint(r.a, "glm.dsa.sparse {s} out", .{tag}), got, want_out);
@@ -262,4 +262,3 @@ fn sparseAttn(r: *Rig, state: *Run, dir: []const u8) !void {
     std.debug.print("RESULT glm.dsa.sparse: f64 worst {d:.4} of tolerance\n", .{t.worst});
     check.pass("glm.dsa.sparse", .{});
 }
-

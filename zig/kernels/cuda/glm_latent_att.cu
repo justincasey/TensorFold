@@ -150,9 +150,9 @@ __device__ __forceinline__ void attn_chunks(const ChunksArgs a) {
         const unsigned* qrowB = qrowA + 2048;
         float sacc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (int kstep = 0; kstep < 32; ++kstep) {
-            // dense: sequential 16-latent window; sparse: strided slots (empirical, from the Triton kernels)
-            const unsigned abase = SPARSE ? 16 * (kstep >> 1) + 2 * m + (kstep & 1) : 8 * kstep + m;
-            const unsigned boff = SPARSE ? 8 : 4;
+            // Triton's dot operand kWidth: bf16 2 (sequential 16-latent window), fp8 4 (even/odd pairs of a 32 window)
+            const unsigned abase = FP8 ? 16 * (kstep >> 1) + 2 * m + (kstep & 1) : 8 * kstep + m;
+            const unsigned boff = FP8 ? 8 : 4;
             const unsigned av[4] = {qrowA[abase], qrowB[abase],
                                     qrowA[abase + boff], qrowB[abase + boff]};
             const unsigned* krow = kv[kbase + (l >> 2)];
@@ -209,16 +209,17 @@ __device__ __forceinline__ void attn_chunks(const ChunksArgs a) {
         psh[rowA][pw + m] = pack_bf16x2(p0, p1);
         psh[rowB][pw + m] = pack_bf16x2(p2, p3);
         __syncthreads();
-        // value mma: A from psh (kstep s needs the u32s that warp groups 2s/2s+1 wrote), B the u16 latents
+        // value mma: A from psh (key pairs pu0/pu1 as in the scores map), B the u16 latents of those keys
         for (int j = 0; j < NT; ++j) {
             for (int kstep = 0; kstep < 2; ++kstep) {
+                const int pu0 = FP8 ? 2 * m + kstep : 8 * kstep + m;
+                const int pu1 = pu0 + (FP8 ? 8 : 4);
                 const int ncol = on_base + 8 * j + (l >> 2);
-                const unsigned pav[4] = {psh[rowA][8 * kstep + m], psh[rowB][8 * kstep + m],
-                                        psh[rowA][8 * kstep + m + 4], psh[rowB][8 * kstep + m + 4]};
+                const unsigned pav[4] = {psh[rowA][pu0], psh[rowB][pu0], psh[rowA][pu1], psh[rowB][pu1]};
                 const unsigned cu = (unsigned)(ncol >> 1);
                 const unsigned sh = (unsigned)(ncol & 1) << 4;
-                const unsigned k0 = kv[16 * kstep + 2 * m][cu], k1 = kv[16 * kstep + 2 * m + 1][cu];
-                const unsigned k8 = kv[16 * kstep + 2 * m + 8][cu], k9 = kv[16 * kstep + 2 * m + 9][cu];
+                const unsigned k0 = kv[2 * pu0][cu], k1 = kv[2 * pu0 + 1][cu];
+                const unsigned k8 = kv[2 * pu1][cu], k9 = kv[2 * pu1 + 1][cu];
                 const unsigned b0 = ((k0 >> sh) & 0xffffu) | (((k1 >> sh) & 0xffffu) << 16);
                 const unsigned b1 = ((k8 >> sh) & 0xffffu) | (((k9 >> sh) & 0xffffu) << 16);
                 const unsigned bv[2] = {b0, b1};
