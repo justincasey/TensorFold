@@ -39,6 +39,7 @@ pub const glm_kda = @import("glm_kda.zig");
 pub const glm_kda_chunk = @import("glm_kda_chunk.zig");
 pub const glm_bmm = @import("glm_bmm.zig");
 pub const glm_glue = @import("glm_glue.zig");
+pub const glm_glue2 = @import("glm_glue2.zig");
 pub const glm_sparse = @import("glm_sparse.zig");
 
 test {
@@ -61,6 +62,7 @@ test {
     _ = glm_kda_chunk;
     _ = glm_bmm;
     _ = glm_glue;
+    _ = glm_glue2;
     _ = glm_sparse;
     _ = @import("modelopt.zig");
 }
