@@ -11,6 +11,7 @@ import glm_oracle_glue
 import glm_oracle_kda
 import glm_oracle_latent
 import glm_oracle_sparse
+import glm_oracle_layer
 
 
 def main() -> int:
@@ -26,6 +27,7 @@ def main() -> int:
     manifest["sparse"] = glm_oracle_sparse.write(out, model_dir)
     manifest["latent"] = glm_oracle_latent.write(out, model_dir)
     manifest["gaps"] = glm_oracle_gaps.write(out, model_dir)
+    manifest["layer"] = glm_oracle_layer.write(out, model_dir)
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     print(f"{len(manifest) - 2} families -> {out / 'manifest.json'}")
     return 0
