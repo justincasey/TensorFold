@@ -44,6 +44,8 @@ const kernels = [_]Kernel{
     .{ .name = "glm_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // glm5_next/cuda/glue.py's Triton kernels as device code
     .{ .name = "glm_glue2", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // glue.py's 1536/512 rmsnorms and the fp32-y combine (glm_glue.cu is at the file cap)
     .{ .name = "glm_sparse", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // glm5_next/cuda/sparse.py's Triton kernels as device code
+    .{ .name = "glm_latent", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // latent.py's cache write and kv_b projections
+    .{ .name = "glm_latent_att", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // latent.py's chunk attention and merge (glm_latent.cu is at the file cap)
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
     .{ .name = "torch_pointwise", .src = "torch_ops/pointwise", .flags = torch_ops },
