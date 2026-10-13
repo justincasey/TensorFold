@@ -398,6 +398,7 @@ __device__ __forceinline__ void swiglu(const u16* gu, u16* out, float* xs, float
 // -- MoE router top-k (glue.py _topk; BLOCK = next_pow2(ne+1) <= 512) -----------------------------
 __device__ __forceinline__ void topk(const float* lg, const float* bias, int* pick, float* wts, float scale, int ne, int topk) {
     __shared__ float mxs[4];
+    __shared__ float ivs[4];  // its own slots: a warp's index must not land in mxs while another still reads the max
     __shared__ float sks[4];
     int r = blockIdx.x, t = threadIdx.x, w = t >> 5, lane = t & 31;
     const int per = 4;  // BLOCK <= 512, 128 threads
@@ -423,9 +424,9 @@ __device__ __forceinline__ void topk(const float* lg, const float* bias, int* pi
         for (int i = 0; i < per; ++i)
             if (choice[i] == mx) iv = fminf(iv, (float)eid[i]);
         for (int i = 16; i; i >>= 1) iv = fminf(iv, __shfl_xor_sync(0xffffffffu, iv, i));
-        if (lane == 0) mxs[w] = iv;
+        if (lane == 0) ivs[w] = iv;
         __syncthreads();
-        int idx = (int)fminf(fminf(mxs[0], mxs[2]), fminf(mxs[1], mxs[3]));
+        int idx = (int)fminf(fminf(ivs[0], ivs[2]), fminf(ivs[1], ivs[3]));
         float sk = 0.0f;
         for (int i = 0; i < per; ++i)
             if (eid[i] == idx) sk += score[i];
