@@ -1,4 +1,4 @@
-//! One GLM-5.3-Flash KDA + MoE layer on one rank (forward.py layer_forward): HC glue, KDA block, MoE, two gathers.
+//! One GLM-5.3-Flash MoE layer on one rank (forward.py layer_forward): HC glue, the KDA or DSA mixer, MoE, two gathers.
 const std = @import("std");
 const driver = @import("driver.zig");
 const memory = @import("memory.zig");
@@ -10,6 +10,9 @@ const glue2_ = @import("glm_glue2.zig");
 const bmm_ = @import("glm_bmm.zig");
 const kda_ = @import("glm_kda.zig");
 const chunk_ = @import("glm_kda_chunk.zig");
+const latent_ = @import("glm_latent.zig");
+const sparse_ = @import("glm_sparse.zig");
+const dsa_ = @import("glm_dsa.zig");
 const Stream = stream_.Stream;
 const B16 = bmm_.B16;
 
@@ -23,6 +26,8 @@ pub const Kernels = struct {
     kda: kda_.Kda,
     chunk: chunk_.Chunk,
     experts: exl3e.Experts,
+    latent: latent_.Latent,
+    sparse: sparse_.Sparse,
 
     pub fn load(d: *const driver.Driver) !Kernels {
         var glue = try glue_.Glue.load(d);
@@ -37,11 +42,17 @@ pub const Kernels = struct {
         errdefer kda.unload();
         var chunk = try chunk_.Chunk.load(d);
         errdefer chunk.unload();
-        const experts = try exl3e.Experts.load(d);
-        return .{ .d = d, .glue = glue, .glue2 = glue2, .bmm = bmm, .dense = dense, .kda = kda, .chunk = chunk, .experts = experts };
+        var experts = try exl3e.Experts.load(d);
+        errdefer experts.unload();
+        var latent = try latent_.Latent.load(d);
+        errdefer latent.unload();
+        const sparse = try sparse_.Sparse.load(d);
+        return .{ .d = d, .glue = glue, .glue2 = glue2, .bmm = bmm, .dense = dense, .kda = kda, .chunk = chunk, .experts = experts, .latent = latent, .sparse = sparse };
     }
 
     pub fn unload(k: *Kernels) void {
+        k.sparse.unload();
+        k.latent.unload();
         k.experts.unload();
         k.chunk.unload();
         k.kda.unload();
@@ -49,6 +60,11 @@ pub const Kernels = struct {
         k.bmm.unload();
         k.glue2.unload();
         k.glue.unload();
+    }
+
+    /// The DSA block's view of these kernels.
+    pub fn dsa(k: *Kernels) dsa_.Kernels {
+        return .{ .glue2 = &k.glue2, .bmm = &k.bmm, .dense = &k.dense, .latent = &k.latent, .sparse = &k.sparse };
     }
 };
 
@@ -64,6 +80,7 @@ pub const Config = struct {
     experts: u32,
     d: u32 = 4096,
     streams: u32 = 4,
+    dsa: ?dsa_.Config = null, // a DSA layer's constants
 };
 
 /// One hyper-connection site: fn [24, S * D] fp32, base [24] fp32, scale [3] fp32.
@@ -92,13 +109,22 @@ pub const KdaW = struct {
 /// The rank's MoE: router [E, D] bf16 and bias [E] fp32, routed EXL3 experts, the shared expert's three linears.
 pub const MoeW = struct { router: u64, bias: u64, experts: exl3e.Layer, gate: exl3.Weight, up: exl3.Weight, down: exl3.Weight };
 
-pub const LayerW = struct { attn_hc: Hc, ffn_hc: Hc, in_norm: u64, post_norm: u64, kda: KdaW, moe: MoeW };
+/// The layer's mixer: the KDA block's weights or the DSA block's.
+pub const Mixer = union(enum) { kda: KdaW, dsa: dsa_.DsaW };
+
+pub const LayerW = struct { attn_hc: Hc, ffn_hc: Hc, in_norm: u64, post_norm: u64, mixer: Mixer, moe: MoeW };
 
 /// This layer's KDA state for one forward: the conv window [3, 3 H 128] bf16, the fp32 state read and written.
 pub const KdaState = struct { conv: u64, rec_in: u64, rec_out: u64 };
 
 /// Decode windows run the serial chain (commit shifts the conv later); prompt chunks the chunked form at `pos`.
 pub const Mode = union(enum) { decode, prompt: u64 };
+
+/// A DSA call: the layer's caches, its buffers (dsa.Scratch, sized by the engine's rows) and the host position.
+pub const DsaRun = struct { st: dsa_.DsaState, sc: *const dsa_.Scratch, pos: usize };
+
+/// The mixer's state for one forward, matching the layer's Mixer.
+pub const MixState = union(enum) { kda: struct { st: KdaState, mode: Mode }, dsa: DsaRun };
 
 pub const Site = enum { attn, ffn };
 
@@ -155,11 +181,17 @@ pub const Scratch = struct {
 
     fn place(l: *Lay, c: Config, w: *const LayerW, rows: usize, world: u32) !Scratch {
         const d: usize = c.d;
-        const per: usize = @as(usize, w.kda.heads) * kda_.d_k;
+        // a DSA layer takes no KDA buffers (their sizes are 0; dsa.Scratch holds its own)
+        const kd: ?*const KdaW = if (w.mixer == .kda) &w.mixer.kda else null;
+        const per: usize = if (kd) |v| @as(usize, v.heads) * kda_.d_k else 0;
+        const heads: usize = if (kd) |v| v.heads else 0;
+        const p_stride: usize = if (kd) |v| v.p_stride else 0;
         const slots: usize = c.top_k + 1;
         const sw: usize = w.moe.gate.n;
         var mp: usize = @as(usize, bmm_.router_ks) * rows * c.experts * 4;
-        for ([_]B16{ w.kda.fa, w.kda.ga, w.kda.b, w.kda.fb, w.kda.gb }) |q| mp = @max(mp, bmm_.Bmm.partBytes(q, rows));
+        if (kd) |v| for ([_]B16{ v.fa, v.ga, v.b, v.fb, v.gb }) |q| {
+            mp = @max(mp, bmm_.Bmm.partBytes(q, rows));
+        };
         var sc: Scratch = undefined;
         sc.rows = rows;
         sc.world = world;
@@ -168,16 +200,16 @@ pub const Scratch = struct {
         sc.post = l.take(rows * c.streams * 4);
         sc.comb = l.take(rows * c.streams * c.streams * 4);
         sc.hcpart = l.take(rows * 16 * 32 * 4);
-        sc.p = l.take(rows * @as(usize, w.kda.p_stride) * 2);
-        sc.qkv = l.take(rows * @as(usize, w.kda.qkv.n) * 2);
-        sc.fa = l.take(rows * @as(usize, w.kda.fa.n) * 2);
-        sc.ga = l.take(rows * @as(usize, w.kda.ga.n) * 2);
-        sc.bb = l.take(rows * @as(usize, w.kda.b.n) * 2);
+        sc.p = l.take(rows * p_stride * 2);
+        sc.qkv = l.take(rows * @as(usize, if (kd) |v| v.qkv.n else 0) * 2);
+        sc.fa = l.take(rows * @as(usize, if (kd) |v| v.fa.n else 0) * 2);
+        sc.ga = l.take(rows * @as(usize, if (kd) |v| v.ga.n else 0) * 2);
+        sc.bb = l.take(rows * @as(usize, if (kd) |v| v.b.n else 0) * 2);
         sc.ka = l.take(rows * per * 2);
         sc.kg = l.take(rows * per * 2);
         sc.mpart = l.take(mp);
         sc.kout = l.take(rows * per * 2);
-        sc.kda = .{ .k = l.take(rows * per * 4), .v = l.take(rows * per * 2), .g = l.take(rows * per * 4), .b = l.take(rows * @as(usize, w.kda.heads) * 4), .q = l.take(rows * per * 4), .y = l.take(rows * per * 2) };
+        sc.kda = .{ .k = l.take(rows * per * 4), .v = l.take(rows * per * 2), .g = l.take(rows * per * 4), .b = l.take(rows * heads * 4), .q = l.take(rows * per * 4), .y = l.take(rows * per * 2) };
         sc.part = l.take(rows * d * 4);
         sc.gath = l.take(@as(usize, world) * rows * d * 4);
         sc.mlog = l.take(rows * @as(usize, c.experts) * 4);
@@ -303,10 +335,17 @@ fn post(k: *Kernels, s: Stream, c: Config, x: u64, sc: *const Scratch, g: Gather
     try k.glue.hcPost(s, x, x, sc.gath, sc.post, sc.comb, @intCast(rows * c.d), g.world, rows, c.d, c.streams);
 }
 
-/// layer_forward: x [rows, S * D] bf16 in place; the KDA state per `mode` (a decode window commits later).
-pub fn forward(k: *Kernels, s: *Stream, c: Config, w: *const LayerW, st: KdaState, sc: *const Scratch, x: u64, rows: usize, mode: Mode, g: Gather) !void {
+/// layer_forward: x [rows, S * D] bf16 in place; a KDA state per its mode (a decode window commits later), or DSA.
+pub fn forward(k: *Kernels, s: *Stream, c: Config, w: *const LayerW, mix: MixState, sc: *const Scratch, x: u64, rows: usize, g: Gather) !void {
+    if (!std.mem.eql(u8, @tagName(w.mixer), @tagName(mix))) return error.GlmLayerMixer;
     try hcPre(k, s.*, c, w.attn_hc, w.in_norm, x, sc, rows);
-    try kdaBlock(k, s, c, &w.kda, st, sc, rows, mode);
+    switch (mix) {
+        .kda => |m| try kdaBlock(k, s, c, &w.mixer.kda, m.st, sc, rows, m.mode),
+        .dsa => |m| {
+            const dc = c.dsa orelse return error.GlmLayerConfig;
+            try dsa_.dsaBlock(k.dsa(), s, dc, &w.mixer.dsa, m.st, m.sc, sc.normed, sc.part, rows, m.pos);
+        },
+    }
     try post(k, s.*, c, x, sc, g, .attn, rows);
     try hcPre(k, s.*, c, w.ffn_hc, w.post_norm, x, sc, rows);
     try moeBlock(k, s.*, c, &w.moe, sc, rows);

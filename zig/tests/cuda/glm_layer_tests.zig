@@ -23,25 +23,21 @@ fn skip() void {
     std.debug.print("SKIP {s}\n", .{id});
 }
 
-fn file(r: *Rig, dir: []const u8, name: []const u8) ![]u8 {
+pub fn file(r: *Rig, dir: []const u8, name: []const u8) ![]u8 {
     return ref.readFile(r.a, r.gpu.io, dir, name);
 }
 
-fn up(r: *Rig, dir: []const u8, name: []const u8) !u64 {
+pub fn up(r: *Rig, dir: []const u8, name: []const u8) !u64 {
     return r.dev(try file(r, dir, name));
 }
 
-fn uint(o: Obj, key: []const u8) u32 {
+pub fn uint(o: Obj, key: []const u8) u32 {
     return @intCast(ref.int(o, key));
 }
 
-fn kdaLayer(r: *Rig, dir: []const u8) !void {
-    if (std.mem.eql(u8, dir, "none")) return skip();
-    var man = try ref.Manifest.open(r.gpu.gpa, r.gpu.io, dir);
-    defer man.deinit();
-    const o = (man.root().get("layer") orelse return skip()).object;
-    const p = o.get("params").?.object;
-    const c: lay.Config = .{
+/// The layer's constants (manifest params).
+pub fn config(p: Obj) lay.Config {
+    return .{
         .eps = @floatCast(ref.float(p, "eps")),
         .hc_eps = @floatCast(ref.float(p, "hc_eps")),
         .hc_iters = uint(p, "hc_iters"),
@@ -53,6 +49,14 @@ fn kdaLayer(r: *Rig, dir: []const u8) !void {
         .d = uint(p, "hidden"),
         .streams = uint(p, "streams"),
     };
+}
+
+fn kdaLayer(r: *Rig, dir: []const u8) !void {
+    if (std.mem.eql(u8, dir, "none")) return skip();
+    var man = try ref.Manifest.open(r.gpu.gpa, r.gpu.io, dir);
+    defer man.deinit();
+    const o = (man.root().get("layer") orelse return skip()).object;
+    const c = config(o.get("params").?.object);
     const host = try lref.Host.read(r.a, r.gpu.io, dir, o.get("weights").?.object);
     const w = try weights(r, &host, c);
     var k = try lay.Kernels.load(r.gpu.d);
@@ -74,7 +78,7 @@ fn kdaLayer(r: *Rig, dir: []const u8) !void {
     check.pass("{s}", .{id});
 }
 
-fn linW(r: *Rig, l: lref.Lin) !exl3.Weight {
+pub fn linW(r: *Rig, l: lref.Lin) !exl3.Weight {
     const st = exl3.strides(l.k, l.n, l.halves, true);
     return .{
         .trellis = try r.dev(l.words),
@@ -89,12 +93,12 @@ fn linW(r: *Rig, l: lref.Lin) !exl3.Weight {
     };
 }
 
-fn b16W(r: *Rig, b: lref.Mat) !cuda.glm_bmm.B16 {
+pub fn b16W(r: *Rig, b: lref.Mat) !cuda.glm_bmm.B16 {
     return .{ .w = try r.dev(b.w), .n = @intCast(b.n), .k = @intCast(b.k) };
 }
 
-/// Rank 0's tensors on the device as the engine holds them; the routed experts' trellises stay in one buffer each.
-fn weights(r: *Rig, h: *const lref.Host, c: lay.Config) !lay.LayerW {
+/// The MoE on the device as the engine holds it; the routed experts' trellises stay in one buffer each.
+pub fn moeW(r: *Rig, h: *const lref.Host, c: lay.Config) !lay.MoeW {
     const ex = &h.ex;
     var tables: [3]u64 = undefined;
     for (ex.proj, ex.offs, 0..) |bytes, offs, j| {
@@ -123,13 +127,25 @@ fn weights(r: *Rig, h: *const lref.Host, c: lay.Config) !lay.LayerW {
         .limit = c.limit,
         .act_mode = 0,
     };
-    const kd = &h.kda;
+    return .{
+        .router = try r.dev(h.router),
+        .bias = try r.dev(h.bias),
+        .experts = experts,
+        .gate = try linW(r, h.sh[0]),
+        .up = try linW(r, h.sh[1]),
+        .down = try linW(r, h.sh[2]),
+    };
+}
+
+/// Rank 0's tensors on the device as the engine holds them.
+fn weights(r: *Rig, h: *const lref.Host, c: lay.Config) !lay.LayerW {
+    const kd = h.kda orelse return error.GlmLayerKind;
     return .{
         .attn_hc = .{ .fn_w = try r.dev(h.attn_hc[0]), .base = try r.dev(h.attn_hc[1]), .scale = try r.dev(h.attn_hc[2]) },
         .ffn_hc = .{ .fn_w = try r.dev(h.ffn_hc[0]), .base = try r.dev(h.ffn_hc[1]), .scale = try r.dev(h.ffn_hc[2]) },
         .in_norm = try r.dev(h.in_norm),
         .post_norm = try r.dev(h.post_norm),
-        .kda = .{
+        .mixer = .{ .kda = .{
             .qkv = try linW(r, kd.qkv),
             .fa = try b16W(r, kd.fa),
             .ga = try b16W(r, kd.ga),
@@ -146,37 +162,31 @@ fn weights(r: *Rig, h: *const lref.Host, c: lay.Config) !lay.LayerW {
             .ga_off = kd.ga_off,
             .b_off = kd.b_off,
             .p_stride = kd.p_stride,
-        },
-        .moe = .{
-            .router = try r.dev(h.router),
-            .bias = try r.dev(h.bias),
-            .experts = experts,
-            .gate = try linW(r, h.sh[0]),
-            .up = try linW(r, h.sh[1]),
-            .down = try linW(r, h.sh[2]),
-        },
+        } },
+        .moe = try moeW(r, h, c),
     };
 }
 
-fn same(r: *Rig, dir: []const u8, tag: []const u8, what: []const u8, ptr: u64, name: []const u8) !void {
+pub fn same(r: *Rig, dir: []const u8, label: []const u8, ptr: u64, name: []const u8) !void {
     const want = try file(r, dir, name);
-    const label = try std.fmt.allocPrint(r.a, "{s} {s} {s}", .{ id, tag, what });
     try check.sameBytes(label, try r.back(ptr, want.len), want);
 }
 
-const Stage = struct { []const u8, u64 };
+pub const Stage = struct { []const u8, u64 };
 
 /// The test's all-gather: own part in slot 0, the fixture's rank-1 partial in slot 1; then the site's stage bits.
-const Ctx = struct {
+pub const Ctx = struct {
     r: *Rig,
+    id: []const u8,
     dir: []const u8,
     tag: []const u8,
     e: Obj,
     sc: *const lay.Scratch,
+    attn: []const Stage, // the mixer's stages
     x: u64,
     d: usize,
 
-    fn gather(p: *anyopaque, s: cuda.Stream, site: lay.Site, part: u64, gath: u64, rows: usize) anyerror!void {
+    pub fn gather(p: *anyopaque, s: cuda.Stream, site: lay.Site, part: u64, gath: u64, rows: usize) anyerror!void {
         const c: *Ctx = @ptrCast(@alignCast(p));
         try s.synchronize();
         const n = rows * c.d * 4;
@@ -185,24 +195,24 @@ const Ctx = struct {
         try g.copyFrom(0, part, n, s.handle);
         try g.upload(n, try file(c.r, c.dir, ref.str(so, "peer")));
         const sc = c.sc;
-        const stages = if (site == .attn) [_]Stage{
-            .{ "normed", sc.normed }, .{ "post", sc.post }, .{ "comb", sc.comb }, .{ "p", sc.p },
-            .{ "ka", sc.ka },         .{ "kg", sc.kg },     .{ "kout", sc.kout }, .{ "sk", sc.kda.k },
-            .{ "sv", sc.kda.v },      .{ "sg", sc.kda.g },  .{ "sb", sc.kda.b },  .{ "part", part },
-            .{ "", 0 },
-        } else [_]Stage{
-            .{ "x", c.x },        .{ "normed", sc.normed }, .{ "post", sc.post }, .{ "comb", sc.comb },
-            .{ "mlog", sc.mlog }, .{ "pick", sc.pick },     .{ "wts", sc.wts },   .{ "ey", sc.ey },
-            .{ "smg", sc.smg },   .{ "smu", sc.smu },       .{ "sact", sc.sact }, .{ "sy", sc.sy },
-            .{ "part", part },
+        // s0 holds no x (the layer's input); s1's is the mixer's hc_post
+        const hc = [_]Stage{ .{ "x", c.x }, .{ "normed", sc.normed }, .{ "post", sc.post }, .{ "comb", sc.comb } };
+        const moe = [_]Stage{
+            .{ "mlog", sc.mlog }, .{ "pick", sc.pick }, .{ "wts", sc.wts },   .{ "ey", sc.ey },
+            .{ "smg", sc.smg },   .{ "smu", sc.smu },   .{ "sact", sc.sact }, .{ "sy", sc.sy },
         };
-        for (stages) |st| {
+        const tail = [_]Stage{.{ "part", part }};
+        for ([_][]const Stage{ &hc, if (site == .attn) c.attn else &moe, &tail }) |list| for (list) |st| {
             const name = (so.get(st[0]) orelse continue).string;
-            const what = try std.fmt.allocPrint(c.r.a, "{s} {s}", .{ @tagName(site), st[0] });
-            try same(c.r, c.dir, c.tag, what, st[1], name);
-        }
+            const label = try std.fmt.allocPrint(c.r.a, "{s} {s} {s} {s}", .{ c.id, c.tag, @tagName(site), st[0] });
+            try same(c.r, c.dir, label, st[1], name);
+        };
     }
 };
+
+fn sameAt(r: *Rig, dir: []const u8, tag: []const u8, what: []const u8, ptr: u64, name: []const u8) !void {
+    try same(r, dir, try std.fmt.allocPrint(r.a, "{s} {s} {s}", .{ id, tag, what }), ptr, name);
+}
 
 /// One window from the fixture's state: forward (+ commit for decode), every stage's bits, x and the KDA state.
 fn window(r: *Rig, k: *lay.Kernels, dir: []const u8, c: lay.Config, w: *const lay.LayerW, tag: []const u8, e: Obj) !void {
@@ -213,21 +223,26 @@ fn window(r: *Rig, k: *lay.Kernels, dir: []const u8, c: lay.Config, w: *const la
     const x = try up(r, dir, ref.str(e, "x0"));
     const rec0 = try file(r, dir, ref.str(e, "rec0"));
     const st: lay.KdaState = .{ .conv = try up(r, dir, ref.str(e, "conv0")), .rec_in = try r.dev(rec0), .rec_out = try r.zeros(rec0.len) };
-    var ctx: Ctx = .{ .r = r, .dir = dir, .tag = tag, .e = e, .sc = &sc, .x = x, .d = c.d };
+    const attn = [_]Stage{
+        .{ "p", sc.p },      .{ "ka", sc.ka },    .{ "kg", sc.kg },    .{ "kout", sc.kout },
+        .{ "sk", sc.kda.k }, .{ "sv", sc.kda.v }, .{ "sg", sc.kda.g }, .{ "sb", sc.kda.b },
+    };
+    var ctx: Ctx = .{ .r = r, .id = id, .dir = dir, .tag = tag, .e = e, .sc = &sc, .attn = &attn, .x = x, .d = c.d };
     const g: lay.Gather = .{ .ctx = &ctx, .world = 2, .run = Ctx.gather };
     const mode: lay.Mode = if (prefill) .{ .prompt = @intCast(ref.int(e, "pos")) } else .decode;
-    try lay.forward(k, &r.s, c, w, st, &sc, x, rows, mode, g);
-    if (!prefill) try lay.commit(k, &r.s, &w.kda, st, &sc, rows, rows);
-    try same(r, dir, tag, "x", x, ref.str(e, "x"));
-    try same(r, dir, tag, "rec", st.rec_out, ref.str(e, "rec"));
-    try same(r, dir, tag, "conv", st.conv, ref.str(e, "conv"));
+    try lay.forward(k, &r.s, c, w, .{ .kda = .{ .st = st, .mode = mode } }, &sc, x, rows, g);
+    const kw = &w.mixer.kda;
+    if (!prefill) try lay.commit(k, &r.s, kw, st, &sc, rows, rows);
+    try sameAt(r, dir, tag, "x", x, ref.str(e, "x"));
+    try sameAt(r, dir, tag, "rec", st.rec_out, ref.str(e, "rec"));
+    try sameAt(r, dir, tag, "conv", st.conv, ref.str(e, "conv"));
     // the oracle ran the chunk row-split too (HC_SPLIT=1, PREFILL_OVERLAP=2): own rows and both states equal unsplit
     if (prefill) try check.expect(if (e.get("split_equal")) |v| v.bool else false, "{s} {s}: no split check", .{ id, tag });
     if (e.get("keep")) |kv| {
         const ko = kv.object;
         const kst: lay.KdaState = .{ .conv = try up(r, dir, ref.str(e, "conv0")), .rec_in = st.rec_in, .rec_out = try r.zeros(rec0.len) };
-        try lay.commit(k, &r.s, &w.kda, kst, &sc, rows, @intCast(ref.int(ko, "keep")));
-        try same(r, dir, tag, "keep rec", kst.rec_out, ref.str(ko, "rec"));
-        try same(r, dir, tag, "keep conv", kst.conv, ref.str(ko, "conv"));
+        try lay.commit(k, &r.s, kw, kst, &sc, rows, @intCast(ref.int(ko, "keep")));
+        try sameAt(r, dir, tag, "keep rec", kst.rec_out, ref.str(ko, "rec"));
+        try sameAt(r, dir, tag, "keep conv", kst.conv, ref.str(ko, "conv"));
     }
 }

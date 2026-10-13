@@ -67,7 +67,7 @@ pub const Host = struct {
     post_norm: []const u8,
     router: []const u8,
     bias: []const u8,
-    kda: KdaHost,
+    kda: ?KdaHost,
     ex: ExpertsHost,
     sh: [3]Lin,
 
@@ -91,7 +91,6 @@ pub const Host = struct {
             }
         };
         const s: R = .{ .a = a, .io = io, .dir = dir };
-        const k = o.get("kda").?.object;
         const m = o.get("moe").?.object;
         const ex = m.get("experts").?.object;
         const sh = m.get("shared").?.object;
@@ -103,24 +102,27 @@ pub const Host = struct {
             .post_norm = try s.f(o, "post_norm"),
             .router = try s.f(m, "router"),
             .bias = try s.f(m, "bias"),
-            .kda = .{
-                .qkv = try s.lin(k.get("qkv").?.object),
-                .o = try s.lin(k.get("o").?.object),
-                .fa = try s.mat(k.get("fa").?.object),
-                .ga = try s.mat(k.get("ga").?.object),
-                .b = try s.mat(k.get("b").?.object),
-                .fb = try s.mat(k.get("fb").?.object),
-                .gb = try s.mat(k.get("gb").?.object),
-                .conv = try s.f(k, "conv"),
-                .a_log = try s.f(k, "a_log"),
-                .dt_bias = try s.f(k, "dt_bias"),
-                .norm = try s.f(k, "norm"),
-                .heads = @intCast(ref.int(k, "heads")),
-                .fa_off = @intCast(ref.int(k, "fa_off")),
-                .ga_off = @intCast(ref.int(k, "ga_off")),
-                .b_off = @intCast(ref.int(k, "b_off")),
-                .p_stride = @intCast(ref.int(k, "p_stride")),
-            },
+            .kda = if (o.get("kda")) |kv| kda: { // a DSA layer's fixture has none
+                const k = kv.object;
+                break :kda .{
+                    .qkv = try s.lin(k.get("qkv").?.object),
+                    .o = try s.lin(k.get("o").?.object),
+                    .fa = try s.mat(k.get("fa").?.object),
+                    .ga = try s.mat(k.get("ga").?.object),
+                    .b = try s.mat(k.get("b").?.object),
+                    .fb = try s.mat(k.get("fb").?.object),
+                    .gb = try s.mat(k.get("gb").?.object),
+                    .conv = try s.f(k, "conv"),
+                    .a_log = try s.f(k, "a_log"),
+                    .dt_bias = try s.f(k, "dt_bias"),
+                    .norm = try s.f(k, "norm"),
+                    .heads = @intCast(ref.int(k, "heads")),
+                    .fa_off = @intCast(ref.int(k, "fa_off")),
+                    .ga_off = @intCast(ref.int(k, "ga_off")),
+                    .b_off = @intCast(ref.int(k, "b_off")),
+                    .p_stride = @intCast(ref.int(k, "p_stride")),
+                };
+            } else null,
             .ex = undefined,
             .sh = .{ try s.lin(sh.get("gate").?.object), try s.lin(sh.get("up").?.object), try s.lin(sh.get("down").?.object) },
         };
@@ -140,14 +142,14 @@ pub const Host = struct {
     }
 };
 
-fn bfs(a: std.mem.Allocator, bytes: []const u8) ![]f64 {
+pub fn bfs(a: std.mem.Allocator, bytes: []const u8) ![]f64 {
     const u = std.mem.bytesAsSlice(u16, bytes);
     const out = try a.alloc(f64, u.len);
     for (u, 0..) |v, i| out[i] = ref.bf(v);
     return out;
 }
 
-fn f32s(bytes: []const u8) []const f32 {
+pub fn f32s(bytes: []const u8) []const f32 {
     return ref.f32s(bytes);
 }
 
@@ -183,15 +185,16 @@ const Bound = struct {
 };
 
 /// The stages' verdicts: the first stage past its tolerance fails the window; `line` lists every stage's worst.
-const Report = struct {
+pub const Report = struct {
     a: std.mem.Allocator,
     tag: []const u8,
+    id: []const u8 = id,
     worst: f64 = 0,
     line: []const u8 = "",
 
     fn stage(rp: *Report, name: []const u8, b: Bound) !void {
         if (b.worst > 1.0) {
-            std.debug.print("FAIL {s} {s} {s} f64: worst {d:.4} of tolerance at element {d}\n", .{ id, rp.tag, name, b.worst, b.at });
+            std.debug.print("FAIL {s} {s} {s} f64: worst {d:.4} of tolerance at element {d}\n", .{ rp.id, rp.tag, name, b.worst, b.at });
             return error.TestFailed;
         }
         rp.worst = @max(rp.worst, b.worst);
@@ -297,7 +300,7 @@ fn b16Stage(rp: *Report, a: std.mem.Allocator, name: []const u8, mt: Mat, x: []c
 }
 
 /// glue.hc_pre in f64: the 24 mixes, gates, Sinkhorn, the collapsed row's norm (glm_glue_tests' reference).
-fn hcPreStage(rp: *Report, a: std.mem.Allocator, name: []const u8, c: lay.Config, hc: [3][]const u8, nw_b: []const u8, x: []const f64, rows: usize, normed: []const f64, post: []const f32, comb: []const f32) !void {
+pub fn hcPreStage(rp: *Report, a: std.mem.Allocator, name: []const u8, c: lay.Config, hc: [3][]const u8, nw_b: []const u8, x: []const f64, rows: usize, normed: []const f64, post: []const f32, comb: []const f32) !void {
     const d: usize = c.d;
     const wide = 4 * d;
     const fnv = f32s(hc[0]);
@@ -364,7 +367,7 @@ fn hcPreStage(rp: *Report, a: std.mem.Allocator, name: []const u8, c: lay.Config
 }
 
 /// glue.hc_post in f64: bf16(rank 0 + rank 1) times the post gate plus the comb mix of the streams.
-fn hcPostStage(rp: *Report, name: []const u8, d: usize, x: []const f64, g0: []const f32, g1: []const f32, post: []const f32, comb: []const f32, rows: usize, got: []const f64) !void {
+pub fn hcPostStage(rp: *Report, name: []const u8, d: usize, x: []const f64, g0: []const f32, g1: []const f32, post: []const f32, comb: []const f32, rows: usize, got: []const f64) !void {
     var b = Bound{};
     for (0..rows) |i| for (0..4) |sv| for (0..d) |j| {
         const branch = bf16r(@as(f64, g0[i * d + j]) + g1[i * d + j]);
@@ -377,22 +380,22 @@ fn hcPostStage(rp: *Report, name: []const u8, d: usize, x: []const f64, g0: []co
 }
 
 /// One file of the window (stage outputs are equal bits on both sides by now).
-const Win = struct {
+pub const Win = struct {
     a: std.mem.Allocator,
     io: std.Io,
     dir: []const u8,
     e: Obj,
 
-    fn raw(w: Win, site: ?[]const u8, key: []const u8) ![]u8 {
+    pub fn raw(w: Win, site: ?[]const u8, key: []const u8) ![]u8 {
         const o = if (site) |s| w.e.get(s).?.object else w.e;
         return ref.readFile(w.a, w.io, w.dir, ref.str(o, key));
     }
 
-    fn bf(w: Win, site: ?[]const u8, key: []const u8) ![]f64 {
+    pub fn bf(w: Win, site: ?[]const u8, key: []const u8) ![]f64 {
         return bfs(w.a, try w.raw(site, key));
     }
 
-    fn f(w: Win, site: ?[]const u8, key: []const u8) ![]const f32 {
+    pub fn f(w: Win, site: ?[]const u8, key: []const u8) ![]const f32 {
         return f32s(try w.raw(site, key));
     }
 };
@@ -406,7 +409,7 @@ pub fn layerF64(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: lay.Conf
     var rp: Report = .{ .a = a, .tag = tag };
     const rows: usize = @intCast(ref.int(e, "rows"));
     const d: usize = c.d;
-    const kd = &h.kda;
+    const kd = if (h.kda) |*v| v else return error.GlmLayerKind;
     const ps: usize = kd.p_stride;
     const sm = samples(rows);
     // the attention site: hc_pre, the KDA block's projections, its chain, o_proj, hc_post
@@ -439,7 +442,7 @@ pub fn layerF64(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: lay.Conf
 
 /// The chain (serial for decode windows, chunked at pos for a prompt chunk) from the engine's prep, f64.
 fn kdaStage(rp: *Report, a: std.mem.Allocator, w: Win, c: lay.Config, h: *const Host, rows: usize) !void {
-    const hd: usize = h.kda.heads;
+    const hd: usize = h.kda.?.heads;
     const per = hd * ref.DK;
     const out64 = try a.alloc(f64, rows * per);
     const st64 = try a.alloc(f64, per * ref.DK);
@@ -450,7 +453,7 @@ fn kdaStage(rp: *Report, a: std.mem.Allocator, w: Win, c: lay.Config, h: *const 
     const beta = f32s(try w.raw("prep", "beta"));
     const rec0 = try w.f(null, "rec0");
     const gate = ref.bf16s(try w.raw("s0", "kg"));
-    const norm = ref.bf16s(h.kda.norm);
+    const norm = ref.bf16s(h.kda.?.norm);
     if (w.e.get("prefill").?.bool) {
         try ref.chunkedRef(a, q, k, v, lg, beta, rec0, gate, norm, c.eps, hd, rows, @intCast(ref.int(w.e, "pos")), out64, st64);
     } else {
@@ -467,7 +470,7 @@ fn kdaStage(rp: *Report, a: std.mem.Allocator, w: Win, c: lay.Config, h: *const 
 }
 
 /// MoE in f64: router dots, the biased top-k and its weights, routed experts, the shared expert, the combine.
-fn moeStage(rp: *Report, a: std.mem.Allocator, w: Win, c: lay.Config, h: *const Host, n1: []const f64, rows: usize) !void {
+pub fn moeStage(rp: *Report, a: std.mem.Allocator, w: Win, c: lay.Config, h: *const Host, n1: []const f64, rows: usize) !void {
     const d: usize = c.d;
     const ne: usize = c.experts;
     const slots: usize = c.top_k + 1;
@@ -501,7 +504,7 @@ fn moeStage(rp: *Report, a: std.mem.Allocator, w: Win, c: lay.Config, h: *const 
             };
             const got: usize = @intCast(picks[i * slots + kk]);
             if (got != at and !(got < ne and !used[got] and @abs(score[got] + bias[got] - best) < 1e-6)) {
-                std.debug.print("FAIL {s} {s} select f64: row {d} slot {d} picks {d}, f64 picks {d}\n", .{ id, rp.tag, i, kk, got, at });
+                std.debug.print("FAIL {s} {s} select f64: row {d} slot {d} picks {d}, f64 picks {d}\n", .{ rp.id, rp.tag, i, kk, got, at });
                 return error.TestFailed;
             }
             used[got] = true;
@@ -509,7 +512,7 @@ fn moeStage(rp: *Report, a: std.mem.Allocator, w: Win, c: lay.Config, h: *const 
         }
         for (0..c.top_k) |kk| bw.rel(wts[i * slots + kk], score[@intCast(picks[i * slots + kk])] / total * c.routed_scale, 1.0 / 1024.0, 1e-6, i * slots + kk);
         if (picks[i * slots + c.top_k] != @as(i32, @intCast(ne)) or wts[i * slots + c.top_k] != 1.0) {
-            std.debug.print("FAIL {s} {s} select: row {d}'s last slot is not the shared expert at weight 1\n", .{ id, rp.tag, i });
+            std.debug.print("FAIL {s} {s} select: row {d}'s last slot is not the shared expert at weight 1\n", .{ rp.id, rp.tag, i });
             return error.TestFailed;
         }
     }
