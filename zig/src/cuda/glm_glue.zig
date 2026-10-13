@@ -81,9 +81,7 @@ pub const Glue = struct {
         r.add(ids);
         r.add(w);
         r.add(out);
-        r.add(@as(u32, @intCast(rows)));
-        r.add(@as(u32, @intCast(d)));
-        r.add(@as(u32, @intCast(copies)));
+        r.add(@as(u32, @intCast(copies))); // the kernel reads rows and d from its grid
         try launch_.launch(g.embed_b16_fn, .{ .grid = grid2(rows, d / 64), .block = block(32), .shared = 0 }, s, &r);
     }
 
