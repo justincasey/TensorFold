@@ -25,7 +25,6 @@ pub const Chunk = struct {
     smem: u32,
     loaded: bool = false,
 
-
     fn smemBytes(dr: *const Driver, m: Module) !u32 {
         const g = try m.global("tf_glm_kda_chunk_smem_v");
         var buf = try memory.DeviceBuffer.alloc(dr, 8);

@@ -1,6 +1,4 @@
-//! The KDA checks' shared helpers: manifest access, fixture bytes, and the float64 references (the serial delta
-
-//! rule as kda_chunked.recurrent_reference, and the chunked algorithm as kda_chunked.chunked_reference).
+//! The KDA checks' helpers: manifest, fixture bytes, f64 references (kda_chunked's recurrent and chunked ones).
 
 const std = @import("std");
 
@@ -15,7 +13,6 @@ pub fn bf(u: u16) f64 {
 pub fn f32Of(u: u16) f32 {
     return @floatCast(@as(f32, @bitCast(@as(u32, u) << 16)));
 }
-
 
 pub const Manifest = struct {
     parsed: std.json.Parsed(std.json.Value),
@@ -101,9 +98,7 @@ pub fn float(o: std.json.ObjectMap, key: []const u8) f64 {
     };
 }
 
-/// recurrent_reference in f64: q, k, lg fp32 [rows, H, 128], v fp32, beta fp32 [rows, H], state fp32 [H, 128, 128];
-
-/// out f64 [rows, H, 128] and the final state f64.
+/// recurrent_reference in f64: q k lg v fp32 [rows, H, 128], beta [rows, H], state [H, 128, 128] -> out, state f64.
 pub fn serialRef(
     a: std.mem.Allocator,
     q: []const f32,
@@ -157,11 +152,7 @@ pub fn serialRef(
     @memcpy(out, y);
 }
 
-/// chunked_reference in f64: the same inputs, a prompt chunk's sub-chunks at absolute positions (pos); out f64
-
-/// [rows, H, 128] and the final state f64. Padded rows (outside the prompt chunk) are zero rows: decay 1, no key,
-
-/// value or beta.
+/// chunked_reference in f64: serialRef's inputs in sub-chunks at absolute pos; padded rows decay 1, no k, v or beta.
 pub fn chunkedRef(
     a: std.mem.Allocator,
     q: []const f32,
