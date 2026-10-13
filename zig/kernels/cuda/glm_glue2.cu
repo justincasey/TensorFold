@@ -90,7 +90,8 @@ __device__ __forceinline__ void rms1536(const u16* x, i64 xs, const u16* w, u16*
     if ((t & 31) == 0) warp_sums[t >> 5] = ssum;
     __syncthreads();
     float total = (warp_sums[0] + warp_sums[2]) + (warp_sums[1] + warp_sums[3]);
-    float rinv = divf(1.0f, sqrtf_ftz(divf(total, 1536.0f) + eps));
+    // Triton folds `/ D + eps` into one FFMA with fp32 1/1536 (0x3a2aaaab): a power-of-two D divides exactly, 1536 not
+    float rinv = divf(1.0f, sqrtf_ftz(fmaf(total, __int_as_float(0x3a2aaaab), eps)));
     u16 yva[8], yvb[8];
     float ya[8], yb[8];
     const u16* wr = w + 8 * t;
