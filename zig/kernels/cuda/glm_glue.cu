@@ -237,8 +237,8 @@ __device__ __forceinline__ void hc_finish(const u16* x, const float* part, const
         load4bf(xr + 3 * D + off, x3);
         load4bf(xr + 3 * D + off + 4, x3 + 4);
         for (int i = 0; i < 8; ++i) {
-            float v = p[0] * x0[i];
-            v = fmaf(p[1], x1[i], v);
+            // Triton's f32x2 pairs: even columns fma(p1, x1, p0 * x0), odd ones fma(p0, x0, p1 * x1) (probed)
+            float v = (i & 1) ? fmaf(p[0], x0[i], p[1] * x1[i]) : fmaf(p[1], x1[i], p[0] * x0[i]);
             v = fmaf(p[2], x2[i], v);
             v = fmaf(p[3], x3[i], v);
             c[half * 8 + i] = f32of(bf16_rn(v));
@@ -314,8 +314,8 @@ __device__ __forceinline__ void hc_post(const u16* x, u16* xout, const float* g,
         float psv = post[(i64)r * s + sv];
         u16 res[8];
         for (int i = 0; i < 8; ++i) {
-            float mixed = c0v * x0[i];
-            mixed = fmaf(c1v, x1[i], mixed);
+            // Triton fuses the first product into the rounded second: fma(c0, x0, c1 * x1) (glm.layer.kda, 14 words)
+            float mixed = fmaf(c0v, x0[i], c1v * x1[i]);
             mixed = fmaf(c2v, x2[i], mixed);
             mixed = fmaf(c3v, x3[i], mixed);
             res[i] = bf16_rn(fmaf(psv, f32of(bf16_rn(branch[i])), mixed));
@@ -411,7 +411,7 @@ __device__ __forceinline__ void topk(const float* lg, const float* bias, int* pi
         score[i] = s;
         choice[i] = ok ? s + bias[e] : -__int_as_float(0x7f800000u);
     }
-    float total = 0.0f;
+    float total = 0.0f, wk[16];  // every thread holds the picks' scores: no global read-back while others normalize
     for (int k = 0; k < topk; ++k) {
         float mx = choice[0];
         for (int i = 1; i < per; ++i) mx = fmaxf(mx, choice[i]);
@@ -434,13 +434,14 @@ __device__ __forceinline__ void topk(const float* lg, const float* bias, int* pi
         __syncthreads();
         sk = (sks[0] + sks[2]) + (sks[1] + sks[3]);
         pick[(i64)r * (topk + 1) + k] = idx;
-        wts[(i64)r * (topk + 1) + k] = sk;
+        wk[k] = sk;
         total += sk;
         for (int i = 0; i < per; ++i)
             if (eid[i] == idx) choice[i] = -__int_as_float(0x7f800000u);
         __syncthreads();
     }
-    for (int k = 0; k < topk; ++k) wts[(i64)r * (topk + 1) + k] = scale * divf(wts[(i64)r * (topk + 1) + k], total + TINY1E20);
+    for (int k = 0; k < topk; ++k)
+        if (t == k) wts[(i64)r * (topk + 1) + k] = scale * divf(wk[k], total + TINY1E20);
     if (t < topk + 1) {
         pick[(i64)r * (topk + 1) + topk] = ne;
         wts[(i64)r * (topk + 1) + topk] = 1.0f;
