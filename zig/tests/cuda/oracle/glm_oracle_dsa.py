@@ -46,21 +46,21 @@ def _load(model_dir: Path):
     return w
 
 
-def _weights(out: Path, a) -> dict:
+def _weights(out: Path, a, pre: str = "dbw") -> dict:
     """Rank 0's DSA tensors exactly as the engine holds them (EXL3 words in its strips layout)."""
 
     def lin(name: str, q) -> dict:
         assert q.layout == "strips" and q.bias is None, name
-        return {"words": save(out, f"dbw_{name}_words", q.words), "suh": save(out, f"dbw_{name}_suh", q.suh),
-                "svh": save(out, f"dbw_{name}_svh", q.svh), "k": q.k, "n": q.n, "k2": q.k2, "codebook": q.codebook}
+        return {"words": save(out, f"{pre}_{name}_words", q.words), "suh": save(out, f"{pre}_{name}_suh", q.suh),
+                "svh": save(out, f"{pre}_{name}_svh", q.svh), "k": q.k, "n": q.n, "k2": q.k2, "codebook": q.codebook}
 
     def b16(name: str, q) -> dict:
         assert q.weight.dtype == torch.bfloat16, name
-        return {"w": save(out, f"dbw_{name}", q.weight), "n": q.n, "k": q.k}
+        return {"w": save(out, f"{pre}_{name}", q.weight), "n": q.n, "k": q.k}
 
     def plain(name: str, t: torch.Tensor, dtype: torch.dtype = torch.bfloat16) -> str:
         assert t.dtype == dtype, (name, t.dtype)
-        return save(out, f"dbw_{name}", t)
+        return save(out, f"{pre}_{name}", t)
 
     ab, ix = a.absorb, a.index
     assert type(ab).__name__ == "AbsorbW" and a.proj is None, "the recipe's bf16 AbsorbW and separate q_a/kv_a"

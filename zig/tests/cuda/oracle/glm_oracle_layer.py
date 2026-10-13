@@ -22,18 +22,20 @@ def save(out: Path, name: str, t: torch.Tensor) -> str:
     return f"{name}.bin"
 
 
-def _load(model_dir: Path, rank: int):
-    """weights.load for one rank, cut to layers 0 .. LAYER (Config.layers patched), then just the layer kept."""
+def _load(model_dir: Path, rank: int, layer: int = LAYER, long: bool = False):
+    """weights.load for one rank, cut to layers 0 .. layer, then just the layer kept; ``long``: indexer caches."""
     from tensorfold.families.glm5_next.cuda import weights
 
     desc = weights.Config.__dict__["read"]
     orig = weights.Config.read
-    weights.Config.read = classmethod(lambda cls, d: dataclasses.replace(orig(d), layers=LAYER + 1))
+    weights.Config.read = classmethod(lambda cls, d: dataclasses.replace(orig(d), layers=layer + 1))
     try:
         w = weights.load(model_dir, rank=rank, mtp=False)
     finally:
         weights.Config.read = desc
-    w.layers = [w.layers[LAYER]]
+    w.layers = [w.layers[layer]]
+    if long:
+        w.meta["long_context"] = True
     gc.collect()
     torch.cuda.empty_cache()
     return w
@@ -125,29 +127,31 @@ def _run(W, R: int, pos: int, prefill: bool, split: bool, states, x0, snap0=None
     return res
 
 
-def _weights(out: Path, L, c) -> dict:
-    """Rank 0's tensors exactly as the engine holds them (EXL3 words in its strips layout)."""
+def _weights(out: Path, L, c, pre: str = "lkw") -> dict:
+    """Rank 0's tensors exactly as the engine holds them (EXL3 words in its strips layout); a KDA layer's mixer too."""
     k, m = L.kda, L.moe
 
     def lin(name: str, q) -> dict:
         assert q.layout == "strips" and q.bias is None, name
-        return {"words": save(out, f"lkw_{name}_words", q.words), "suh": save(out, f"lkw_{name}_suh", q.suh),
-                "svh": save(out, f"lkw_{name}_svh", q.svh), "k": q.k, "n": q.n, "k2": q.k2, "codebook": q.codebook}
+        return {"words": save(out, f"{pre}_{name}_words", q.words), "suh": save(out, f"{pre}_{name}_suh", q.suh),
+                "svh": save(out, f"{pre}_{name}_svh", q.svh), "k": q.k, "n": q.n, "k2": q.k2, "codebook": q.codebook}
 
     def b16(name: str, q) -> dict:
         assert q.weight.dtype == torch.bfloat16, name
-        return {"w": save(out, f"lkw_{name}", q.weight), "n": q.n, "k": q.k}
+        return {"w": save(out, f"{pre}_{name}", q.weight), "n": q.n, "k": q.k}
 
     def plain(name: str, t: torch.Tensor, dtype: torch.dtype) -> str:
         assert t.dtype == dtype, (name, t.dtype)
-        return save(out, f"lkw_{name}", t)
+        return save(out, f"{pre}_{name}", t)
 
-    man = {"kda": {"qkv": lin("qkv", k.qkv), "o": lin("o", k.o), "fa": b16("fa", k.fa), "ga": b16("ga", k.ga),
-                   "b": b16("b", k.b), "fb": b16("fb", k.fb), "gb": b16("gb", k.gb),
-                   "conv": plain("conv", k.conv, torch.bfloat16), "a_log": plain("a_log", k.a_log, torch.float32),
-                   "dt_bias": plain("dt_bias", k.dt_bias, torch.float32),
-                   "norm": plain("norm", k.norm, torch.bfloat16), "heads": k.heads, "b_off": k.b_off,
-                   "fa_off": k.fa_off, "ga_off": k.ga_off, "p_stride": k.out_n}}
+    man = {}
+    if L.kind == "kda":
+        man["kda"] = {"qkv": lin("qkv", k.qkv), "o": lin("o", k.o), "fa": b16("fa", k.fa), "ga": b16("ga", k.ga),
+                      "b": b16("b", k.b), "fb": b16("fb", k.fb), "gb": b16("gb", k.gb),
+                      "conv": plain("conv", k.conv, torch.bfloat16), "a_log": plain("a_log", k.a_log, torch.float32),
+                      "dt_bias": plain("dt_bias", k.dt_bias, torch.float32),
+                      "norm": plain("norm", k.norm, torch.bfloat16), "heads": k.heads, "b_off": k.b_off,
+                      "fa_off": k.fa_off, "ga_off": k.ga_off, "p_stride": k.out_n}
     for site, h in (("attn_hc", L.attn_hc), ("ffn_hc", L.ffn_hc)):
         man[site] = {"fn": plain(f"{site}_fn", h.fn, torch.float32), "base": plain(f"{site}_base", h.base, torch.float32),
                      "scale": plain(f"{site}_scale", h.scale, torch.float32)}
@@ -163,7 +167,7 @@ def _weights(out: Path, L, c) -> dict:
         for t in mats:
             offs.append(at)
             at += t.numel() * t.element_size()
-        experts[proj] = save(out, f"lkw_ex_{proj}", torch.cat([t.reshape(-1) for t in mats]))
+        experts[proj] = save(out, f"{pre}_ex_{proj}", torch.cat([t.reshape(-1) for t in mats]))
         experts[f"{proj}_offs"] = offs
     for name in ("gate_k2", "up_k2", "down_k2"):
         experts[name] = [int(v) for v in getattr(ex, name).cpu()]
