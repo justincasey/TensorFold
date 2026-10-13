@@ -101,7 +101,7 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt
 }
 
 // Program (expert u, n block, split, member tile): 16 members times W_q over the split's K range, summed in warp order.
-template <int CB, int NT, int W>
+template <int CB, int NT, int W, int PD>
 __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nblock, int zz) {
     if (u >= a.ucount[0]) return;
     const int MT = (a.maxm + 15) / 16;
@@ -143,7 +143,7 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
     switch (k2) {
 #define TF_EXL3X_CASE(K2_)                                                                                   \
     case K2_:                                                                                                \
-        warp_tiles<CB, K2_, NT, 2>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc,       \
+        warp_tiles<CB, K2_, NT, PD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc,       \
                                    reinterpret_cast<uint32_t*>(red[warp]));                                   \
         break;
         TF_EXL3X_CASE(2)
@@ -192,17 +192,18 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
 
 // ---------------------------------------------------------------------------------------------------------------
 
-extern "C" __global__ void tf_exl3_grouped_0(tf_exl3::GroupedArgs a) {  // 3inst, any width
-    tf_exl3::grouped_body<0, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
-}
-
-extern "C" __global__ void tf_exl3_grouped_1(tf_exl3::GroupedArgs a) {  // mcg, any width
-    tf_exl3::grouped_body<1, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
-}
-
-extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1, any width (RED-SNOW's experts)
-    tf_exl3::grouped_body<2, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
-}
+// One per codebook (3inst, mcg, mul1: RED-SNOW's experts), any width; _nc: staged 16-byte loads (decode rows).
+#define TF_EXL3X_GROUPED(CB)                                                                                  \
+    extern "C" __global__ void tf_exl3_grouped_##CB(tf_exl3::GroupedArgs a) {                                 \
+        tf_exl3::grouped_body<CB, 8, 4, 0>(a, blockIdx.x, blockIdx.y, blockIdx.z);                            \
+    }                                                                                                         \
+    extern "C" __global__ void tf_exl3_grouped_nc_##CB(tf_exl3::GroupedArgs a) {                              \
+        tf_exl3::grouped_body<CB, 8, 4, 2>(a, blockIdx.x, blockIdx.y, blockIdx.z);                            \
+    }
+TF_EXL3X_GROUPED(0)
+TF_EXL3X_GROUPED(1)
+TF_EXL3X_GROUPED(2)
+#undef TF_EXL3X_GROUPED
 
 namespace tf_exl3 {
 
