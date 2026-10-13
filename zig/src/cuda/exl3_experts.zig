@@ -167,7 +167,9 @@ pub const Experts = struct {
         a.add(i32d(slots));
         a.add(i32d(l.experts));
         a.add(i32d(rows));
-        try launch_.launch(e.group, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 1024, .y = 1, .z = 1 }, .shared = @intCast(rows * slots * 4) }, s, &a);
+        const group_shared: u32 = @intCast(rows * slots * 4); // a prompt chunk's 2,048 rows of 9 slots take 72 KiB
+        if (group_shared > 48 * 1024) try e.group.allowDynamicShared(group_shared);
+        try launch_.launch(e.group, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 1024, .y = 1, .z = 1 }, .shared = group_shared }, s, &a);
 
         var r: launch_.Args = .{};
         r.add(x);
