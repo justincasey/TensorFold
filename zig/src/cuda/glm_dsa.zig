@@ -37,7 +37,7 @@ pub const Kernels = struct {
 pub const Config = struct { eps: f32, index_eps: f32, scale: f32, index_scale: f32, wscale: f32 };
 
 /// The replicated indexer: wk | weights_proj [160, D], wq_b [4096, 1536], the gate [128, D], LayerNorm, pool ape.
-pub const IndexW = struct { kw: B16, qb: B16, gate: u64, ln_w: u64, ln_b: u64, ape: u64 };
+pub const IndexW = struct { kw: B16, qb: B16, gate: B16, ln_w: u64, ln_b: u64, ape: u64 };
 
 /// The rank's DSA weights: q_a/kv_a/q_b and o_proj's rows (EXL3), the bf16 norms, kv_b as AbsorbW [H, 256, 512].
 pub const DsaW = struct {
@@ -161,8 +161,8 @@ fn front(k: Kernels, s: *Stream, c: Config, w: *const DsaW, sc: *const Scratch, 
 }
 
 /// forward.dense_attention: part_rows-row calls, each at its first row's position, over the capped chunk count.
-fn denseAttn(k: Kernels, s: *Stream, c: Config, st: DsaState, sc: *const Scratch, rows: usize, pos: usize) !void {
-    const nch: u32 = @intCast(@min((pos + rows + chunk - 1) / chunk, sc.nch));
+fn denseAttn(k: Kernels, s: *Stream, c: Config, st: DsaState, sc: *const Scratch, rows: usize, pos: usize, all: bool) !void {
+    const nch: u32 = @intCast(if (all) sc.nch else @min((pos + rows + chunk - 1) / chunk, sc.nch));
     const row_qa: u64 = heads * kv_lora * 2;
     var r0: usize = 0;
     while (r0 < rows) : (r0 += sc.part_rows) {
@@ -179,7 +179,8 @@ fn denseAttn(k: Kernels, s: *Stream, c: Config, st: DsaState, sc: *const Scratch
 }
 
 /// select_tokens and sparse_attention: rows past the dense limit attend their top-512 pools' tokens.
-fn sparseAttn(k: Kernels, s: *Stream, c: Config, w: *const DsaW, st: DsaState, sc: *const Scratch, rows: usize, pos: usize) !void {
+fn sparseAttn(k: Kernels, s: *Stream, c: Config, w: *const DsaW, st: DsaState, sc: *const Scratch, rows: usize, pos: usize, capture: bool) !void {
+    const posp: u64 = if (capture) st.pos_dev else 0; // a captured step is one row: its position is pos_dev's
     try k.bmm.matmul(s.*, w.index.qb, sc.qr, q_lora, rows, sc.qi, false, sc.mpart);
     const np = poolBucket(pos, rows, sc.np_max);
     if (np < sparse_.topk_pools) return error.GlmDsaCapacity; // sparse.top_pools' torch fallback is not ported
@@ -188,17 +189,17 @@ fn sparseAttn(k: Kernels, s: *Stream, c: Config, w: *const DsaW, st: DsaState, s
     while (a < rows) : (a += select_rows) {
         const n: u32 = @intCast(@min(select_rows, rows - a));
         const at: i32 = @intCast(pos + a);
-        try k.sparse.scores(s, sc.qi + a * qi_row, sparse_.heads * index_dim, sc.ikr + (a * ikr_w + index_dim) * 2, ikr_w, st.pk, sc.scores, at, n, @intCast(np), c.index_scale, c.wscale);
-        try k.sparse.selectRows(s, sc.scores, @intCast(np), sc.pools + a * sparse_.topk_pools * 8, at, sparse_.topk_pools, n, true);
+        try k.sparse.scores(s, sc.qi + a * qi_row, sparse_.heads * index_dim, sc.ikr + (a * ikr_w + index_dim) * 2, ikr_w, st.pk, sc.scores, at, posp, n, @intCast(np), c.index_scale, c.wscale);
+        try k.sparse.selectRows(s, sc.scores, @intCast(np), sc.pools + a * sparse_.topk_pools * 8, at, posp, sparse_.topk_pools, n, true);
     }
     const r32: u32 = @intCast(rows);
-    try k.sparse.tokensCounts(s, sc.pools, sc.tokens, sc.counts, @intCast(pos), r32);
+    try k.sparse.tokensCounts(s, sc.pools, sc.tokens, sc.counts, @intCast(pos), posp, r32);
     try k.latent.attnChunks(s, sc.qa, st.lc, st.scales, 0, sc.tokens, sc.counts, sc.po, sc.pm, sc.pl, r32, sparse_.width, sparse_nch, true, true, c.scale);
     try k.latent.merge(s, sc.po, sc.pm, sc.pl, sc.ol, sc.counts, r32, sparse_nch, true);
 }
 
-/// dsa_block at host pos (st.pos_dev): window latents, index keys and pools into st; fp32 o_proj partial into part.
-pub fn dsaBlock(k: Kernels, s: *Stream, c: Config, w: *const DsaW, st: DsaState, sc: *const Scratch, normed: u64, part: u64, rows: usize, pos: usize) !void {
+/// dsa_block at pos (= st.pos_dev) into st and part; `capture`: a graph's one-row step (pool bucket fixed by pos).
+pub fn dsaBlock(k: Kernels, s: *Stream, c: Config, w: *const DsaW, st: DsaState, sc: *const Scratch, normed: u64, part: u64, rows: usize, pos: usize, capture: bool) !void {
     if (rows == 0 or rows > sc.rows) return error.GlmDsaRows;
     if (pos + rows > st.cap or st.cap / 4 != sc.np_max) return error.GlmDsaCapacity;
     const r32: u32 = @intCast(rows);
@@ -207,16 +208,18 @@ pub fn dsaBlock(k: Kernels, s: *Stream, c: Config, w: *const DsaW, st: DsaState,
     try k.latent.latWrite(s, sc.lat, kv_lora, st.lc, st.pos_dev, st.scales, r32, true);
     const all_sparse = pos >= dense_limit;
     const sparse_rows = pos + rows - 1 >= dense_limit;
+    if (capture and (rows != 1 or sparse_rows != all_sparse)) return error.GlmDsaCapture;
     // the indexer runs on every call: it fills the caches while the window is still dense
     const ix = w.index;
     try k.bmm.matmul(s.*, ix.kw, normed, hidden, rows, sc.ikr, false, sc.mpart);
-    try k.bmm.router(s.*, normed, hidden, ix.gate, rows, index_dim, hidden, sc.igr, sc.mpart);
-    try k.sparse.indexWrite(s, sc.ikr, ikr_w, sc.igr, ix.ln_w, ix.ln_b, st.ik, st.ig, p32, c.index_eps, r32);
-    try k.sparse.poolKeys(s, st.ik, st.ig, ix.ape, st.pk, p32, r32);
+    if (ix.gate.n != index_dim or ix.gate.k != hidden) return error.GlmDsaShape;
+    try k.bmm.router(s.*, normed, hidden, ix.gate, rows, sc.igr, sc.mpart);
+    try k.sparse.indexWrite(s, sc.ikr, ikr_w, sc.igr, ix.ln_w, ix.ln_b, st.ik, st.ig, p32, st.pos_dev, c.index_eps, r32);
+    try k.sparse.poolKeys(s, st.ik, st.ig, ix.ape, st.pk, p32, st.pos_dev, r32);
     try k.latent.absorbQ(s, sc.q, w.wk, sc.qa, r32);
     // rows within the limit keep the dense result; the sparse merge overwrites only rows with tokens
-    if (!all_sparse) try denseAttn(k, s, c, st, sc, rows, pos);
-    if (sparse_rows) try sparseAttn(k, s, c, w, st, sc, rows, pos);
+    if (!all_sparse) try denseAttn(k, s, c, st, sc, rows, pos, capture);
+    if (sparse_rows) try sparseAttn(k, s, c, w, st, sc, rows, pos, capture);
     try k.latent.expandV(s, sc.ol, w.wv, sc.vn, r32);
     try k.dense.prompt(s.*, w.o, sc.vn, .bf16, rows, part, .f32);
 }

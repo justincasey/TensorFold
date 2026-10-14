@@ -36,7 +36,7 @@ pub const topk_pools = 512; // pools a row keeps
 
 pub const width = topk_pools * pool + pool - 1; // tokens a row keeps (2051)
 
-pub const score_loop = 32; // pool blocks a scores program takes
+pub const score_loop = 1; // pool blocks a scores program takes (the kernel's L; speed only)
 
 pub const block_pools = 64; // pools a scores block
 
@@ -91,6 +91,7 @@ pub const Sparse = struct {
         ik: u64,
         ig: u64,
         pos: i32,
+        posp: u64, // the position on the device instead (0: pos)
         eps: f32,
         rows: u32,
     ) !void {
@@ -104,11 +105,12 @@ pub const Sparse = struct {
         args.add(ig);
         args.add(pos);
         args.add(eps);
+        args.add(posp);
         try launch_.launch(self.index_fn, .{ .grid = .{ .x = rows, .y = 1, .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s.*, &args);
     }
 
     /// Pool keys for the pools the window completes: pk rows (pos / 4).., capped by the window's last full pool.
-    pub fn poolKeys(self: *Sparse, s: *Stream, ik: u64, ig: u64, ape: u64, pk: u64, pos: i32, rows: u32) !void {
+    pub fn poolKeys(self: *Sparse, s: *Stream, ik: u64, ig: u64, ape: u64, pk: u64, pos: i32, posp: u64, rows: u32) !void {
         var args = launch_.Args{};
         args.add(ik);
         args.add(ig);
@@ -116,6 +118,7 @@ pub const Sparse = struct {
         args.add(pk);
         args.add(pos);
         args.add(@as(i32, @intCast(rows)));
+        args.add(posp);
         try launch_.launch(self.pool_fn, .{ .grid = .{ .x = rows / 4 + 2, .y = 1, .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s.*, &args);
     }
 
@@ -130,6 +133,7 @@ pub const Sparse = struct {
         pk: u64,
         out: u64,
         pos: i32,
+        posp: u64, // the position on the device instead (0: pos)
         rows: u32,
         np: u32,
         scale: f32,
@@ -146,12 +150,13 @@ pub const Sparse = struct {
         args.add(@as(i32, @intCast(np)));
         args.add(scale);
         args.add(wscale);
+        args.add(posp);
         const blocks_y = (np + block_pools * score_loop - 1) / (block_pools * score_loop);
         try launch_.launch(self.scores_fn, .{ .grid = .{ .x = rows, .y = @intCast(blocks_y), .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s.*, &args);
     }
 
     /// Radix top-pool select per row: visible bounds the per-row pool limit; out [rows, k] int64 pools ascending.
-    pub fn selectRows(self: *Sparse, s: *Stream, sc: u64, np: u32, out: u64, pos: i32, k: u32, rows: u32, visible: bool) !void {
+    pub fn selectRows(self: *Sparse, s: *Stream, sc: u64, np: u32, out: u64, pos: i32, posp: u64, k: u32, rows: u32, visible: bool) !void {
         var args = launch_.Args{};
         args.add(sc);
         args.add(@as(i64, @intCast(np)));
@@ -161,16 +166,18 @@ pub const Sparse = struct {
         args.add(pos);
         args.add(@as(i32, @intCast(k)));
         args.add(@as(i32, if (visible) 1 else 0));
+        args.add(posp);
         try launch_.launch(self.select_fn, .{ .grid = .{ .x = rows, .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s.*, &args);
     }
 
     /// Tokens/counts from pools: tokens [rows, 2051] i32 (pools ascending then the partial tail), counts [rows].
-    pub fn tokensCounts(self: *Sparse, s: *Stream, pools: u64, tokens: u64, counts: u64, pos: i32, rows: u32) !void {
+    pub fn tokensCounts(self: *Sparse, s: *Stream, pools: u64, tokens: u64, counts: u64, pos: i32, posp: u64, rows: u32) !void {
         var args = launch_.Args{};
         args.add(pools);
         args.add(tokens);
         args.add(counts);
         args.add(pos);
+        args.add(posp);
         try launch_.launch(self.tokens_fn, .{ .grid = .{ .x = rows, .y = 1, .z = 1 }, .block = .{ .x = 512, .y = 1, .z = 1 } }, s.*, &args);
     }
 };

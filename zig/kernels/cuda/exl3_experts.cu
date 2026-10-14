@@ -23,17 +23,23 @@ struct GroupedArgs {
     int k, n, p, sk, maxm, slots, nexp_max, mats, ns;
 };
 
-// One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads and the shared decode (same bits).
-template <int CB, int K2, int NT>
+// 16 bytes of trellis words, read-only and not kept in L1 (experts.py TF_GLM_EXL3_LOADS's ld.global.nc).
+__device__ __forceinline__ uint4 ldg_nc_v4(const uint32_t* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
+}
+
+// A warp's k steps of NT tiles into acc; even widths: 16-byte loads (PD in flight) staged, each lane's words read back.
+template <int CB, int K2, int NT, int PD>
 __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* x0,
-                                           const half* x1, bool ok0, bool ok1, int lane, float (&acc)[NT][2][4]) {
+                                           const half* x1, bool ok0, bool ok1, int lane, float (&acc)[NT][2][4],
+                                           uint32_t* stage) {
     constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();
     const size_t kstride = (size_t)ntiles * TW;
-    for (int i = 0; i < nkt; ++i) {
-        const uint32_t* t0 = T + (size_t)(kt0 + i) * kstride + (size_t)nt0 * TW;
-        uint32_t w[NT][LW];
-#pragma unroll
-        for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(t0 + j * TW, lane, w[j]);
+    auto step = [&](int i, const uint32_t (&w)[NT][LW]) {
         const int k = (kt0 + i) * 16;
         const uint32_t a[4] = {ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u,
                                ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u,
@@ -46,17 +52,61 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt
             mma16816(acc[j][0], a, b0);
             mma16816(acc[j][1], a, b1);
         }
+    };
+    if constexpr (PD > 0 && TW % 8 == 0) {
+        constexpr int NV = (NT * TW + 127) / 128; // 16-byte loads a lane a step
+        int word, offset;
+        lane_start<K2>(lane, word, offset);
+        const uint32_t* tb = T + (size_t)kt0 * kstride + (size_t)nt0 * TW + 4 * lane;
+        uint4 rv[PD][NV];
+#pragma unroll
+        for (int d = 0; d < PD; ++d)
+            if (d < nkt)
+#pragma unroll
+                for (int v = 0; v < NV; ++v)
+                    if (128 * v + 4 * lane < NT * TW) rv[d][v] = ldg_nc_v4(tb + d * kstride + 128 * v);
+        for (int ib = 0; ib < nkt; ib += PD) {
+#pragma unroll
+            for (int d = 0; d < PD; ++d) {
+                const int it = ib + d;
+                if (it >= nkt) break;
+                __syncwarp(); // every lane has read the previous step back
+#pragma unroll
+                for (int v = 0; v < NV; ++v)
+                    if (128 * v + 4 * lane < NT * TW) *reinterpret_cast<uint4*>(stage + 128 * v + 4 * lane) = rv[d][v];
+                if (it + PD < nkt)
+#pragma unroll
+                    for (int v = 0; v < NV; ++v)
+                        if (128 * v + 4 * lane < NT * TW)
+                            rv[d][v] = ldg_nc_v4(tb + (size_t)(it + PD) * kstride + 128 * v);
+                __syncwarp(); // the step is staged before any lane reads it
+                uint32_t w[NT][LW];
+#pragma unroll
+                for (int j = 0; j < NT; ++j)
+#pragma unroll
+                    for (int i = 0; i < LW; ++i) w[j][i] = stage[j * TW + (word + i) % TW];
+                step(it, w);
+            }
+        }
+        __syncwarp(); // `stage` is the caller's red[warp]: every read done before it is written
+    } else {
+        for (int i = 0; i < nkt; ++i) {
+            const uint32_t* t0 = T + (size_t)(kt0 + i) * kstride + (size_t)nt0 * TW;
+            uint32_t w[NT][LW];
+#pragma unroll
+            for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(t0 + j * TW, lane, w[j]);
+            step(i, w);
+        }
     }
 }
 
-// Program (expert u, n block, split, member tile): 16 members times W_q over the split's K range, summed in warp order.
-template <int CB, int NT, int W>
+// Program (expert u, n block, split and matrix): its member tiles of 16 in order (each as alone), to the first empty.
+template <int CB, int NT, int W, int PD>
 __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nblock, int zz) {
     if (u >= a.ucount[0]) return;
     const int MT = (a.maxm + 15) / 16;
-    const int mtile = zz % MT;
-    const int split = (zz / MT) % a.sk;
-    const int mat = zz / MT / a.sk;
+    const int split = zz % a.sk;
+    const int mat = zz / a.sk;
     const half* X = mat ? a.x1 : a.x0;
     const int e = a.uids[u];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? a.tp1[e] : a.tp0[e]);
@@ -64,75 +114,79 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, t = lane & 3;
     const int NTILES = a.ns > 0 ? a.ns : (a.n >> 4); // row stride of the trellis, in tiles
-
-    __shared__ int rows_sh[16];
-    if (threadIdx.x < 16) {
-        const int m = mtile * 16 + threadIdx.x;
-        const int code = m < a.maxm ? a.members[u * a.maxm + m] : -1;
-        rows_sh[threadIdx.x] = code >= 0 ? (code >> 5) * a.slots + (code & 31) : -1;
-    }
-    __syncthreads();
-    if (rows_sh[0] < 0) return; // members come first, so this tile is empty
-    const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
-    const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * a.k + 2 * t;
-    const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * a.k + 2 * t;
     const int per_warp = (a.k >> 4) / a.sk / W;
     const int kt0 = split * (per_warp * W) + warp * per_warp;
     const int nt0 = nblock * NT;
-
-    float acc[NT][2][4];
-#pragma unroll
-    for (int i = 0; i < NT; ++i)
-#pragma unroll
-        for (int h = 0; h < 2; ++h)
-#pragma unroll
-            for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
-
+    __shared__ int rows_sh[16];
     __shared__ __align__(16) float red[W][16][NT * 16];
-    switch (k2) {
+
+    for (int mtile = 0; mtile < MT; ++mtile) {
+        if (threadIdx.x < 16) {
+            const int m = mtile * 16 + threadIdx.x;
+            const int code = m < a.maxm ? a.members[u * a.maxm + m] : -1;
+            rows_sh[threadIdx.x] = code >= 0 ? (code >> 5) * a.slots + (code & 31) : -1;
+        }
+        __syncthreads();
+        if (rows_sh[0] < 0) return; // this tile and every later one are empty
+        const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
+        const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * a.k + 2 * t;
+        const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * a.k + 2 * t;
+
+        float acc[NT][2][4];
+#pragma unroll
+        for (int i = 0; i < NT; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
+
+        switch (k2) {
 #define TF_EXL3X_CASE(K2_)                                                                                   \
     case K2_:                                                                                                \
-        warp_tiles<CB, K2_, NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);          \
+        warp_tiles<CB, K2_, NT, PD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc,       \
+                                   reinterpret_cast<uint32_t*>(red[warp]));                                   \
         break;
-        TF_EXL3X_CASE(2)
-        TF_EXL3X_CASE(3)
-        TF_EXL3X_CASE(4)
-        TF_EXL3X_CASE(5)
-        TF_EXL3X_CASE(6)
-        TF_EXL3X_CASE(7)
-        TF_EXL3X_CASE(8)
-        TF_EXL3X_CASE(9)
-        TF_EXL3X_CASE(10)
-        TF_EXL3X_CASE(11)
-        TF_EXL3X_CASE(12)
-        TF_EXL3X_CASE(13)
-        TF_EXL3X_CASE(14)
-        TF_EXL3X_CASE(15)
-        TF_EXL3X_CASE(16)
+            TF_EXL3X_CASE(2)
+            TF_EXL3X_CASE(3)
+            TF_EXL3X_CASE(4)
+            TF_EXL3X_CASE(5)
+            TF_EXL3X_CASE(6)
+            TF_EXL3X_CASE(7)
+            TF_EXL3X_CASE(8)
+            TF_EXL3X_CASE(9)
+            TF_EXL3X_CASE(10)
+            TF_EXL3X_CASE(11)
+            TF_EXL3X_CASE(12)
+            TF_EXL3X_CASE(13)
+            TF_EXL3X_CASE(14)
+            TF_EXL3X_CASE(15)
+            TF_EXL3X_CASE(16)
 #undef TF_EXL3X_CASE
-        default:
-            __trap();
-    }
+            default:
+                __trap();
+        }
 
 #pragma unroll
-    for (int i = 0; i < NT; ++i)
+        for (int i = 0; i < NT; ++i)
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const int col = i * 16 + h * 8 + 2 * t;
-            red[warp][g][col] = acc[i][h][0];
-            red[warp][g][col + 1] = acc[i][h][1];
-            red[warp][g + 8][col] = acc[i][h][2];
-            red[warp][g + 8][col + 1] = acc[i][h][3];
+            for (int h = 0; h < 2; ++h) {
+                const int col = i * 16 + h * 8 + 2 * t;
+                red[warp][g][col] = acc[i][h][0];
+                red[warp][g][col + 1] = acc[i][h][1];
+                red[warp][g + 8][col] = acc[i][h][2];
+                red[warp][g + 8][col + 1] = acc[i][h][3];
+            }
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
+            const int row = idx / (NT * 16), col = idx % (NT * 16);
+            const int r = rows_sh[row];
+            if (r < 0) continue;
+            float s = red[0][row][col];
+#pragma unroll
+            for (int w = 1; w < W; ++w) s += red[w][row][col];
+            a.z[(((size_t)mat * a.sk + split) * a.p + r) * a.n + nt0 * 16 + col] = s;
         }
-    __syncthreads();
-    for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
-        const int row = idx / (NT * 16), col = idx % (NT * 16);
-        const int r = rows_sh[row];
-        if (r < 0) continue;
-        float s = red[0][row][col];
-#pragma unroll
-        for (int w = 1; w < W; ++w) s += red[w][row][col];
-        a.z[(((size_t)mat * a.sk + split) * a.p + r) * a.n + nt0 * 16 + col] = s;
+        __syncthreads(); // rows_sh and red are rewritten by the next tile
     }
 }
 
@@ -140,23 +194,25 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
 
 // ---------------------------------------------------------------------------------------------------------------
 
-extern "C" __global__ void tf_exl3_grouped_0(tf_exl3::GroupedArgs a) {  // 3inst, any width
-    tf_exl3::grouped_body<0, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
-}
-
-extern "C" __global__ void tf_exl3_grouped_1(tf_exl3::GroupedArgs a) {  // mcg, any width
-    tf_exl3::grouped_body<1, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
-}
-
-extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1, any width (RED-SNOW's experts)
-    tf_exl3::grouped_body<2, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
-}
+// One per codebook (3inst, mcg, mul1: RED-SNOW's experts), any width; _nc: staged 16-byte loads (decode rows).
+#define TF_EXL3X_GROUPED(CB)                                                                                  \
+    extern "C" __global__ void tf_exl3_grouped_##CB(tf_exl3::GroupedArgs a) {                                 \
+        tf_exl3::grouped_body<CB, 8, 4, 0>(a, blockIdx.x, blockIdx.y, blockIdx.z);                            \
+    }                                                                                                         \
+    extern "C" __global__ void tf_exl3_grouped_nc_##CB(tf_exl3::GroupedArgs a) {                              \
+        tf_exl3::grouped_body<CB, 8, 4, 2>(a, blockIdx.x, blockIdx.y, blockIdx.z);                            \
+    }
+TF_EXL3X_GROUPED(0)
+TF_EXL3X_GROUPED(1)
+TF_EXL3X_GROUPED(2)
+#undef TF_EXL3X_GROUPED
 
 namespace tf_exl3 {
 
 // Grouping in one block: distinct experts (< E) in id order, members row * 32 + slot in row order, -1 after the last.
 constexpr int GROUP_THREADS = 1024;
 constexpr int GROUP_PER_THREAD = 4;
+constexpr int GROUP_WARPS = GROUP_THREADS / 32;
 
 struct GroupArgs {
     const int* pick; // int32 [rows * slots]
@@ -166,25 +222,40 @@ struct GroupArgs {
     int rows, slots, experts, maxm;
 };
 
+// A stable counting sort: warps count their slices of picks, a prefix over warps places them, they land in order.
 extern "C" __global__ void __launch_bounds__(GROUP_THREADS) tf_exl3_group(const GroupArgs a) {
-    extern __shared__ int sh_pick[];
-    __shared__ int warp_tot[GROUP_THREADS / 32];
-    const int n = a.rows * a.slots;
-    for (int i = threadIdx.x; i < n; i += GROUP_THREADS) sh_pick[i] = a.pick[i];
+    extern __shared__ int sh[]; // cnt [warps, E], place [E], total by place [E]
+    __shared__ int warp_tot[GROUP_WARPS];
+    __shared__ int nu; // distinct experts
+    const int E = a.experts, n = a.rows * a.slots;
+    int* cnt = sh;
+    int* place = sh + GROUP_WARPS * E;
+    int* total = place + E;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int i = threadIdx.x; i < GROUP_WARPS * E; i += GROUP_THREADS) cnt[i] = 0;
     __syncthreads();
-    int cnt[GROUP_PER_THREAD];
+    const int seg = (n + GROUP_WARPS - 1) / GROUP_WARPS, lo = warp * seg, hi = min(n, lo + seg);
+    for (int i = lo + lane; i < hi; i += 32) {
+        const int e = a.pick[i];
+        if (e >= 0 && e < E) atomicAdd(&cnt[warp * E + e], 1);
+    }
+    __syncthreads();
+    int tot[GROUP_PER_THREAD];
     int used = 0;
 #pragma unroll
     for (int q = 0; q < GROUP_PER_THREAD; ++q) {
         const int e = threadIdx.x * GROUP_PER_THREAD + q;
-        int c = 0;
-        if (e < a.experts)
-            for (int i = 0; i < n; ++i) c += sh_pick[i] == e;
-        cnt[q] = c;
-        used += c > 0;
+        int sum = 0;
+        if (e < E)
+            for (int w = 0; w < GROUP_WARPS; ++w) { // each slice's first member index: the earlier slices' counts
+                const int c = cnt[w * E + e];
+                cnt[w * E + e] = sum;
+                sum += c;
+            }
+        tot[q] = sum;
+        used += sum > 0;
     }
     // exclusive scan of `used` over threads
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     int inc = used;
 #pragma unroll
     for (int o = 1; o < 32; o <<= 1) {
@@ -201,20 +272,41 @@ extern "C" __global__ void __launch_bounds__(GROUP_THREADS) tf_exl3_group(const 
             if (lane >= o) s += x;
         }
         warp_tot[lane] = s - v; // exclusive per warp
-        if (lane == 31) a.ucount[0] = s;
+        if (lane == 31) {
+            a.ucount[0] = s;
+            nu = s;
+        }
     }
     __syncthreads();
-    int place = warp_tot[warp] + inc - used;
+    int at = warp_tot[warp] + inc - used;
 #pragma unroll
     for (int q = 0; q < GROUP_PER_THREAD; ++q) {
-        if (cnt[q] == 0) continue;
         const int e = threadIdx.x * GROUP_PER_THREAD + q;
-        a.uids[place] = e;
-        int j = 0;
-        for (int i = 0; i < n && j < a.maxm; ++i)
-            if (sh_pick[i] == e) a.members[place * a.maxm + j++] = (i / a.slots) * 32 + (i % a.slots);
-        for (; j < a.maxm; ++j) a.members[place * a.maxm + j] = -1;
-        ++place;
+        if (e >= E) continue;
+        place[e] = tot[q] > 0 ? at : -1;
+        if (tot[q] > 0) {
+            a.uids[at] = e;
+            total[at] = tot[q];
+            ++at;
+        }
+    }
+    __syncthreads();
+    for (int b = lo; b < hi; b += 32) { // a slice's picks in order, 32 at a time
+        const int i = b + lane;
+        int e = i < hi ? a.pick[i] : -1;
+        if (e >= E) e = -1;
+        const unsigned peers = __match_any_sync(0xffffffffu, e);
+        if (e >= 0) {
+            const int j = cnt[warp * E + e] + __popc(peers & ((1u << lane) - 1u));
+            if (j < a.maxm) a.members[place[e] * a.maxm + j] = (i / a.slots) * 32 + (i % a.slots);
+        }
+        __syncwarp();
+        if (e >= 0 && lane == 31 - __clz(peers)) cnt[warp * E + e] += __popc(peers);
+        __syncwarp();
+    }
+    for (int idx = threadIdx.x; idx < nu * a.maxm; idx += GROUP_THREADS) {
+        const int u = idx / a.maxm, j = idx % a.maxm;
+        if (j >= total[u]) a.members[idx] = -1;
     }
 }
 

@@ -199,7 +199,14 @@ pub const Reader = struct {
         const x = try r.t(p, name, .f16);
         const bytes = if (rows) try rowHalf(x, r.rank) else x.bytes;
         const n = if (rows) x.shape[0] / world else x.shape[0];
-        return .{ .w = try r.put(try toBf16(r.a(), x.dtype, bytes)), .n = @intCast(n), .k = @intCast(x.shape[1]) };
+        return r.packed_(try toBf16(r.a(), x.dtype, bytes), n, x.shape[1]);
+    }
+
+    /// bf16 [n, k] row-major uploaded in the matmul's fragment order.
+    fn packed_(r: *Reader, bytes: []const u8, n: usize, k: usize) !B16 {
+        const out = try r.a().alloc(u8, bytes.len);
+        try cuda.glm_bmm.pack(out, bytes, n, k);
+        return .{ .w = try r.put(out), .n = @intCast(n), .k = @intCast(k), .frag = true };
     }
 
     /// One EXL3 group (Exl3Linear.from_tensors, strips layout) cut for this rank.
@@ -260,17 +267,22 @@ pub const Reader = struct {
 
     fn kda(r: *Reader, p: []const u8, heads: u32) !lay.KdaW {
         const qkv = try r.linear(p, "self_attn.qkv_proj", .qkv);
-        const fa = try r.b16(p, "self_attn.f_a_proj.weight", false);
-        const ga = try r.b16(p, "self_attn.g_a_proj.weight", false);
-        const b = try r.b16(p, "self_attn.b_proj.weight", true);
+        // f_a, g_a and the rank's b rows stacked: one matmul (each column's sum is its own)
+        const fa = try r.t(p, "self_attn.f_a_proj.weight", .f16);
+        const ga = try r.t(p, "self_attn.g_a_proj.weight", .f16);
+        const bt = try r.t(p, "self_attn.b_proj.weight", .f16);
+        if (fa.shape[1] != ga.shape[1] or fa.shape[1] != bt.shape[1]) return error.GlmShape;
+        const b_rows = try rowHalf(bt, r.rank);
+        const stacked = try std.mem.concat(r.a(), u8, &.{ fa.bytes, ga.bytes, b_rows });
+        const fa_n: u32 = @intCast(fa.shape[0]);
+        const ga_n: u32 = @intCast(ga.shape[0]);
+        const fab = try r.packed_(try toBf16(r.a(), .f16, stacked), fa.shape[0] + ga.shape[0] + bt.shape[0] / world, fa.shape[1]);
         const conv = try r.t(p, "self_attn.conv1d.weight", .bf16);
         const taps = conv.shape[2];
         const fa_off = 3 * heads * 128;
         return .{
             .qkv = qkv,
-            .fa = fa,
-            .ga = ga,
-            .b = b,
+            .fab = fab,
             .fb = try r.b16(p, "self_attn.f_b_proj.weight", true),
             .gb = try r.b16(p, "self_attn.g_b_proj.weight", true),
             .o = try r.linear(p, "self_attn.o_proj", .in),
@@ -280,9 +292,9 @@ pub const Reader = struct {
             .norm = try r.put((try r.t(p, "self_attn.o_norm.weight", .bf16)).bytes),
             .heads = heads,
             .fa_off = fa_off,
-            .ga_off = fa_off + fa.n,
-            .b_off = fa_off + fa.n + ga.n,
-            .p_stride = qkv.n + fa.n + ga.n + b.n,
+            .ga_off = fa_off + fa_n,
+            .b_off = fa_off + fa_n + ga_n,
+            .p_stride = qkv.n + fab.n,
         };
     }
 
@@ -316,9 +328,9 @@ pub const Reader = struct {
             .wk = try r.put(wk),
             .wv = try r.put(wv),
             .index = .{
-                .kw = .{ .w = try r.put(kw), .n = @intCast(wkx.shape[0] + wpx.shape[0]), .k = @intCast(wkx.shape[1]) },
+                .kw = try r.packed_(kw, wkx.shape[0] + wpx.shape[0], wkx.shape[1]),
                 .qb = try r.b16(p, "self_attn.indexer.wq_b.weight", false),
-                .gate = try r.bf(p, "self_attn.indexer.index_kpool_compress_gate", .f16),
+                .gate = try r.b16(p, "self_attn.indexer.index_kpool_compress_gate", false),
                 .ln_w = try r.put((try r.t(p, "self_attn.indexer.k_norm.weight", .f16)).bytes),
                 .ln_b = try r.put((try r.t(p, "self_attn.indexer.k_norm.bias", .f16)).bytes),
                 .ape = try r.bf(p, "self_attn.indexer.index_kpool_compress_ape", .f32),
@@ -415,7 +427,7 @@ pub const Reader = struct {
                 .mla => .{ .dsa = try r.dsaW(p, c) },
             },
             .ffn = if (c.isMoe(i)) .{ .moe = .{
-                .router = try r.bf(p, "mlp.gate.weight", .f16),
+                .router = try r.b16(p, "mlp.gate.weight", false),
                 .bias = try r.put((try r.t(p, "mlp.gate.e_score_correction_bias", .f32)).bytes),
                 .experts = try r.experts(p, c),
                 .gate = try r.linear(p, "mlp.shared_experts.gate_proj", .out),
@@ -438,7 +450,7 @@ pub const Reader = struct {
         const n: u32 = c.vocab / world;
         return .{ .embed = try r.put(emb.bytes), .head = .{
             .norm = try r.put((try r.t("", "model.language_model.norm.weight", .bf16)).bytes),
-            .head = .{ .w = try r.put(try rowHalf(lm, r.rank)), .n = n, .k = c.hidden },
+            .head = try r.packed_(try rowHalf(lm, r.rank), n, c.hidden),
             .offset = r.rank * n,
         } };
     }

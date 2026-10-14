@@ -90,6 +90,7 @@ __device__ __forceinline__ void attn_chunks(const ChunksArgs a) {
     __shared__ unsigned psh[32][16];
     __shared__ float tmx[32][2][4]; // per row, a/b tile max over the warp's 8-key slice (w&3)
     __shared__ float lbuf[32][2][4]; // per row, a/b rowsum over the warp's 8-key slice
+    extern __shared__ __align__(16) unsigned qsh[]; // the block's HBT heads of qa (u32 view), staged once
     const int rowA = (HBT == 32 ? 16 * (w >> 2) : 16 * t0) + (l >> 2);
     const int rowB = rowA + 8;
     const int kbase = (w & 3) * 8;
@@ -104,7 +105,14 @@ __device__ __forceinline__ void attn_chunks(const ChunksArgs a) {
         oacc[j][2] = 0.0f;
         oacc[j][3] = 0.0f;
     }
+    const int hb0 = HBT == 32 ? 0 : 16 * t0; // the block's first head
+    if (run) {
+        const uint4* qsrc = reinterpret_cast<const uint4*>(a.qa) + ((long long)r * H + hb0) * 64;
+        for (int i = t; i < HBT * 64; i += 256) reinterpret_cast<uint4*>(qsh)[i] = qsrc[i]; // read after the first sync
+    }
     for (int tile = 0; run && tile < 16; ++tile) { // 16 tiles of 32 keys = the 512-key chunk
+        // a tile past the last visible key leaves m, l and o as they are (alpha 1, p 0): stop at the first one
+        if (SPARSE ? cbase + tile * 32 >= a.cnt[r] : cbase + tile * 32 > a.pos[0] + r) break;
         // stage 32 keys x 512 latents: thread t holds key (t>>3), u32 columns (t&7)*32..
         const int kk = t >> 3;
         int rowbase;
@@ -120,9 +128,20 @@ __device__ __forceinline__ void attn_chunks(const ChunksArgs a) {
         }
         unsigned* dst = &kv[kk][(t & 7) * 32];
         if (FP8) {
-            const unsigned char* src = reinterpret_cast<const unsigned char*>(a.cache) + (long long)rowbase * LW;
+            const uint4* src = reinterpret_cast<const uint4*>(reinterpret_cast<const unsigned char*>(a.cache) +
+                                                              (long long)rowbase * LW) + (t & 7) * 4;
+            unsigned cw[16]; // the thread's 64 bytes as four 16-byte loads
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                const uint4 u = src[v];
+                cw[4 * v] = u.x;
+                cw[4 * v + 1] = u.y;
+                cw[4 * v + 2] = u.z;
+                cw[4 * v + 3] = u.w;
+            }
+#pragma unroll
             for (int i = 0; i < 16; ++i) {
-                const unsigned c4 = *reinterpret_cast<const unsigned*>(src + 4 * ((t & 7) * 16 + i));
+                const unsigned c4 = cw[i];
                 const unsigned p01 = cvt_e4m3x2_u16((unsigned short)c4);
                 const unsigned p23 = cvt_e4m3x2_u16((unsigned short)(c4 >> 16));
                 const float g0 = __fmul_rn(f16_of(p01, 0), s);
@@ -146,7 +165,7 @@ __device__ __forceinline__ void attn_chunks(const ChunksArgs a) {
         }
         __syncthreads();
         // scores: 32 ksteps of m16n8k16, A from the qa u32 view, B from shared
-        const unsigned* qrowA = reinterpret_cast<const unsigned*>(a.qa) + ((long long)r * H + rowA) * 256;
+        const unsigned* qrowA = qsh + (rowA - hb0) * 256;
         const unsigned* qrowB = qrowA + 2048;
         float sacc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (int kstep = 0; kstep < 32; ++kstep) {

@@ -17,6 +17,7 @@ struct IndexArgs {
     bf16* ig;             // bf16 [cap, D]
     int pos;
     float eps;
+    const int* posp;      // the position on the device (a captured decode step), else null and pos
 };
 
 struct PoolArgs {
@@ -26,6 +27,7 @@ struct PoolArgs {
     bf16* pk;             // bf16 [cap / 4 + 2, D]
     int pos;
     int r;
+    const int* posp;      // as IndexArgs
 };
 
 struct ScoresArgs {
@@ -39,6 +41,7 @@ struct ScoresArgs {
     int np;
     float scale;
     float wscale;
+    const int* posp;      // as IndexArgs
 };
 
 struct SelectArgs {
@@ -50,6 +53,7 @@ struct SelectArgs {
     int pos;
     int k;
     int visible;          // 1: limit = min(np, max(k, (pos + r + 1) / 4)); 0: limit = np
+    const int* posp;      // as IndexArgs
 };
 
 struct TokensArgs {
@@ -57,12 +61,13 @@ struct TokensArgs {
     int* tokens;            // int32 [R, 512 * 4 + 3]
     int* counts;            // int32 [R]
     int pos;
+    const int* posp;        // as IndexArgs
 };
 
 constexpr int D = 128;                 // index key dims
 constexpr int H = 32;                  // index heads (the serve model's index_heads)
 constexpr int BP = 64;                 // pools a scores block
-constexpr int L = 32;                  // pool blocks a scores program takes
+constexpr int L = 1;                   // pool blocks a scores program takes (speed only: a block's sums are its own)
 constexpr int LOG2E_BITS = 0x3FB8AA3B; // float log2(e)'s bits, as Triton's exp lowering multiplies by
 
 __device__ __forceinline__ unsigned pack2(bf16 lo, bf16 hi) {
@@ -154,7 +159,7 @@ extern "C" __global__ void tf_glm_index_write(IndexArgs a) {
         reinterpret_cast<bf16*>(y)[i] = __float2bfloat16_rn(__fmaf_rn(t, wf[i], bf4[i]));
         reinterpret_cast<bf16*>(gv)[i] = __float2bfloat16_rn(a.gr[static_cast<long long>(r) * D + lane * 4 + i]);
     }
-    const long long p = static_cast<long long>(a.pos) + r;
+    const long long p = static_cast<long long>(a.posp ? *a.posp : a.pos) + r;
     *reinterpret_cast<unsigned*>(a.ik + p * D + lane * 4) = y[0];
     *reinterpret_cast<unsigned*>(a.ik + p * D + lane * 4 + 2) = y[1];
     *reinterpret_cast<unsigned*>(a.ig + p * D + lane * 4) = gv[0];
@@ -164,8 +169,9 @@ extern "C" __global__ void tf_glm_index_write(IndexArgs a) {
 // Program i: pool p = pos / 4 + i if it is complete within the window. One warp, four dims a lane.
 extern "C" __global__ void tf_glm_pool_keys(PoolArgs a) {
     const int i = blockIdx.x;
-    const long long p = static_cast<long long>(a.pos) / 4 + i;
-    if (4 * p + 3 > static_cast<long long>(a.pos) + a.r - 1) return;
+    const long long pos = a.posp ? *a.posp : a.pos;
+    const long long p = pos / 4 + i;
+    if (4 * p + 3 > pos + a.r - 1) return;
     const int lane = threadIdx.x;
     const int d = lane * 4;
     float l[4][4], e[4][4]; // pool member j, lane dim t
@@ -228,7 +234,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_glm_scores(ScoresArgs a) {
 
     const int g4 = lane >> 2;      // the fragment's first row
     const int t2 = (lane & 3) * 2; // the fragment's first col
-    const int npool = (a.pos + r + 1) / 4;
+    const int npool = ((a.posp ? *a.posp : a.pos) + r + 1) / 4;
     const float neg_inf = -__int_as_float(0x7F800000);
     for (int j = 0; j < L; j++) {
         const int pb = g * L + j;
@@ -342,7 +348,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_glm_select_rows(SelectArgs 
     __shared__ int total;
     const int r = blockIdx.x;
     const long long row = static_cast<long long>(r) * a.s_stride;
-    const int limit = a.visible ? min(a.np, max(a.k, (a.pos + r + 1) / 4)) : a.np;
+    const int limit = a.visible ? min(a.np, max(a.k, ((a.posp ? *a.posp : a.pos) + r + 1) / 4)) : a.np;
     unsigned prefix = 0, fixed = 0;
     int need = a.k;
 #pragma unroll 1
@@ -425,7 +431,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_glm_select_rows(SelectArgs 
 extern "C" __global__ void tf_glm_tokens_counts(TokensArgs a) {
     const int r = blockIdx.x;
     const int t = threadIdx.x; // 512 threads, four tokens a thread
-    const long long q = static_cast<long long>(a.pos) + r;
+    const long long q = static_cast<long long>(a.posp ? *a.posp : a.pos) + r;
     const long long npool = (q + 1) / 4;
     const long long p = a.pools[static_cast<long long>(r) * 512 + t]; // every row's 512 selected pools' tokens
     for (int j = 0; j < 4; j++)

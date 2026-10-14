@@ -72,8 +72,8 @@ fn index(r: *Rig, state: *Run, dir: []const u8) !void {
         const ik = try r.dev(try sref.readFile(r.a, r.gpu.io, dir, ref.str(e, "ik_pre")));
         const ig = try r.dev(try sref.readFile(r.a, r.gpu.io, dir, ref.str(e, "ig_pre")));
         const pk = try r.dev(try sref.readFile(r.a, r.gpu.io, dir, ref.str(e, "pk_pre")));
-        try k.indexWrite(&r.s, try r.dev(ikr), 160, try r.dev(igr), try r.dev(lnw), try r.dev(lnb), ik, ig, pos, 1.0e-6, @intCast(rows));
-        try k.poolKeys(&r.s, ik, ig, try r.dev(ape), pk, pos, @intCast(rows));
+        try k.indexWrite(&r.s, try r.dev(ikr), 160, try r.dev(igr), try r.dev(lnw), try r.dev(lnb), ik, ig, pos, 0, 1.0e-6, @intCast(rows));
+        try k.poolKeys(&r.s, ik, ig, try r.dev(ape), pk, pos, 0, @intCast(rows));
         const got_ik = try r.back(ik, want_ik.len);
         try check.sameBytes(try std.fmt.allocPrint(r.a, "glm.dsa.indexer {s} ik", .{tag}), got_ik, want_ik);
         try check.sameBytes(try std.fmt.allocPrint(r.a, "glm.dsa.indexer {s} ig", .{tag}), try r.back(ig, want_ig.len), want_ig);
@@ -126,7 +126,7 @@ fn scores(r: *Rig, state: *Run, dir: []const u8) !void {
             const n = @min(@as(usize, 512), rows - b0);
             const want = try sref.readFile(r.a, r.gpu.io, dir, bname.string);
             const out = try r.zeros(want.len);
-            try k.scores(&r.s, qi_dev + b0 * 4096 * 2, 4096, w_base + (b0 * 160 + sref.D) * 2, 160, pk_dev, out, pos + @as(i32, @intCast(b0)), @intCast(n), @intCast(np_max), @floatCast(q.scale), @floatCast(q.wscale));
+            try k.scores(&r.s, qi_dev + b0 * 4096 * 2, 4096, w_base + (b0 * 160 + sref.D) * 2, 160, pk_dev, out, pos + @as(i32, @intCast(b0)), 0, @intCast(n), @intCast(np_max), @floatCast(q.scale), @floatCast(q.wscale));
             const got = try r.back(out, want.len);
             try check.sameBytes(try std.fmt.allocPrint(r.a, "glm.dsa.scores {s} b{d}", .{ tag, b0 }), got, want);
             if (rows <= 128) {
@@ -167,13 +167,13 @@ fn selectPhase(r: *Rig, fam: std.json.Value, q: Params, dir: []const u8) !void {
         var b0: usize = 0;
         while (b0 < rows) : (b0 += 512) {
             const n = @min(@as(usize, 512), rows - b0);
-            try k.scores(&r.s, qi_dev + b0 * 4096 * 2, 4096, w_base + (b0 * 160 + sref.D) * 2, 160, pk_dev, sc + b0 * bucket * 4, pos + @as(i32, @intCast(b0)), @intCast(n), @intCast(bucket), @floatCast(q.scale), @floatCast(q.wscale));
+            try k.scores(&r.s, qi_dev + b0 * 4096 * 2, 4096, w_base + (b0 * 160 + sref.D) * 2, 160, pk_dev, sc + b0 * bucket * 4, pos + @as(i32, @intCast(b0)), 0, @intCast(n), @intCast(bucket), @floatCast(q.scale), @floatCast(q.wscale));
         }
         const pools = try r.zeros(rows * 512 * 8);
-        try k.selectRows(&r.s, sc, @intCast(bucket), pools, pos, 512, @intCast(rows), true);
+        try k.selectRows(&r.s, sc, @intCast(bucket), pools, pos, 0, 512, @intCast(rows), true);
         const tokens = try r.zeros(rows * 2051 * 4);
         const counts = try r.zeros(rows * 4);
-        try k.tokensCounts(&r.s, pools, tokens, counts, pos, @intCast(rows));
+        try k.tokensCounts(&r.s, pools, tokens, counts, pos, 0, @intCast(rows));
         const want_tokens = try sref.readFile(r.a, r.gpu.io, dir, ref.str(e, "tokens"));
         const want_counts = try sref.readFile(r.a, r.gpu.io, dir, ref.str(e, "counts"));
         try check.sameBytes(try std.fmt.allocPrint(r.a, "glm.dsa.scores {s} tokens", .{tag}), try r.back(tokens, want_tokens.len), want_tokens);

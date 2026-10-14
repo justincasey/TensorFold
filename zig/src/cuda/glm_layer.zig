@@ -89,9 +89,7 @@ pub const Hc = struct { fn_w: u64, base: u64, scale: u64 };
 /// The rank's KDA weights: fused q|k|v EXL3, the bf16 pair and b, conv taps, decays, gated norm, o_proj's rows.
 pub const KdaW = struct {
     qkv: exl3.Weight,
-    fa: B16,
-    ga: B16,
-    b: B16,
+    fab: B16, // f_a | g_a | b stacked by rows: one matmul writes p's columns fa_off.. (the three are adjacent)
     fb: B16,
     gb: B16,
     o: exl3.Weight,
@@ -107,7 +105,7 @@ pub const KdaW = struct {
 };
 
 /// The rank's MoE: router [E, D] bf16 and bias [E] fp32, routed EXL3 experts, the shared expert's three linears.
-pub const MoeW = struct { router: u64, bias: u64, experts: exl3e.Layer, gate: exl3.Weight, up: exl3.Weight, down: exl3.Weight };
+pub const MoeW = struct { router: B16, bias: u64, experts: exl3e.Layer, gate: exl3.Weight, up: exl3.Weight, down: exl3.Weight };
 
 /// A dense layer's MLP (layers 0-2): gate and up (the rank's columns), down (the rank's rows, an fp32 partial).
 pub const MlpW = struct { gate: exl3.Weight, up: exl3.Weight, down: exl3.Weight };
@@ -127,7 +125,7 @@ pub const KdaState = struct { conv: u64, rec_in: u64, rec_out: u64 };
 pub const Mode = union(enum) { decode, prompt: u64 };
 
 /// A DSA call: the layer's caches, its buffers (dsa.Scratch, sized by the engine's rows) and the host position.
-pub const DsaRun = struct { st: dsa_.DsaState, sc: *const dsa_.Scratch, pos: usize };
+pub const DsaRun = struct { st: dsa_.DsaState, sc: *const dsa_.Scratch, pos: usize, capture: bool = false };
 
 /// The mixer's state for one forward, matching the layer's Mixer.
 pub const MixState = union(enum) { kda: struct { st: KdaState, mode: Mode }, dsa: DsaRun };
@@ -186,9 +184,7 @@ pub const Scratch = struct {
     hcpart: u64,
     p: u64, // [rows, p_stride] bf16: the decode window's st.proj rows, the prompt chunk's b.kproj
     qkv: u64,
-    fa: u64,
-    ga: u64,
-    bb: u64,
+    fab: u64, // [rows, fab.n] bf16: f_a | g_a | b
     ka: u64,
     kg: u64,
     mpart: u64, // split-K partials of the bf16 matmuls and the router (one at a time)
@@ -222,7 +218,7 @@ pub const Scratch = struct {
         const er: usize = if (sh.experts != null) rows else 0;
         const sw: usize = sh.width;
         var mp: usize = @as(usize, bmm_.router_ks) * rows * ne * 4;
-        if (kd) |v| for ([_]B16{ v.fa, v.ga, v.b, v.fb, v.gb }) |q| {
+        if (kd) |v| for ([_]B16{ v.fab, v.fb, v.gb }) |q| {
             mp = @max(mp, bmm_.Bmm.partBytes(q, rows));
         };
         var sc: Scratch = undefined;
@@ -235,9 +231,7 @@ pub const Scratch = struct {
         sc.hcpart = l.take(rows * 16 * 32 * 4);
         sc.p = l.take(rows * p_stride * 2);
         sc.qkv = l.take(rows * @as(usize, if (kd) |v| v.qkv.n else 0) * 2);
-        sc.fa = l.take(rows * @as(usize, if (kd) |v| v.fa.n else 0) * 2);
-        sc.ga = l.take(rows * @as(usize, if (kd) |v| v.ga.n else 0) * 2);
-        sc.bb = l.take(rows * @as(usize, if (kd) |v| v.b.n else 0) * 2);
+        sc.fab = l.take(rows * @as(usize, if (kd) |v| v.fab.n else 0) * 2);
         sc.ka = l.take(rows * per * 2);
         sc.kg = l.take(rows * per * 2);
         sc.mpart = l.take(mp);
@@ -262,6 +256,15 @@ pub const Scratch = struct {
         sc.sact = l.take(rows * sw * 2);
         sc.sxs = l.take(rows * sw / 64 * 4);
         sc.sy = l.take(er * d * 4);
+        if (rows == 1) { // one row: the copies into p, sgu and ey's shared slot become the outputs themselves
+            if (kd) |v| {
+                sc.qkv = sc.p;
+                sc.fab = sc.p + @as(u64, v.fa_off) * 2;
+            }
+            sc.smg = sc.sgu;
+            sc.smu = sc.sgu + sw * 2;
+            if (er > 0) sc.sy = sc.ey + (slots - 1) * d * 4;
+        }
         return sc;
     }
 
@@ -294,10 +297,8 @@ pub const Scratch = struct {
 
 /// rows rows of `bytes` each from src (row stride ss bytes) to dst (row stride ds bytes): torch's strided copy_.
 fn copyRows(d: *const driver.Driver, s: Stream, dst: u64, ds: usize, src: u64, ss: usize, bytes: usize, rows: usize) !void {
-    for (0..rows) |r| {
-        const b: memory.DeviceBuffer = .{ .d = d, .ptr = dst + r * ds, .len = bytes, .borrowed = true };
-        try b.copyFrom(0, src + r * ss, bytes, s.handle);
-    }
+    if (dst == src and (rows == 1 or ds == ss)) return; // a one-row Scratch's aliases
+    try memory.DeviceBuffer.copyRows(d, dst, ds, src, ss, bytes, rows, s.handle);
 }
 
 /// glue.hc_pre: normed, xs, post and comb of the S streams x [rows, S * D] at one site.
@@ -312,15 +313,9 @@ pub fn kdaBlock(k: *Kernels, s: *Stream, c: Config, w: *const KdaW, st: KdaState
     const ps: usize = @as(usize, w.p_stride) * 2;
     try k.dense.prompt(s.*, w.qkv, sc.normed, .bf16, rows, sc.qkv, .bf16);
     try copyRows(k.d, s.*, sc.p, ps, sc.qkv, @as(usize, w.qkv.n) * 2, @as(usize, w.qkv.n) * 2, rows);
-    const parts = [_]struct { q: B16, out: u64, off: u32 }{
-        .{ .q = w.fa, .out = sc.fa, .off = w.fa_off },
-        .{ .q = w.ga, .out = sc.ga, .off = w.ga_off },
-        .{ .q = w.b, .out = sc.bb, .off = w.b_off },
-    };
-    for (parts) |pt| {
-        try k.bmm.matmul(s.*, pt.q, sc.normed, c.d, rows, pt.out, false, sc.mpart);
-        try copyRows(k.d, s.*, sc.p + @as(u64, pt.off) * 2, ps, pt.out, @as(usize, pt.q.n) * 2, @as(usize, pt.q.n) * 2, rows);
-    }
+    if (w.fa_off + w.fab.n != w.p_stride) return error.GlmLayerShape;
+    try k.bmm.matmul(s.*, w.fab, sc.normed, c.d, rows, sc.fab, false, sc.mpart);
+    try copyRows(k.d, s.*, sc.p + @as(u64, w.fa_off) * 2, ps, sc.fab, @as(usize, w.fab.n) * 2, @as(usize, w.fab.n) * 2, rows);
     try k.bmm.matmul(s.*, w.fb, sc.p + @as(u64, w.fa_off) * 2, w.p_stride, rows, sc.ka, false, sc.mpart);
     try k.bmm.matmul(s.*, w.gb, sc.p + @as(u64, w.ga_off) * 2, w.p_stride, rows, sc.kg, false, sc.mpart);
     const per: i64 = @as(i64, w.heads) * kda_.d_k;
@@ -371,7 +366,8 @@ pub fn moeBlock(k: *Kernels, s: Stream, c: Config, w: *const MoeW, sc: *const Sc
     const esc = sc.esc orelse return error.GlmLayerScratch;
     const d: usize = c.d;
     const slots: usize = c.top_k + 1;
-    try k.bmm.router(s, sc.normed, c.d, w.router, rows, c.experts, d, sc.mlog, sc.mpart);
+    if (w.router.n != c.experts or w.router.k != d) return error.GlmLayerShape;
+    try k.bmm.router(s, sc.normed, c.d, w.router, rows, sc.mlog, sc.mpart);
     try k.glue.topk(s, sc.mlog, w.bias, sc.pick, sc.wts, c.routed_scale, rows, c.experts, c.top_k);
     try k.experts.runPerSlot(s, w.experts, sc.normed, d, .bf16, sc.pick, rows, sc.ey, esc);
     try swigluMlp(k, s, c, w.gate, w.up, w.down, sc, rows, sc.sy);
@@ -400,7 +396,7 @@ pub fn forward(k: *Kernels, s: *Stream, c: Config, w: *const LayerW, mix: MixSta
         .kda => |m| try kdaBlock(k, s, c, &w.mixer.kda, m.st, sc, rows, m.mode),
         .dsa => |m| {
             const dc = c.dsa orelse return error.GlmLayerConfig;
-            try dsa_.dsaBlock(k.dsa(), s, dc, &w.mixer.dsa, m.st, m.sc, sc.normed, sc.part, rows, m.pos);
+            try dsa_.dsaBlock(k.dsa(), s, dc, &w.mixer.dsa, m.st, m.sc, sc.normed, sc.part, rows, m.pos, m.capture);
         },
     }
     try post(k, s.*, c, x, sc, g, .attn, rows);
