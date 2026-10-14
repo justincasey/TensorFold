@@ -4,6 +4,26 @@ pub const Result = c_int;
 pub const Device = c_int;
 pub const DevicePtr = u64;
 
+/// CUDA_MEMCPY2D: rows of `width` bytes, `height` of them, each side at its own pitch (memory type 2: device).
+pub const Memcpy2D = extern struct {
+    src_x: usize = 0,
+    src_y: usize = 0,
+    src_type: c_int = 2,
+    src_host: ?*const anyopaque = null,
+    src_device: DevicePtr,
+    src_array: ?*anyopaque = null,
+    src_pitch: usize,
+    dst_x: usize = 0,
+    dst_y: usize = 0,
+    dst_type: c_int = 2,
+    dst_host: ?*anyopaque = null,
+    dst_device: DevicePtr,
+    dst_array: ?*anyopaque = null,
+    dst_pitch: usize,
+    width: usize,
+    height: usize,
+};
+
 pub const Context = ?*opaque {};
 pub const Module = ?*opaque {};
 pub const Function = ?*opaque {};
@@ -167,6 +187,7 @@ pub const Api = struct {
     cuMemcpyHtoDAsync_v2: *const fn (DevicePtr, CPtr, usize, Stream) callconv(.c) R,
     cuMemcpyDtoHAsync_v2: *const fn (Ptr, DevicePtr, usize, Stream) callconv(.c) R,
     cuMemcpyDtoDAsync_v2: *const fn (DevicePtr, DevicePtr, usize, Stream) callconv(.c) R,
+    cuMemcpy2DAsync_v2: *const fn (*const Memcpy2D, Stream) callconv(.c) R,
     cuMemsetD8_v2: *const fn (DevicePtr, u8, usize) callconv(.c) R,
     cuMemsetD32_v2: *const fn (DevicePtr, c_uint, usize) callconv(.c) R,
     cuMemsetD8Async: *const fn (DevicePtr, u8, usize, Stream) callconv(.c) R,
