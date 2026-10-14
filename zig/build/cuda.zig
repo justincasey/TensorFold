@@ -38,6 +38,14 @@ const kernels = [_]Kernel{
     .{ .name = "modelopt_pack", .flags = &.{"-O3"} }, // ours: ModelOpt tensors into the lane, prompt and expert layouts
     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5
     .{ .name = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/experts.cu's device code, tensorfold_exl3_experts
+    .{ .name = "glm_kda", .flags = &.{ "-O3", "--fmad=false" } }, // glm5_next/cuda/kda.cu's device code (chain, replay, wide trio, conv shift)
+    .{ .name = "glm_kda_chunk", .flags = &.{ "-O3", "--fmad=false" } }, // glm5_next/cuda/kda_chunk.cu's device code (32-row WY sub-chunks)
+    .{ .name = "glm_bmm", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // glm5_next/cuda's bf16 matmul and router dots (qmm._bmm, glue._router)
+    .{ .name = "glm_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // glm5_next/cuda/glue.py's Triton kernels as device code
+    .{ .name = "glm_glue2", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // glue.py's 1536/512 rmsnorms and the fp32-y combine (glm_glue.cu is at the file cap)
+    .{ .name = "glm_sparse", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // glm5_next/cuda/sparse.py's Triton kernels as device code
+    .{ .name = "glm_latent", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // latent.py's cache write and kv_b projections
+    .{ .name = "glm_latent_att", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // latent.py's chunk attention and merge (glm_latent.cu is at the file cap)
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
     .{ .name = "torch_pointwise", .src = "torch_ops/pointwise", .flags = torch_ops },
@@ -74,7 +82,7 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return cuda;
 }
 
-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module } {
+fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, glm: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module } {
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     core.addImport("tokenizer", tokenizer);
@@ -86,7 +94,10 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     nemotron.addImport("lanes", lanes);
     nemotron.addImport("heat", heat);
     nemotron.addImport("nemotron_draft_ids", draft_ids);
-    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .heat = heat };
+    const glm = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm.addImport("cuda", cuda);
+    glm.addImport("core", core);
+    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .glm = glm, .tokenizer = tokenizer, .heat = heat };
 }
 
 /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
@@ -126,6 +137,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("cuda", cuda);
     runner.addImport("lanes", mods.lanes);
     runner.addImport("nemotron", mods.nemotron);
+    runner.addImport("glm", mods.glm);
     runner.addImport("core", mods.core); // the exl3 checks' f64 reference is core/exl3_format.zig's
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
     nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true).root_module.strip = strip;
@@ -193,7 +205,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
     step.dependOn(&server_test.step);
     b.step("test-server-cpu", "The HTTP server's unit tests (routes, templates, tool parsing) without a GPU").dependOn(&server_test.step);
-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.glm, mods.heat, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);

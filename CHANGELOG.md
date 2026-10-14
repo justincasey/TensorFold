@@ -5,6 +5,7 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 ## Unreleased
 
 - EXL3 on CUDA in the native binary: hand-written kernels ported from the Python engine's, so a row's bits match it. They cover the trellis decode, a row-invariant linear for 1 to 128 rows at every codebook and width, and grouped routed experts with widths mixed within a layer. `tf-cuda-test exl3` checks every width against float64 references, and with fixtures from the Python engine checks real layers of `vcruz305/RED-SNOW-5.3-FLASH-EXL3-SAGE-4.91bpw` (a KDA and a DSA layer, all 288 experts under real routing) bit for bit. `tf-cuda-test exl3-tp2` checks the same with the GLM split rules on two ranks over NCCL. No family serves EXL3 natively yet ([EXL3 on CUDA](docs/recipes/exl3.md#native-cuda-zig)).
+- GLM-5.3-Flash's CUDA engine in the native binary, at TP=2 on two GB10s from `vcruz305/RED-SNOW-5.3-FLASH-EXL3-SAGE-4.91bpw`. Every kernel is hand-written CUDA ported from the Python engine's Triton and CUDA kernels, in their order of operations. Greedy replies to eight reference prompts (code, prose, math, chat, a long document, 4K and 16K-token books; 221 to 16,416 prompt tokens) are token for token the Python engine's. It runs under `tf-cuda-test glm-model`; the server does not load it yet ([the native CUDA engine](docs/recipes/glm-5.3-flash.md#native-cuda-engine-zig)).
 
 ## 1.0.7
 

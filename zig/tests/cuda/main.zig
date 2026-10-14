@@ -22,6 +22,8 @@ const nvfp4_tests = @import("nvfp4_tests.zig");
 const modelopt_tests = @import("modelopt_tests.zig");
 const exl3_tests = @import("exl3_tests.zig");
 const exl3_tp2_tests = @import("exl3_tp2_tests.zig");
+const glm_tests = @import("glm_tests.zig");
+const glm_model_tests = @import("glm_model_tests.zig");
 const train_pack = @import("train_pack.zig");
 
 const usage =
@@ -54,6 +56,8 @@ const usage =
     \\  modelopt                  ModelOpt repack, FP8 and BF16 lane rows and relu^2 NVFP4 experts against fp64
     \\  exl3 [dir]                EXL3 decode-row linear: float64 checks, row invariance, the Python engine's fixture (dir none skips it)
     \\  exl3-tp2 <rank> <host:port> [dir]  EXL3 tensor parallel: rank shards vs the Python engine's, all-gathered (dir none skips them)
+    \\  glm [dir]                 GLM-5.3-Flash kernels and layers vs float64 and the Python engine (dir none skips those)
+    \\  glm-model <rank> <host:port> MODEL REF   the whole GLM-5.3-Flash at TP=2 vs the Python engine's greedy replies
     \\  train-pack MODEL EXAMPLES [COUNT]   training passes holding several sequences against one a pass: differences, time
     \\
 ;
@@ -112,6 +116,8 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "modelopt")) return modelopt_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "exl3")) return exl3_tests.run(gpu, if (rest.len > 0) rest[0] else "none");
     if (std.mem.eql(u8, cmd, "exl3-tp2")) return exl3_tp2_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) rest[2] else "none");
+    if (std.mem.eql(u8, cmd, "glm")) return glm_tests.run(gpu, if (rest.len > 0) rest[0] else "none");
+    if (std.mem.eql(u8, cmd, "glm-model")) return glm_model_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
     if (std.mem.eql(u8, cmd, "glue")) return glue_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "window-profile")) return window_profile.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
