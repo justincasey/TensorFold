@@ -3,6 +3,7 @@
 pub const safetensors = @import("safetensors.zig");
 pub const exl3_format = @import("exl3_format.zig");
 pub const checkpoint = @import("checkpoint.zig");
+pub const exl3_load = @import("exl3_load.zig");
 pub const direct_io = @import("direct_io.zig");
 pub const Checkpoint = checkpoint.Checkpoint;
 pub const draft_depth = @import("draft_depth.zig");
@@ -25,6 +26,7 @@ test {
     _ = registry;
     _ = tuning;
     _ = exl3_format;
+    _ = exl3_load;
     _ = @import("exl3_rect_test.zig");
     _ = checkpoint;
     _ = direct_io;
