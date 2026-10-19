@@ -17,6 +17,7 @@ const tile = @import("cuda_tile.zig");
 const mm_mod = @import("cuda_mm.zig");
 const dflash = @import("dflash.zig");
 const prof_mod = @import("cuda_prof.zig");
+const decode = @import("cuda_decode.zig");
 
 pub const Options = @import("cuda_engine_types.zig").Options;
 
@@ -25,8 +26,6 @@ pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) boo
 
 /// The most drafts a chain holds (decode.DepthPolicy's top depth).
 pub const max_drafts = 3;
-/// A greedy pick as it crosses ranks: (value, id) and padding, so the RoCE gather (16-byte packs) can carry it.
-const pair_bytes = 16;
 
 /// A prompt pass's chunk rows (decode.prefill's).
 pub const prompt_rows = fw.prefill_rows;
@@ -82,6 +81,7 @@ pub const Engine = struct {
     next_snap: u64 = 1, // rank 0: the next id
     announce: u64 = 0, // rank 0: a state kept at this chunk's mark, for the other ranks to copy at its gate
     dropped: std.ArrayList(u32) = .empty, // rank 0: ids dropped since the other ranks last heard (cuda_follow)
+    graphs: decode.Graphs, // verify windows replayed as CUDA graphs (TF_GLM_GRAPHS=0: eager)
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
@@ -130,7 +130,7 @@ pub const Engine = struct {
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .hold = undefined, .pairs = undefined, .smp = undefined, .mtp = o.mtp };
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .hold = undefined, .pairs = undefined, .smp = undefined, .mtp = o.mtp, .graphs = .{ .gpa = gpa, .on = decode.Graphs.wanted() } };
         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
         const Tile = struct {
@@ -171,9 +171,9 @@ pub const Engine = struct {
         errdefer if (e.bs) |*b| b.deinit();
         e.hold = try cuda.DeviceBuffer.alloc(d, c.hidden * 2);
         errdefer e.hold.free();
-        e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world);
+        e.pairs = try cuda.DeviceBuffer.alloc(d, decode.pair_bytes * world * fw.window_rows);
         errdefer e.pairs.free();
-        try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * world), "cuMemsetD8"); // each pair's padding stays zero
+        try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, decode.pair_bytes * world * fw.window_rows), "cuMemsetD8"); // each pair's padding stays zero
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
         errdefer e.smp.deinit();
         errdefer e.freeProfs();
@@ -193,6 +193,7 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         e.stream.synchronize() catch {};
+        e.graphs.deinit();
         e.gpa.free(e.packs.ptrs);
         e.gpa.free(e.packs.bits);
         if (e.drafter) |dr| dr.deinit();
@@ -266,6 +267,7 @@ pub const Engine = struct {
     fn free(e: *Engine, slot: usize) void {
         const q = e.seqs.items[slot] orelse return;
         e.stream.synchronize() catch {};
+        e.graphs.clear(); // a graph of this sequence holds its caches' addresses
         q.st.deinit();
         e.gpa.destroy(q);
         e.seqs.items[slot] = null;
@@ -471,7 +473,7 @@ pub const Engine = struct {
         const at = e.cur.st.pos;
         f.prof = e.profs[ids.len - 1];
         if (f.prof) |p| try p.begin(e.stream, verifyLabel(ids.len));
-        try f.run(@ptrCast(ids));
+        try e.graphs.run(&f, @ptrCast(ids));
         if (e.drafter) |dr| try dr.noteVerify(e.slot, 0, ids.len, at, true);
         e.cur.rows_at = e.bd.fnormed;
         try e.draw(e.bd.logits, ids.len, at + 1, out);
@@ -556,31 +558,7 @@ pub const Engine = struct {
             try e.smp.draw(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, sampler.rule(s), out);
             return e.checkGathers(); // the draw read rows the forward's gathers made
         }
-        for (0..rows) |r| out[r] = try e.greedy(logits + r * e.share.vocab.len() * 2);
-    }
-
-    /// decode.sample_rows' greedy pick: per-rank top-1 (tf_glm_top1), all-gathered, largest value then lowest id.
-    fn greedy(e: *Engine, logits: u64) !u32 {
-        const world = e.share.world;
-        var a: cuda.Args = .{};
-        a.add(logits);
-        a.add(@as(i64, @intCast(e.share.vocab.len())));
-        a.add(@as(u32, @intCast(e.share.vocab.lo)));
-        a.add(e.pairs.ptr + e.share.rank * pair_bytes);
-        try cuda.launch.launch(e.m.glue.top1, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, e.stream, &a);
-        const mine = e.pairs.ptr + e.share.rank * pair_bytes;
-        if (e.group) |g| try g.allGather(e.stream, mine, e.pairs.ptr, pair_bytes) else try e.lib.check(e.lib.api.ncclAllGather(mine, e.pairs.ptr, pair_bytes, .u8, e.comm, e.stream.handle), "ncclAllGather");
-        try e.stream.synchronize();
-        try e.checkGathers();
-        var all: [ranks.max_world][4]u32 = undefined; // Engine.init refuses a larger world
-        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&all, e.pairs.ptr, world * pair_bytes), "cuMemcpyDtoH");
-        var pick = all[0];
-        for (all[1..world]) |p| {
-            const v: f32 = @bitCast(p[0]);
-            const b: f32 = @bitCast(pick[0]);
-            if (v > b or (v == b and p[1] < pick[1])) pick = p;
-        }
-        return pick[1];
+        try decode.greedy(e, logits, rows, out);
     }
 
     /// A failed RoCE gather's error, after a synchronize whose result read gathered rows (they hold nothing then).

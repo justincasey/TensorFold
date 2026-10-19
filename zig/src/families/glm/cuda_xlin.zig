@@ -55,6 +55,7 @@ pub const Runner = struct {
     max_z: usize = 0,
     max_counters: usize = 0,
     streams: [max_streams]Scratch = @splat(.{}),
+    grown: u64 = 0, // scratch reallocations: a captured decode graph holds the old addresses (cuda_decode)
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver) !*Runner {
         const r = try gpa.create(Runner);
@@ -138,6 +139,7 @@ pub const Runner = struct {
         const nb = try cuda.DeviceBuffer.alloc(r.d, @max(bytes, 256));
         if (slot.*) |*old| old.free();
         slot.* = nb;
+        r.grown += 1;
         return nb.ptr;
     }
 

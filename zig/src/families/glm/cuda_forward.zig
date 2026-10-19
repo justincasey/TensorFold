@@ -304,11 +304,6 @@ pub const Forward = struct {
         return r.b.gathered + r.w.share.world * lo * r.w.config.hidden * 4;
     }
 
-    /// reduce.shares: [lo, hi) of the rows of a piece of `n` each rank owns: about equal, the first n % world one more.
-    pub fn share(n: usize, world: usize, rank: usize) [2]usize {
-        return cuda.rank_scatter.share(n, world, rank);
-    }
-
     /// Whether piece [lo, lo + n) splits (TF_GLM_PREFILL_REDUCE=split): at least one row for every rank.
     fn splits(f: *const Forward, n: usize) bool {
         return f.split and n >= f.ranks[0].w.share.world;
@@ -342,14 +337,14 @@ pub const Forward = struct {
                 },
             } else switch (f.exchange) {
                 .local => for (f.ranks) |to| {
-                    const mine = share(n, world, to.w.share.rank);
+                    const mine = cuda.rank_scatter.share(n, world, to.w.share.rank);
                     const own = mine[1] - mine[0];
                     for (f.ranks) |from| try f.copy(p.side, room(to, lo) + from.w.share.rank * own * D * 4, from.b.part + (lo + mine[0]) * D * 4, own * D * 4);
                 },
                 .nccl => |x| {
                     const r = f.ranks[0];
                     const me = r.w.share.rank;
-                    const mine = share(n, world, me);
+                    const mine = cuda.rank_scatter.share(n, world, me);
                     const own = mine[1] - mine[0];
                     const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
                     if (f.ring) try relay.partials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D) else try relay.splitPartials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D);
@@ -405,14 +400,14 @@ pub const Forward = struct {
                 continue;
             }
             for (f.ranks) |r| {
-                const mine = share(n, world, r.w.share.rank);
+                const mine = cuda.rank_scatter.share(n, world, r.w.share.rank);
                 try f.glueRows(r, j, site, lo + mine[0], lo + mine[1], room(r, lo));
             }
             try p.glues[q].record(f.stream);
             try p.side.wait(p.glues[q]);
             switch (f.exchange) {
                 .local => for (f.ranks) |from| {
-                    const mine = share(n, world, from.w.share.rank);
+                    const mine = cuda.rank_scatter.share(n, world, from.w.share.rank);
                     const bytes = (mine[1] - mine[0]) * D * 2;
                     for (f.ranks) |to| if (to.w.share.rank != from.w.share.rank) {
                         const at = (lo + mine[0]) * D * 2;
@@ -456,6 +451,11 @@ pub const Forward = struct {
 
     /// forward.forward of `ids`: logits in b.logits; a prompt chunk's KDA layers committed, a window's at `commit`.
     pub fn run(f: *const Forward, ids: []const i32) !void {
+        try f.begin(ids);
+        try f.body(ids.len);
+    }
+
+    pub fn begin(f: *const Forward, ids: []const i32) !void {
         const R = ids.len;
         for (f.ranks) |r| {
             if (R == 0 or R > r.b.rows) return error.BadWindow;
@@ -466,6 +466,10 @@ pub const Forward = struct {
             } else try shared.begin(r, R, f.stream);
             try cuda.copy_source.enqueue(f.d, r.b.ids, std.mem.sliceAsBytes(ids), f.stream);
         }
+    }
+
+    /// GPU work after `begin` (rows checked, sequences readied, ids on the device); cuda_decode replays a window's.
+    pub fn body(f: *const Forward, R: usize) !void {
         const c = &f.ranks[0].w.config;
         for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
         if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
