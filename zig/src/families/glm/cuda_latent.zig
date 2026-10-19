@@ -27,9 +27,19 @@ fn cdiv(a: usize, b: usize) u32 {
 }
 
 /// latent.absorb_q (BF16 kv_b): out [rows][heads][lw] bf16 = q [rows][heads][d] . wk [heads][d][lw], fp32 sums.
-pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
+/// Prompt rows (prompt_rows on, never a decode window's 32) take tensor-core tiles on `wkt` [heads][lw][d] when given.
+pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, wkt: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
     if (d != 256 or lw != 512) return error.LatentShape;
+    if (wkt != 0 and rows >= prompt_rows) return bmmHeads(set, stream, q, heads * d, wkt, out, heads * lw, rows, lw, d, heads);
     try rowBlocks(set.glue.absorb_q, stream, q, wk, out, rows, heads, lw / 32);
+}
+
+/// out_h [m][n] (row stride ldo) = x_h [m][k] (row stride ldx) . w_h [n][k] for each head h (heads apart: k, n k, n).
+fn bmmHeads(set: glue.Set, stream: cuda.Stream, x: u64, ldx: usize, w: u64, out: u64, ldo: usize, m: usize, n: usize, k: usize, heads: usize) !void {
+    if (n % 128 != 0 or k % 32 != 0 or x % 16 != 0 or out % 16 != 0 or ldx % 8 != 0 or ldo % 8 != 0) return error.LatentShape;
+    var a: cuda.Args = .{};
+    inline for (.{ x, w, out, @as(i64, @intCast(m)), @as(i64, @intCast(ldx)), @as(i64, @intCast(n)), @as(i64, @intCast(k)), @as(i64, @intCast(k)), @as(i64, @intCast(n * k)), @as(i64, @intCast(n)), @as(i64, @intCast(ldo)) }) |v| a.add(v);
+    try cuda.launch.launch(set.glue.bmm_heads, .{ .grid = .{ .x = cdiv(m, 128), .y = @intCast(n / 128), .z = @intCast(heads) }, .block = .{ .x = 256 }, .shared = glue.bmm_tile1_smem[0] }, stream, &a);
 }
 
 /// The absorb and expand launches: rows in one block in decode windows, prompt_rb a block in prompt chunks.
@@ -41,8 +51,10 @@ fn rowBlocks(f: cuda.Function, stream: cuda.Stream, in: u64, w: u64, out: u64, r
 }
 
 /// latent.expand_v (BF16 kv_b): out [rows][heads][dv] bf16 = o_lat [rows][heads][lw] . wv [heads][dv][lw].
-pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize) !void {
+/// Prompt rows take tensor-core tiles with `tiles` (wv is already [heads][n][k]).
+pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize, tiles: bool) !void {
     if (dv != 256 or lw != 512) return error.LatentShape;
+    if (tiles and rows >= prompt_rows) return bmmHeads(set, stream, ol, heads * lw, wv, out, heads * dv, rows, dv, lw, heads);
     try rowBlocks(set.glue.expand_v, stream, ol, wv, out, rows, heads, dv / 16);
 }
 

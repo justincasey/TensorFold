@@ -20,6 +20,7 @@ pub const Layer = struct {
     kv_norm: u64,
     q_b: u64,
     wk: u64,
+    wkt: u64 = 0, // wk per head transposed, [heads][lw][qk]: prompt rows' tensor-core absorb (RED-SNOW's loader), else 0
     wv: u64,
     o: u64,
     index: Index,
@@ -79,7 +80,7 @@ pub fn fill(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize,
 pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize) !void {
     try prepare(k.set, stream, l, s, x, x_stride, rows, sparseRows(l, host_pos, rows));
     try attend(k, stream, l, c, s, 0, rows, pos, host_pos, nch, part_rows);
-    try latent.expandV(k.set, stream, s.ol, l.wv, s.vn, rows, l.heads, l.dv, l.lw);
+    try latent.expandV(k.set, stream, s.ol, l.wv, s.vn, rows, l.heads, l.dv, l.lw, l.wkt != 0);
 }
 
 /// Whether a sequence at `host_pos` has rows past the dense limit among its next `rows` (the sparse pass).
@@ -97,7 +98,7 @@ pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
     const ix = l.index;
     try b16.matmul(set, stream, x, x_stride, ix.kw, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
     try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);
-    try latent.absorbQ(set, stream, s.q, l.wk, s.qa, rows, l.heads, l.qk, l.lw);
+    try latent.absorbQ(set, stream, s.q, l.wk, l.wkt, s.qa, rows, l.heads, l.qk, l.lw);
     if (qi) try b16.matmul(set, stream, s.qr, l.q_lora, ix.qb, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
 }
 

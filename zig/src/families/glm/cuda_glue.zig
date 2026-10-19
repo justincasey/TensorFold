@@ -41,6 +41,7 @@ pub const Kernels = struct {
     bmm_rows: cuda.Function,
     bmm_tile: cuda.Function,
     bmm_tile1: cuda.Function,
+    bmm_heads: cuda.Function, // one bf16 tile matmul a head (the latent absorb and expand of prompt rows)
     bmm_d32s1: cuda.Function,
     bmm_d32s2: cuda.Function,
     bmm_d32s3: cuda.Function,
@@ -55,6 +56,7 @@ pub const Kernels = struct {
         inline for (@typeInfo(Kernels).@"struct".field_names) |name| @field(k, name) = try m.function("tf_glm_" ++ name);
         try k.bmm_tile.allowDynamicShared(bmm_tile_smem);
         try k.bmm_tile1.allowDynamicShared(bmm_tile1_smem[1]);
+        try k.bmm_heads.allowDynamicShared(bmm_tile1_smem[0]);
         try k.chunks_16.allowDynamicShared(chunksSmem(16));
         try k.chunks_32.allowDynamicShared(chunksSmem(32));
         return k;
