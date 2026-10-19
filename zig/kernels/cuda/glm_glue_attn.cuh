@@ -60,12 +60,13 @@ __device__ __forceinline__ void cp4(void* dst, const void* src, bool ok) {
   asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(d), "l"(src), "r"(ok ? 4 : 0));
 }
 
-// Two e4m3 codes (the low 16 bits of c) as a bf16 pair, exactly (every e4m3 value is an f16 and a bf16).
-__device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint32_t c) {
-  uint32_t h;
-  asm("{\n.reg .b16 lo;\ncvt.u16.u32 lo, %1;\ncvt.rn.f16x2.e4m3x2 %0, lo;\n}" : "=r"(h) : "r"(c));
-  const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
-  const __nv_bfloat162 b = __floats2bfloat162_rn(f.x, f.y);
+// Codes `sel` picks of c (byte_perm selector 0x4140: bytes 0, 1; 0x4342: bytes 2, 3) as a bf16 pair, exactly: a code's
+// exponent and mantissa bits under bf16's are its value times 2^-120 (subnormals too), so one bf16 multiply by 2^120.
+__device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint32_t c, uint32_t sel) {
+  const uint32_t p = __byte_perm(c, 0, sel);
+  const uint32_t v = ((p << 4) & 0x07f007f0u) | ((p << 8) & 0x80008000u);
+  const __nv_bfloat162 x = *reinterpret_cast<const __nv_bfloat162*>(&v);
+  const __nv_bfloat162 b = __hmul2(x, __nv_bfloat162(__ushort_as_bfloat16(0x7b80), __ushort_as_bfloat16(0x7b80)));
   return *reinterpret_cast<const uint32_t*>(&b);
 }
 
@@ -91,27 +92,37 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const void* cache, const in
   const bool live = sparse ? start < n : start <= limit;
   auto load_kv = [&](int tile) {
     const int64_t first = start + tile * KT;
-    if constexpr (FP8) {
-      uint8_t* dst = stage + (tile & 1) * KT * LW;
-      for (int idx = t; idx < KT * (LW / 16); idx += blockDim.x) {
-        const int key = idx / (LW / 16), u = idx % (LW / 16);
-        const int64_t ki = first + key;
-        const bool ok = sparse ? ki < n : ki <= limit;
-        const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
-        cp16(dst + key * LW + u * 16, lc8 + src * LW + u * 16, ok);
-        if (u == 0) cp4(sst + (tile & 1) * KT + key, ls + src, ok);
-      }
-    } else {
-      __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
-      for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
-        const int key = idx / (LW / 8), u = idx % (LW / 8);
-        const int64_t ki = first + key;
-        const bool ok = sparse ? ki < n : ki <= limit;
-        const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
-        cp16(dst + wide(key, u), lc + src * LW + u * 8, ok);
-      }
+    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
+    for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
+      const int key = idx / (LW / 8), u = idx % (LW / 8);
+      const int64_t ki = first + key;
+      const bool ok = sparse ? ki < n : ki <= limit;
+      const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+      cp16(dst + wide(key, u), lc + src * LW + u * 8, ok);
     }
   };
+  // FP8 (256 threads): a thread's keys of a tile are t / 32 + 8 i (i < 4), its 16-byte unit t % 32. Their cache rows
+  // (-1: none) are read a tile before their copies start, so the token list's latency is off the tile's path.
+  auto rows_of = [&](int tile, int* s) {
+    const int64_t first = start + tile * KT + (t >> 5);
+    for (int i = 0; i < 4; ++i) {
+      const int64_t ki = first + 8 * i;
+      const bool ok = sparse ? ki < n : ki <= limit;
+      s[i] = ok ? (sparse ? tok[r * w + ki] : (int)ki) : -1;
+    }
+  };
+  auto load8 = [&](int tile, const int* s) {
+    uint8_t* dst = stage + (tile & 1) * KT * LW;
+    const int u = t & 31;
+    for (int i = 0; i < 4; ++i) {
+      const int key = (t >> 5) + 8 * i;
+      const bool ok = s[i] >= 0;
+      const int64_t src = ok ? s[i] : 0;
+      cp16(dst + key * LW + u * 16, lc8 + src * LW + u * 16, ok);
+      if (u == 0) cp4(sst + (tile & 1) * KT + key, ls + src, ok);
+    }
+  };
+  int ahead[4];  // FP8: the cache rows of the next tile to copy
   // FP8: tile `tile`'s staged codes as bf16 into the key buffer, 16 codes a thread at a time.
   auto widen = [&](int tile) {
     const uint8_t* src = stage + (tile & 1) * KT * LW;
@@ -120,7 +131,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const void* cache, const in
       const uint4 v = *reinterpret_cast<const uint4*>(src + key * LW + u * 16);
       const uint32_t in[4] = {v.x, v.y, v.z, v.w};
       uint32_t out[8];
-      for (int j = 0; j < 4; ++j) out[2 * j] = e4m3x2_bf16x2(in[j]), out[2 * j + 1] = e4m3x2_bf16x2(in[j] >> 16);
+      for (int j = 0; j < 4; ++j) out[2 * j] = e4m3x2_bf16x2(in[j], 0x4140), out[2 * j + 1] = e4m3x2_bf16x2(in[j], 0x4342);
       *reinterpret_cast<uint4*>(kvs + wide(key, 2 * u)) = make_uint4(out[0], out[1], out[2], out[3]);
       *reinterpret_cast<uint4*>(kvs + wide(key, 2 * u + 1)) = make_uint4(out[4], out[5], out[6], out[7]);
     }
@@ -138,10 +149,20 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const void* cache, const in
       const bool ok = h0 + hd < heads;
       cp16(qs + wide(hd, u), qa + (r * heads + (ok ? h0 + hd : 0)) * LW + u * 8, ok);
     }
-    load_kv(0);
-    commit();
-    load_kv(1);
-    commit();
+    if constexpr (FP8) {
+      rows_of(0, ahead);
+      load8(0, ahead);
+      commit();
+      rows_of(1, ahead);
+      load8(1, ahead);
+      commit();
+      rows_of(2, ahead);
+    } else {
+      load_kv(0);
+      commit();
+      load_kv(1);
+      commit();
+    }
   }
   for (int tile = 0; live && tile < tiles; ++tile) {
     if (tile + 1 < tiles)
@@ -245,8 +266,14 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const void* cache, const in
     __syncthreads();
     for (int i = 0; i < MT; ++i)
       for (int hf = 0; hf < 2; ++hf) l[i][hf] = __fmaf_rn(l[i][hf], alpha[i][hf], stat[HB + i * 16 + hf * 8 + g]);
-    if (tile + 2 < tiles) load_kv(tile + 2);
-    commit();
+    if constexpr (FP8) {
+      if (tile + 2 < tiles) load8(tile + 2, ahead);
+      commit();
+      if (tile + 3 < tiles) rows_of(tile + 3, ahead);
+    } else {
+      if (tile + 2 < tiles) load_kv(tile + 2);
+      commit();
+    }
   }
   for (int i = 0; i < MT; ++i)
     for (int e = 0; e < 4; ++e) {
