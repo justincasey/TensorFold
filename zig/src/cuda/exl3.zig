@@ -145,10 +145,12 @@ pub const Linear = struct {
         l.mod.unload();
     }
 
-    /// Shared bytes one call needs: WK * min(m, 8) * 128 floats of warp sums, at most 32 KB.
+    /// Shared bytes one call needs: WK * min(m, 8) * 128 floats of warp sums, at most 32 KB; even widths stage a step.
     pub fn sharedBytes(w: Weight, m: usize) u32 {
         const p = plan(w.k, w.n, 192, 8);
-        return @intCast(p.wk * @min(m, 8) * 128 * 4);
+        const red = p.wk * @min(m, 8) * 128 * 4;
+        const stage = if (w.halves % 2 == 0) p.wk * 8 * 64 * 4 else 0; // a warp's 8 tiles of a k step, in red
+        return @intCast(@max(red, stage));
     }
 
     /// Split partials one call needs (fp32 [sk, m, n]) when the plan splits K, else 0.
