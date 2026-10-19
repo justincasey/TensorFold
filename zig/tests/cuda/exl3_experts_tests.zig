@@ -42,6 +42,14 @@ pub fn run(r: *Rig, state: *Run, dir: []const u8) !void {
     }
     {
         var ok = true;
+        fused(r, &exp) catch |e| {
+            state.fail(e, "exl3.prompt.fused");
+            ok = false;
+        };
+        if (ok) check.pass("exl3.prompt.fused: mul1 at mixed widths (gate and up apart) within f64, chunk and repeat bytes equal", .{});
+    }
+    {
+        var ok = true;
         python(r, &exp, dir, state) catch |e| {
             state.fail(e, "exl3.experts.python");
             ok = false;
@@ -108,6 +116,56 @@ fn chunks(r: *Rig, exp: *const exl3e.Experts) !void {
         const res = try ref.runSlice(r, exp, b.layer, b.dx + @as(u64, at) * ref.D * 2, b.dpick + @as(u64, at) * ref.SLOTS * 4, b.dwts + @as(u64, at) * ref.SLOTS * 4, n);
         const got = try r.back(res.out, n * ref.D * 4);
         try check.sameBytes("exl3.prompt.experts.chunks 37", got, whole[at * ref.D * 4 ..][0 .. n * ref.D * 4]);
+    }
+}
+
+/// The fused prompt kernels' per-slot rows of `n` rows from `at`, over a fresh plan and scratch.
+fn fusedRows(r: *Rig, exp: *const exl3e.Experts, router: cuda.grouped.Router, b: *const ref.Built, at: usize, n: usize) ![]u8 {
+    const P = n * ref.SLOTS;
+    const wide = P > cuda.grouped.small;
+    const plan: cuda.grouped.Plan = .{
+        .members = try r.zeros(P * 4),
+        .items = try r.zeros(cuda.grouped.maxItems(P, ref.E, exl3e.prompt.tile) * 12),
+        .counts = try r.zeros(16),
+        .rank = try r.zeros((if (wide) P else 1) * 4),
+        .hist = try r.zeros((if (wide) (P + 1023) / 1024 * ref.E else 1) * 4),
+    };
+    const sc = try exl3e.prompt.scratch(try r.zeros(try exl3e.prompt.bytes(b.layer, n, ref.SLOTS)), b.layer, n, ref.SLOTS);
+    try exp.prompt.run(exp, router, r.s, b.layer, b.dx + @as(u64, at) * ref.D * 2, ref.D, b.dpick + @as(u64, at) * ref.SLOTS * 4, n, sc, plan);
+    try r.s.synchronize();
+    return r.back(sc.y, P * ref.D * 4);
+}
+
+/// The fused path at RED-SNOW's widths, gate and up apart in one expert: f64, repeat, and chunks of 128 and 37 rows.
+fn fused(r: *Rig, exp: *const exl3e.Experts) !void {
+    const gbits = [ref.E]u32{ 5, 6, 4, 6, 6, 5, 5, 4, 6 };
+    const ubits = [ref.E]u32{ 5, 6, 4, 6, 6, 5, 5, 4, 5 };
+    const dbits = [ref.E]u32{ 4, 4, 4, 5, 6, 5, 6, 5, 4 };
+    var b = try ref.buildWidths(r, &gbits, &ubits, &dbits);
+    b.layer.max_k2 = 12;
+    if (!exl3e.prompt.eligible(b.layer)) return error.TestFailed;
+    var pm = try cuda.Module.load(r.gpu.d, cuda.kernels.experts);
+    defer pm.unload();
+    const router = try cuda.grouped.Router.resolve(pm);
+    const rows = 300;
+    const y = try fusedRows(r, exp, router, &b, 0, rows);
+    const want = try ref.reference(r, &b, rows);
+    var most: f64 = 0;
+    for (0..rows) |row| for (0..ref.D) |d| { // the reference's combine: fp32 fmas in slot order
+        var acc: f32 = 0;
+        for (0..ref.SLOTS) |k| acc = @mulAdd(f32, b.wts[row * ref.SLOTS + k], std.mem.bytesToValue(f32, y[((row * ref.SLOTS + k) * ref.D + d) * 4 ..][0..4]), acc);
+        most = @max(most, @abs(@as(f64, acc) - want.want[row * ref.D + d]) / want.tol[row * ref.D + d]);
+    };
+    std.debug.print("RESULT exl3.prompt.fused.f64: largest difference {d:.3} of its tolerance\n", .{most});
+    if (!(most <= 1)) return error.TestFailed;
+    try check.sameBytes("exl3.prompt.fused repeat", try fusedRows(r, exp, router, &b, 0, rows), y);
+    for ([_]usize{ 128, 37 }) |step| {
+        var at: usize = 0;
+        while (at < rows) : (at += step) {
+            const n: usize = @min(rows - at, step);
+            const per = ref.SLOTS * ref.D * 4;
+            try check.sameBytes("exl3.prompt.fused chunks", try fusedRows(r, exp, router, &b, at, n), y[at * per ..][0 .. n * per]);
+        }
     }
 }
 

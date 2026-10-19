@@ -23,7 +23,9 @@ const f64_ids = [_][]const u8{ "exl3.experts.f64.mul1.4", "exl3.experts.f64.mul1
 /// One synthetic layer: the device tensors, the host trellises the reference unpacks, and the seeded routing.
 pub const Built = struct {
     layer: exl3e.Layer,
-    bits: []const u32,
+    bits: []const u32, // the gate's bits an expert (and up's and down's unless they differ)
+    ubits: []const u32,
+    dbits: []const u32,
     gate: [E][]i16,
     up: [E][]i16,
     down: [E][]i16,
@@ -80,9 +82,16 @@ fn bf16r(v: f64) f64 {
 }
 
 pub fn buildLayer(r: *Rig, bits: []const u32) !Built {
+    return buildWidths(r, bits, bits, bits);
+}
+
+/// A layer whose gate, up and down take their own bits an expert.
+pub fn buildWidths(r: *Rig, bits: []const u32, ubits: []const u32, dbits: []const u32) !Built {
     var b: Built = .{
         .layer = undefined,
         .bits = bits,
+        .ubits = ubits,
+        .dbits = dbits,
         .gate = undefined,
         .up = undefined,
         .down = undefined,
@@ -113,14 +122,14 @@ pub fn buildLayer(r: *Rig, bits: []const u32) !Built {
     const svh_d = try r.a.alloc(u16, E * D);
     for (0..E) |e| {
         b.gate[e] = try randI16(r, (D / 16) * (I / 16) * widthOf(bits[e]).tileWords());
-        b.up[e] = try randI16(r, (D / 16) * (I / 16) * widthOf(bits[e]).tileWords());
-        b.down[e] = try randI16(r, (I / 16) * (D / 16) * widthOf(bits[e]).tileWords());
+        b.up[e] = try randI16(r, (D / 16) * (I / 16) * widthOf(ubits[e]).tileWords());
+        b.down[e] = try randI16(r, (I / 16) * (D / 16) * widthOf(dbits[e]).tileWords());
         gate_p[e] = try r.dev(std.mem.sliceAsBytes(b.gate[e]));
         up_p[e] = try r.dev(std.mem.sliceAsBytes(b.up[e]));
         down_p[e] = try r.dev(std.mem.sliceAsBytes(b.down[e]));
         gk2[e] = @intCast(2 * bits[e]);
-        uk2[e] = gk2[e];
-        dk2[e] = gk2[e];
+        uk2[e] = @intCast(2 * ubits[e]);
+        dk2[e] = @intCast(2 * dbits[e]);
         randScale(r, suh_g[e * D ..][0..D]);
         randScale(r, suh_u[e * D ..][0..D]);
         randScale(r, svh_g[e * I ..][0..I]);
@@ -258,7 +267,7 @@ pub fn prompt(r: *Rig, exp: *const exl3e.Experts) !void {
 }
 
 /// The f64 reference: the kernel's chain mirrored in f64, each output's error its per-element worst case.
-fn reference(r: *Rig, b: *const Built, rows_n: usize) !struct { want: []f64, tol: []f64 } {
+pub fn reference(r: *Rig, b: *const Built, rows_n: usize) !struct { want: []f64, tol: []f64 } {
     const p = rows_n * SLOTS;
     // xg: fp16((x * suh_g) @ H) per slot; |xg| and its error <= V, the block's sum of |x * suh| over sqrt(128)
     const xs = try r.a.alloc(f64, p * D);
@@ -293,7 +302,7 @@ fn reference(r: *Rig, b: *const Built, rows_n: usize) !struct { want: []f64, tol
             if (b.pick[s0] != @as(i32, @intCast(ex))) continue;
             gemmK(xg[s0 * D ..][0..D], wq, zg[s0..], s1g[s0..], eg[s0..], xgerr[s0 * D ..][0..D], D, I, p);
         }
-        exl3fmt.unpack(widthOf(b.bits[ex]), .mul1, b.up[ex], D / 16, I / 16, wq[0 .. D * I]);
+        exl3fmt.unpack(widthOf(b.ubits[ex]), .mul1, b.up[ex], D / 16, I / 16, wq[0 .. D * I]);
         for (0..p) |s0| {
             if (b.pick[s0] != @as(i32, @intCast(ex))) continue;
             gemmK(xg[s0 * D ..][0..D], wq, zu[s0..], s1u[s0..], eu[s0..], xgerr[s0 * D ..][0..D], D, I, p);
@@ -362,7 +371,7 @@ fn reference(r: *Rig, b: *const Built, rows_n: usize) !struct { want: []f64, tol
     @memset(s1d, 0);
     @memset(de, 0);
     for (0..E) |ex| {
-        exl3fmt.unpack(widthOf(b.bits[ex]), .mul1, b.down[ex], I / 16, D / 16, wq[0 .. I * D]);
+        exl3fmt.unpack(widthOf(b.dbits[ex]), .mul1, b.down[ex], I / 16, D / 16, wq[0 .. I * D]);
         for (0..p) |s0| {
             if (b.pick[s0] != @as(i32, @intCast(ex))) continue;
             for (0..I) |ki| {
