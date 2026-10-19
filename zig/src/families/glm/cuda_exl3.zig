@@ -95,7 +95,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
             if (k2 < 2 or k2 > 16) return error.NotExl3Experts;
             const b = try markerOf(L, i, e, proj);
             if (book) |x| (if (x != b) return error.MixedExl3Codebooks) else book = b;
-            if (b == .mcg and k2 % 2 != 0) return error.NotExl3Experts; // the half steps are mul1's alone
+            if (b == .mcg and @rem(k2, 2) != 0) return error.NotExl3Experts; // the half steps are mul1's alone
             if (uniform) |u| (if (u != k2) {
                 mixed = true;
             }) else uniform = k2;
