@@ -65,7 +65,7 @@ pub fn run(gpu: Gpu) !void {
             const scales = if (fp8 == 1) ls else 0;
             for (0..2) |round| {
                 try t0.record(s);
-                for (0..reps) |_| try latent.sparseAttention(set, s, qa, cache, scales, dtok, dcnt, w, p, out, rows, heads, lw, 0.0625);
+                for (0..reps) |_| try latent.sparseAttention(set, s, qa, cache, scales, dtok, dcnt, w, p, out, rows, heads, lw, 0.0625, latent.headBlock(rows));
                 try t1.record(s);
                 try t1.synchronize();
                 if (round == 1) ms[fp8] = @as(f64, try cuda.Event.elapsedMs(t0, t1)) / reps;
