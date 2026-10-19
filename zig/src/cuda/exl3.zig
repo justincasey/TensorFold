@@ -74,11 +74,11 @@ pub fn denseIndex(w: Weight) ?usize {
     return null;
 }
 
-/// 128-row blocks once they fill this many blocks (four a GB10 SM), else 64-row blocks; a row's bits are the same.
-const dense_wide_blocks = 192;
+/// 128-row blocks once they fill this many blocks (two a GB10 SM), else 64-row blocks; a row's bits are the same.
+const dense_wide_blocks = 96;
 
 /// Row blocks a column block sweeps before the next starts (its weights stay in L2 while x streams past).
-const dense_group = 16;
+const dense_group = 4;
 
 /// What one shape launches, from the shape alone so a row's bits never depend on the row count (linear.py plan).
 pub fn plan(k: usize, n: usize, blocks: usize, min_tiles: usize) struct { sk: u32, wk: u32 } {
