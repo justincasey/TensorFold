@@ -91,7 +91,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
         for (0..count) |e| {
             const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".trellis", .{ i, e });
             if (t.dtype != .i16 or t.rank != 3 or t.dim(0) != m.k / 16 or t.dim(1) != m.n / 16 or t.dim(2) % 8 != 0) return error.NotExl3Experts;
-            const k2: i32 = @intCast(t.dim(2) / 8); // 16 x 16 values at k2 / 2 bits: 16 k2 i16 words
+            const k2: i32 = @intCast(t.dim(2) / 8); // a 16 x 16 tile at k2 / 2 bits: 8 k2 i16 words, 16 k2 bytes
             if (k2 < 2 or k2 > 16) return error.NotExl3Experts;
             const b = try markerOf(L, i, e, proj);
             if (book) |x| (if (x != b) return error.MixedExl3Codebooks) else book = b;
@@ -101,7 +101,8 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
             }) else uniform = k2;
             k2s[e] = k2;
             offs[e] = at;
-            const tile: usize = 32 * @as(usize, @intCast(k2)); // a 16 x 16 tile's bytes
+            const tile: usize = 16 * @as(usize, @intCast(k2)); // a 16 x 16 tile's bytes (the trellis's last axis, in bytes)
+            if (tile != t.dim(2) * 2) return error.NotExl3Experts;
             if (m.by_cols) { // every tile row, the rank's tile columns
                 const row = (m.n / 16) * tile;
                 for (0..kt) |r| try L.host.appendSlice(L.gpa, t.bytes[r * row + (cut.lo / 16) * tile ..][0 .. nt * tile]);
@@ -144,12 +145,14 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
 fn markerOf(L: anytype, i: u32, e: usize, comptime proj: []const u8) !common.Codebook {
     const marks = @import("core").exl3_load.markers;
     inline for (.{ "mcg", "mul1" }, .{ common.Codebook.mcg, common.Codebook.mul1 }) |name, cb| {
-        if (L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ "." ++ name, .{ i, e })) |t| {
+        var nb: [192]u8 = undefined;
+        if (L.ck.has(try std.fmt.bufPrint(&nb, "model.language_model.layers.{d}.mlp.experts.{d}." ++ proj ++ "." ++ name, .{ i, e }))) {
+            const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ "." ++ name, .{ i, e });
             if (t.dtype != .i32 or t.numel() != 1 or t.bytes.len != 4) return error.NotExl3Experts;
             const v = std.mem.readInt(u32, t.bytes[0..4], .little);
             for (marks) |mk| if (std.mem.eql(u8, mk.name, name) and mk.value != v) return error.NotExl3Experts;
             return cb;
-        } else |_| {}
+        }
     }
     return error.NotExl3Experts;
 }
