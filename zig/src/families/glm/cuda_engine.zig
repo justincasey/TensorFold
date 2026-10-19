@@ -155,6 +155,7 @@ pub const Engine = struct {
         }
         e.m.tiled = o.settings.tiled;
         if (o.settings.tiled) e.m.packs = &e.packs;
+        e.m.xl = e.w.xl; // RED-SNOW: the EXL3 linears b16.matmul's handles name
         try e.bind(0);
         errdefer {
             e.free(0);

@@ -55,6 +55,14 @@ fn linears(w: *Weights, list: *std.ArrayList(Lin)) !void {
         try add(list, w.gpa, &m.eh, w.config.hidden, 2 * w.config.hidden);
     }
     try add(list, w.gpa, &w.head, w.share.vocab.len(), w.config.hidden);
+    if (w.xl) |r| { // RED-SNOW's EXL3 handles stay as they are
+        var keep: usize = 0;
+        for (list.items) |x| if (r.find(x.field.*) == null) {
+            list.items[keep] = x;
+            keep += 1;
+        };
+        list.shrinkRetainingCapacity(keep);
+    }
 }
 
 /// A packed linear moved into a buffer its own size, its bf16 one freed; the bytes freed (0: it shares a buffer).
