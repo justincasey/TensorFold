@@ -143,12 +143,20 @@ pub const Runner = struct {
         return nb.ptr;
     }
 
+    /// The split-K counters, zeroed when allocated: each call's last block of a column block zeroes its own again.
+    fn zeroedCounters(r: *Runner, s: *Scratch, stream: cuda.Stream, bytes: usize) !u64 {
+        const before = r.grown;
+        const p = try r.grow(&s.counters, bytes);
+        if (r.grown != before) try stream.d.check(stream.d.api.cuMemsetD8Async(p, 0, s.counters.?.len, stream.handle), "EXL3 counters");
+        return p;
+    }
+
     /// Grows each stream's scratch for `rows` rows a call (prompt chunks) before any decode window runs.
     pub fn reserve(r: *Runner, stream: cuda.Stream, rows: usize) !void {
         const s = try r.scratchFor(stream);
         _ = try r.grow(&s.xh, @max(rows, block_rows) * r.max_k * 2);
         _ = try r.grow(&s.z, r.max_z);
-        _ = try r.grow(&s.counters, r.max_counters);
+        _ = try r.zeroedCounters(s, stream, r.max_counters);
         _ = try r.grow(&s.xc, rows * r.max_k * 2);
         _ = try r.grow(&s.yt, rows * r.max_n * 4);
     }
@@ -198,13 +206,12 @@ pub const Runner = struct {
         const lin = try r.linear();
         const p = exl3.plan(w.k, w.n, 192, 8);
         const z: u64 = if (p.sk > 1) try r.grow(&s.z, @as(usize, p.sk) * block_rows * w.n * 4) else 0;
-        const counters = try r.grow(&s.counters, exl3.Linear.counterBytes(w));
+        const counters = try r.zeroedCounters(s, stream, exl3.Linear.counterBytes(w));
         const xh = try r.grow(&s.xh, block_rows * w.k * 2);
         const ye: u64 = if (yd == .f32) 4 else 2;
         var at: usize = 0;
         while (at < rows) : (at += block_rows) {
             const mm = @min(rows - at, block_rows);
-            try stream.d.check(stream.d.api.cuMemsetD8Async(counters, 0, exl3.Linear.counterBytes(w), stream.handle), "EXL3 counters");
             try lin.matmul(stream, w, x + @as(u64, at) * w.k * 2, .bf16, mm, y + @as(u64, at) * w.n * ye, yd, xh, z, counters);
         }
     }
