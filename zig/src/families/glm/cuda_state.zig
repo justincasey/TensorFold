@@ -263,7 +263,9 @@ pub const State = struct {
     base: usize = 0, // the first position the main rings hold (their pointers are ring - base rows)
     mtp_base: usize = 0,
 
-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize) !State {
+    /// `kv8` (--kv-cache fp8): each DSA layer's latent cache (and the MTP layer's) in e4m3 bytes with an fp32 scale a
+    /// row, both in the arena (a kept state's copy takes them).
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, kv8: bool) !State {
         const c = &w.config;
         const s = &w.share;
         var nk: usize = 0;
@@ -280,8 +282,10 @@ pub const State = struct {
         try sizes.appendSlice(gpa, &.{ 4, nk * 3 * 3 * n * 2, 2 * nk * s.kda.len() * kda.dk * kda.dv * 4, nk * window_rows * kw * 2 });
         try sizes.appendSlice(gpa, &.{ nk * window_rows * n * 4, nk * window_rows * n * 2, nk * window_rows * n * 4, nk * window_rows * s.kda.len() * 4 });
         const ring_rows = @min(capacity, index_ring);
-        for (0..nd + 1) |_| try sizes.appendSlice(gpa, &.{ capacity * c.kv_lora * 2, ring_rows * c.i_dim * 2, ring_rows * c.i_dim * 2, pk_rows * c.i_dim * 2 });
+        const lat_bytes: usize = if (kv8) 1 else 2;
+        for (0..nd + 1) |_| try sizes.appendSlice(gpa, &.{ capacity * c.kv_lora * lat_bytes, ring_rows * c.i_dim * 2, ring_rows * c.i_dim * 2, pk_rows * c.i_dim * 2 });
         try sizes.append(gpa, 4); // the MTP head's position
+        if (kv8) try sizes.appendNTimes(gpa, capacity * 4, nd + 1); // the latent caches' row scales, the MTP layer's last
         const p = try gpa.alloc(u64, sizes.items.len);
         defer gpa.free(p);
         var a = try arena(d, sizes.items, p);
@@ -291,10 +295,10 @@ pub const State = struct {
         @memset(cur, 0);
         const caches = try gpa.alloc(dsa_block.Caches, nd);
         errdefer gpa.free(caches);
-        for (caches, 0..) |*x, j| x.* = .{ .lc = p[8 + 4 * j], .ik = p[9 + 4 * j], .ig = p[10 + 4 * j], .pk = p[11 + 4 * j], .pk_rows = pk_rows };
+        for (caches, 0..) |*x, j| x.* = .{ .lc = p[8 + 4 * j], .ik = p[9 + 4 * j], .ig = p[10 + 4 * j], .pk = p[11 + 4 * j], .pk_rows = pk_rows, .ls = if (kv8) p[13 + 4 * nd + j] else 0 };
         const rings = try gpa.alloc(u64, 2 * (nd + 1));
         for (0..nd + 1) |j| rings[2 * j ..][0..2].* = .{ p[9 + 4 * j], p[10 + 4 * j] };
-        return .{ .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw };
+        return .{ .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = pk_rows, .ls = if (kv8) p[13 + 5 * nd] else 0 }, .mtp_pos_dev = p[12 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw };
     }
 
     pub fn deinit(st: *State) void {

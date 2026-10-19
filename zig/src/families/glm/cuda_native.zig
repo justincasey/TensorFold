@@ -37,6 +37,7 @@ pub const Options = struct {
     vision: ?images_mod.Limits = null, // --vision: rank 0's tower, every rank's image rows
     drafter: ?[]const u8 = null, // --drafter: DFlash2's folder (the same on every rank; needs drafts on)
     drafter_bits: u8 = 4, // --drafter-bits: 4 (default) or 0 (bf16)
+    kv8: bool = false, // --kv-cache fp8: the DSA latent caches (and the MTP layer's) in e4m3 with an fp32 row scale
 };
 /// --drafter: DFlash2 (incoai/GLM-5.3-Flash-DFlash2, non-commercial weights) drafts instead of the MTP head.
 pub const takes_drafter = true;
@@ -136,10 +137,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const roce_bytes = try roceBytes(if (std.c.getenv("TF_ROCE_MAX_KB")) |v| std.mem.span(v) else null);
     if (p.world > 1 and std.c.getenv("NCCL_COMM_ID") == null) return error.NoCommId;
     var problem: []const u8 = "";
-    const set = ranks.Settings.read(&ranks.environment, &problem) catch |err| {
+    var set = ranks.Settings.read(&ranks.environment, &problem) catch |err| {
         std.log.err("{s}", .{problem});
         return err;
     };
+    set.kv8 = o.kv8;
     // the ranks' lines before NCCL (cuda/tp_watch.zig): a rank that fails, refuses or dies stops every rank
     if (p.world > 1) try cuda.tp_watch.start(io, p.rank, p.world);
     return openRank(gpa, io, ctx, dir, o, p, set, roce_bytes) catch |err| {

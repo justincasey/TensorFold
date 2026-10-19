@@ -16,6 +16,7 @@ pub const Settings = struct {
     layers: u32 = 0, // TF_GLM_LAYERS: the first this many layers only, a thin model for one-GPU checks (0: all)
     dense_bits: u8 = 16, // TF_GLM_DENSE_BITS: the dense linears packed at load to 4, 6 or 8 bits (16: bf16)
     head_bits: u8 = 16, // TF_GLM_HEAD_BITS: the head, likewise
+    kv8: bool = false, // --kv-cache fp8 (the server's flag, set by cuda_native): e4m3 latent caches, an fp32 scale a row
 
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
@@ -101,7 +102,7 @@ pub const Fingerprint = extern struct {
     max_images: u32 = 0,
     max_videos: u32 = 0,
     max_frames: u32 = 0,
-    bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
+    bits: u32 = 16 << 8 | 16, // kv8 << 16 | TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank reads the same codes
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
@@ -152,7 +153,7 @@ pub const Fingerprint = extern struct {
             .pieces = s.pieces,
             .layers = s.layers,
             .mtp = @intFromBool(mtp),
-            .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
+            .bits = @as(u32, @intFromBool(s.kv8)) << 16 | @as(u32, s.dense_bits) << 8 | s.head_bits,
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,
@@ -289,7 +290,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .max_images => "the image count limit",
         .max_videos => "the video count limit",
         .max_frames => "the frame limit",
-        .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
+        .bits => "TF_GLM_DENSE_BITS, TF_GLM_HEAD_BITS or --kv-cache",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",
