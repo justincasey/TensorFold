@@ -63,6 +63,8 @@ pub const Modules = struct {
         m.prompt = try cuda.nvfp4.Prompt.load(d);
         errdefer m.prompt.unload();
         m.kda = try kda.Kernels.load(m.mods[0]);
+        m.kda.chunk = try kda.Chunk.load(d);
+        errdefer m.kda.chunk.?.unload();
         m.experts = try experts.Kernels.load(d, m.mods[2], @intCast(try ctx.attribute(.multiprocessor_count)));
         errdefer m.experts.unload();
         m.copy_rows = try m.mods[1].function("tf_glm_copy_rows");
@@ -91,6 +93,7 @@ pub const Modules = struct {
 
     pub fn deinit(m: *Modules) void {
         m.exl3.unload();
+        if (m.kda.chunk) |*c| c.unload();
         for (&m.mods) |*x| x.unload();
         m.lane.unload();
         m.prompt.unload();
