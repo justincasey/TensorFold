@@ -30,6 +30,7 @@ const glm_exl3_tests = @import("glm_exl3_tests.zig");
 const glm_exl3_bench = @import("glm_exl3_bench.zig");
 const glm_vision_tests = @import("glm_vision_tests.zig");
 const glm_mm_bench = @import("glm_mm_bench.zig");
+const glm_attn_bench = @import("glm_attn_bench.zig");
 const carveout_tests = @import("carveout_tests.zig");
 const nvfp4_tests = @import("nvfp4_tests.zig");
 const modelopt_tests = @import("modelopt_tests.zig");
@@ -172,6 +173,7 @@ const usage =
     \\  glm-exl3-bench [SIGMA]    GLM's EXL3 routed experts on one 2,048-row prompt chunk at RED-SNOW's rank shapes
     \\  glm-vision MODEL F32 BF16 IMG  GLM's image tower and preparation against vision_ref.py's torch runs
     \\  glm-mm-bench              GLM's bf16 linears: b16.matmul against glm_mm, by rows (one GPU)
+    \\  glm-attn-bench            GLM's sparse latent attention, bf16 cache against --kv-cache fp8's (one GPU)
     \\  glm-ref                   GLM projections (matmuls, router, attention, indexer, hc) against float64 (synthetic)
     \\  glm-lanes-cover <ckpt> <dc.json> <rank> <world> <idfile>  copy drafts, cancels, discards, eos and max_new on one lanes.Engine across requests
     \\  glm-lanes-concurrent <ckpt> <dc.json> <rank> <world> <idfile>  concurrent streams on one lanes.Engine, each against its solo run
@@ -262,6 +264,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm-exl3")) return glm_exl3_tests.run_(gpu);
     if (std.mem.eql(u8, cmd, "glm-exl3-bench")) return glm_exl3_bench.run(gpu, if (rest.len > 0) rest[0] else null);
     if (std.mem.eql(u8, cmd, "glm-mm-bench")) return glm_mm_bench.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm-attn-bench")) return glm_attn_bench.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-vision")) return glm_vision_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "modelopt")) return modelopt_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "moe")) return moe_tests.run(gpu);
