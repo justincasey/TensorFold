@@ -2,12 +2,36 @@
 #pragma once
 namespace tf_exl3_prompt {
 using namespace tf_exl3;
-__device__ __forceinline__ void decode_tile_p(const uint32_t* tile, int lane, uint32_t (&b0)[2], uint32_t (&b1)[2]) {
-    uint32_t w[lane_words<8>()];
+// One tile's lane values at a compile-time width from shared memory (the tile's 4 K2 words from `tile` on).
+template <int K2, int CB>
+__device__ __forceinline__ void decode_tile_k(const uint32_t* tile, int lane, uint32_t (&b0)[2], uint32_t (&b1)[2]) {
+    uint32_t w[lane_words<K2>()];
     int word, offset;
-    lane_start<8>(lane, word, offset);
-    for (int i = 0; i < lane_words<8>(); ++i) w[i] = tile[(word + i) % tile_words<8>()];
-    decode_lane<8, CB_MCG>(w, lane, b0, b1);
+    lane_start<K2>(lane, word, offset);
+#pragma unroll
+    for (int i = 0; i < lane_words<K2>(); ++i) w[i] = tile[(word + i) % tile_words<K2>()];
+    decode_lane<K2, CB>(w, lane, b0, b1);
+}
+// A warp's N tiles (`stride` words apart) at its warp-uniform width k2 (2..16) as mma A fragments.
+template <int CB, int N>
+__device__ __forceinline__ void decode_tiles_p(const uint32_t* tile, int stride, int k2, int lane, uint32_t (&a)[N][4]) {
+    uint32_t b0[N][2], b1[N][2];
+    switch (k2) {
+#define TF_EXL3P_CASE(K2_)                                                                \
+    case K2_:                                                                             \
+        _Pragma("unroll") for (int i = 0; i < N; ++i) decode_tile_k<K2_, CB>(tile + i * stride, lane, b0[i], b1[i]); \
+        break;
+        TF_EXL3P_CASE(2) TF_EXL3P_CASE(3) TF_EXL3P_CASE(4) TF_EXL3P_CASE(5) TF_EXL3P_CASE(6) TF_EXL3P_CASE(7)
+        TF_EXL3P_CASE(8) TF_EXL3P_CASE(9) TF_EXL3P_CASE(10) TF_EXL3P_CASE(11) TF_EXL3P_CASE(12) TF_EXL3P_CASE(13)
+        TF_EXL3P_CASE(14) TF_EXL3P_CASE(15) TF_EXL3P_CASE(16)
+#undef TF_EXL3P_CASE
+    default:
+        for (int i = 0; i < N; ++i) b0[i][0] = b0[i][1] = b1[i][0] = b1[i][1] = 0u;
+    }
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        a[i][0] = b0[i][0]; a[i][1] = b1[i][0]; a[i][2] = b0[i][1]; a[i][3] = b1[i][1];
+    }
 }
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
     const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
@@ -27,15 +51,9 @@ namespace tf_exl3_prompt {
 
 constexpr int TPM = 64, TNW = 8, TMT = 16 / TNW, TNB = TPM / 8, TT = TNW * 32, TPH = TPM / 2;
 constexpr int TBK = 32, TKT = TBK / 16, TSTAGES = 3, TXS = TBK + 8;
-constexpr int TWORDS = 16 * TKT * 32;
 constexpr int GU_ES = 128 + 4, DN_ES = 256 + 4;                        // the epilogue sums' row strides (floats)
-template <int XR>
-constexpr int tstage_halves() { return XR * TXS + 2 * TWORDS; }
-constexpr int tsmem_bytes() {
-    const int gu = TSTAGES * tstage_halves<2 * TPM>() * 2;   // gate and up rows apart (no shared rotation)
-    const int ep = 2 * TPH * GU_ES * 4, dn = TPH * DN_ES * 4;
-    return gu > ep ? (gu > dn ? gu : dn) : (ep > dn ? ep : dn);
-}
+// A stage's halves: XR rows of TXS, then 16 TKT weight tiles of ws words (4 times the layer's widest k2).
+__device__ __forceinline__ int tstage_halves(int XR, int ws) { return XR * TXS + 2 * 16 * TKT * ws; }
 
 // Which (matrix, weight tile) warp-tile q (0..15) of column block cb is.
 template <int MATS>
@@ -44,15 +62,16 @@ __device__ __forceinline__ void ttile(int q, int cb, int& mat, int& nt) {
     nt = MATS == 2 ? cb * 8 + (q & 7) : cb * 16 + q;
 }
 
-// Main loop: acc[i][nb] = warp tile i x members nb * 8 .. + 7 over K; XR rows a stage (TPM if X0 == X1, else 2 TPM).
-template <int MATS, int XR>
+// Main loop: acc[i][nb] = warp tile i x members nb * 8 .. + 7 over K; k2a, k2b: matrix 0's and 1's widths (2..16).
+template <int MATS, int XR, int CB>
 __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ tp0,
-        const uint64_t* __restrict__ tp1, const int* rows_sh, int cnt, int e, int K, int NTILES, int cb, int xdiv,
-        half* stage, float (&acc)[TMT][TNB][4]) {
-    constexpr int SH = tstage_halves<XR>();
+        const uint64_t* __restrict__ tp1, int k2a, int k2b, int kmax, const int* rows_sh, int cnt, int e, int K, int NTILES,
+        int cb, int xdiv, half* stage, float (&acc)[TMT][TNB][4]) {
+    const int ws = 4 * kmax, SH = tstage_halves(XR, ws);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int mat, nt_unused;
     ttile<MATS>(warp * TMT, cb, mat, nt_unused);
+    const int k2w = mat ? k2b : k2a;   // this warp's tiles' width
     const int chunks = K / TBK;
     const uint32_t* T0 = reinterpret_cast<const uint32_t*>(tp0[e]);
     const uint32_t* T1 = reinterpret_cast<const uint32_t*>(tp1[e]);
@@ -74,12 +93,14 @@ __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* _
             cp_async16(dst + ((size_t)m * TPM + i) * TXS + j * 8, src, r >= 0);
         }
         uint32_t* wdst = reinterpret_cast<uint32_t*>(dst + (size_t)XR * TXS);
-        for (int idx = threadIdx.x; idx < 16 * TKT * 8; idx += TT) {   // 16-byte pieces of the 128-byte tile words
-            const int q = idx / (TKT * 8), kk = (idx / 8) % TKT, part = idx % 8;
+        for (int idx = threadIdx.x; idx < 16 * TKT * 16; idx += TT) {   // a tile's 16-byte pieces: k2 of at most 16
+            const int q = idx / (TKT * 16), kk = (idx / 16) % TKT, part = idx % 16;
             int wm, nt;
             ttile<MATS>(q, cb, wm, nt);
-            const uint32_t* src = (wm ? T1 : T0) + (((size_t)chunk * TKT + kk) * NTILES + nt) * 32 + part * 4;
-            cp_async16(wdst + ((size_t)q * TKT + kk) * 32 + part * 4, src, true);
+            const int k2 = wm ? k2b : k2a;
+            if (part >= k2) continue;
+            const uint32_t* src = (wm ? T1 : T0) + (((size_t)chunk * TKT + kk) * NTILES + nt) * (4 * k2) + part * 4;
+            cp_async16(wdst + ((size_t)q * TKT + kk) * ws + part * 4, src, true);
         }
     };
 #pragma unroll
@@ -94,16 +115,11 @@ __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* _
         cp_async_commit();
         const half* base = stage + (size_t)(c % TSTAGES) * SH;
         const half* xs = base + (size_t)(XR == TPM ? 0 : mat) * TPM * TXS;
-        const uint32_t* ws = reinterpret_cast<const uint32_t*>(base + (size_t)XR * TXS);
+        const uint32_t* wsh = reinterpret_cast<const uint32_t*>(base + (size_t)XR * TXS);
 #pragma unroll
         for (int kk = 0; kk < TKT; ++kk) {
             uint32_t a[TMT][4];
-#pragma unroll
-            for (int i = 0; i < TMT; ++i) {
-                uint32_t b0[2], b1[2];
-                decode_tile_p(ws + ((size_t)(warp * TMT + i) * TKT + kk) * 32, lane, b0, b1);
-                a[i][0] = b0[0]; a[i][1] = b1[0]; a[i][2] = b0[1]; a[i][3] = b1[1];
-            }
+            decode_tiles_p<CB, TMT>(wsh + ((size_t)warp * TMT * TKT + kk) * ws, TKT * ws, k2w, lane, a);
 #pragma unroll
             for (int jb = 0; jb < TPM / 16; ++jb) {
                 if (jb < nblocks) {
@@ -140,11 +156,13 @@ __device__ __forceinline__ void tspill(float* E, int ES, int col0, const float (
         }
 }
 
-template <int XR>
+// Block (128 expert-width columns, item): xd[pair][:] = the rotated SwiGLU of the item's pairs; kmax the widest k2.
+template <int XR, int CB>
 __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half* __restrict__ Xu, const uint64_t* __restrict__ Tg,
-        const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members,
-        const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d, half* __restrict__ xd,
-        int K, int N, int xdiv, float limit, int act_mode, unsigned char* smem_raw, int* rows_sh) {
+        const uint64_t* __restrict__ Tu, const int* __restrict__ gk2, const int* __restrict__ uk2, const int* __restrict__ items,
+        const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u,
+        const half* __restrict__ suh_d, half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, int kmax,
+        unsigned char* smem_raw, int* rows_sh) {
     const int cb = blockIdx.x, item = blockIdx.y;
     if (item >= counts[0]) return;
     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
@@ -152,7 +170,7 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float acc[TMT][TNB][4];
-    tmain<2, XR>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, N >> 4, cb, xdiv, reinterpret_cast<half*>(smem_raw), acc);
+    tmain<2, XR, CB>(Xg, Xu, Tg, Tu, gk2[e], uk2[e], kmax, rows_sh, cnt, e, K, N >> 4, cb, xdiv, reinterpret_cast<half*>(smem_raw), acc);
     float* Eg = reinterpret_cast<float*>(smem_raw);
     int mat, nt;
     ttile<2>(warp * TMT, cb, mat, nt);
@@ -189,6 +207,41 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
             half* o = xd + (size_t)p * N + n;
 #pragma unroll
             for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
+        }
+    }
+}
+
+// Block (256 model-width columns, item): y[row][slot][:] = the down epilogue of the item's pairs (this rank's share).
+template <int CB>
+__device__ __forceinline__ void tdown(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, const int* __restrict__ dk2,
+        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+        float* __restrict__ y, int K, int D, int kmax, unsigned char* smem_raw, int* rows_sh) {
+    const int cb = blockIdx.x, item = blockIdx.y;
+    if (item >= counts[0]) return;
+    const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
+    if (threadIdx.x < TPM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    float acc[TMT][TNB][4];
+    tmain<1, TPM, CB>(Xd, Xd, Td, Td, dk2[e], dk2[e], kmax, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
+    float* Ed = reinterpret_cast<float*>(smem_raw);
+    for (int hf = 0; hf < 2 && hf * TPH < cnt; ++hf) {
+        if (hf) __syncthreads();
+        tspill(Ed, DN_ES, warp * TMT * 16, acc, hf);
+        __syncthreads();
+        for (int i = warp; i < TPH && hf * TPH + i < cnt; i += TNW) {
+            const int p = rows_sh[hf * TPH + i];
+#pragma unroll
+            for (int blk = 0; blk < 2; ++blk) {
+                const int n = cb * 256 + blk * 128 + 4 * lane;
+                float v[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) v[j] = Ed[(size_t)i * DN_ES + blk * 128 + 4 * lane + j];
+                fwht128(v, lane);
+                float* o = y + (size_t)p * D + n;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
+            }
         }
     }
 }

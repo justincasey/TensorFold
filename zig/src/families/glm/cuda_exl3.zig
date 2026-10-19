@@ -61,6 +61,7 @@ pub const Experts = struct {
     dk2: u64,
     book: common.Codebook = .mcg, // one codebook a layer (its every expert's marker)
     uniform: u32 = 0, // the one half-bit width of every projection of every expert, else 0
+    widest: u32 = 16, // the widest half-bit width of any projection of any expert (the prompt kernels' tile stride)
     shx: bool, // every expert's gate and up share one input rotation: a prompt rotates a row once, not once a pick
 };
 
@@ -73,6 +74,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
     var book: ?common.Codebook = null;
     var uniform: ?i32 = null;
     var mixed = false;
+    var widest: i32 = 0;
     const Mat = struct { k: usize, n: usize, by_cols: bool };
     const mats = [_]Mat{
         .{ .k = dims, .n = inter, .by_cols = true },
@@ -100,6 +102,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
                 mixed = true;
             }) else uniform = k2;
             k2s[e] = k2;
+            widest = @max(widest, k2);
             offs[e] = at;
             const tile: usize = 16 * @as(usize, @intCast(k2)); // a 16 x 16 tile's bytes (the trellis's last axis, in bytes)
             if (tile != t.dim(2) * 2) return error.NotExl3Experts;
@@ -138,6 +141,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
     }
     out.book = book orelse return error.NotExl3Experts;
     out.uniform = if (mixed) 0 else @intCast(uniform.?);
+    out.widest = @intCast(widest);
     return out;
 }
 
@@ -165,7 +169,7 @@ pub const top_k = 8;
 /// Rows a call to the common experts takes: each call reads every expert's weights, so a prompt pass needs few calls.
 pub const chunk_rows = 1024;
 fn layer(w: Experts, count: usize, dims: usize, width: usize, limit: f32) common.Layer {
-    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.gk2, .up_k2 = w.uk2, .down_k2 = w.dk2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = w.book, .limit = limit, .act_mode = 0, .uniform_k2 = w.uniform, .shared_input = w.shx };
+    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.gk2, .up_k2 = w.uk2, .down_k2 = w.dk2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = w.book, .limit = limit, .act_mode = 0, .uniform_k2 = w.uniform, .max_k2 = w.widest, .shared_input = w.shx };
 }
 fn shape(dims: usize, width: usize, book: common.Codebook, uniform: u32) common.Layer {
     const w: Experts = .{ .gt = 0, .ut = 0, .dt = 0, .gk2 = 0, .uk2 = 0, .dk2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .book = book, .uniform = uniform, .shx = false };
