@@ -59,6 +59,27 @@ pub fn variantIndex(halves: u32, codebook: Codebook, warps: u32) ?usize {
     return null;
 }
 
+/// The prompt kernels' widths (mul1 alone): every decode width but 15 halves, each at 64- and 128-row blocks.
+pub const dense_halves = [_]u32{ 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16 };
+
+/// A prompt kernel's dynamic shared bytes: three stages of x rows and 16 tiles, else the epilogue's 64 rows of sums.
+pub fn denseShared(halves: u32, rows: u32) u32 {
+    return @max(3 * (rows * 40 * 2 + 2 * 8 * 4 * halves * 4), 64 * 132 * 4);
+}
+
+/// The prompt kernel's index in `Linear.dense_fns` for a weight, null for widths and codebooks it does not serve.
+pub fn denseIndex(w: Weight) ?usize {
+    if (w.codebook != .mul1) return null;
+    for (dense_halves, 0..) |h, i| if (h == w.halves) return i;
+    return null;
+}
+
+/// 128-row blocks once they fill this many blocks (four a GB10 SM), else 64-row blocks; a row's bits are the same.
+const dense_wide_blocks = 192;
+
+/// Row blocks a column block sweeps before the next starts (its weights stay in L2 while x streams past).
+const dense_group = 16;
+
 /// What one shape launches, from the shape alone so a row's bits never depend on the row count (linear.py plan).
 pub fn plan(k: usize, n: usize, blocks: usize, min_tiles: usize) struct { sk: u32, wk: u32 } {
     const kt = k / 16;
@@ -102,6 +123,8 @@ pub const Linear = struct {
     mod: Module,
     fns: [variants.len]Function,
     rot_in: Function,
+    rot_rows: Function = undefined,
+    dense_fns: [dense_halves.len][2]Function = undefined, // [width][64 or 128 rows]
 
     pub fn load(d: *const Driver) !Linear {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -111,6 +134,10 @@ pub const Linear = struct {
         inline for (0..variants.len) |i| {
             l.fns[i] = try l.mod.function(symbol(variants[i].halves, variants[i].codebook, variants[i].warps));
         }
+        l.rot_rows = try l.mod.function("tf_exl3_rot_rows");
+        inline for (dense_halves, 0..) |h, i| inline for (.{ 64, 128 }, 0..) |rows, j| {
+            l.dense_fns[i][j] = try l.mod.function(std.fmt.comptimePrint("tf_exl3_dense_{d}_{d}", .{ h, rows }));
+        };
         return l;
     }
 
@@ -177,6 +204,48 @@ pub const Linear = struct {
             .grid = .{ .x = @intCast(w.n / 128 * p.sk), .y = 1, .z = 1 },
             .block = .{ .x = @intCast(p.wk * 32), .y = 1, .z = 1 },
             .shared = sharedBytes(w, m),
+        }, s, &args);
+    }
+
+    /// Prompt rows (mul1): y rows `y_stride` apart = x's bf16 rows `x_stride` apart; `xh` is fp16 [m, k] scratch.
+    pub fn dense(l: *const Linear, s: Stream, w: Weight, x: u64, x_stride: usize, m: usize, y: u64, y_stride: usize, y_dtype: DType, xh: u64) !void {
+        const idx = denseIndex(w) orelse return error.UnsupportedExl3Width;
+        if (m < 1 or m > 65535 or w.k % 128 != 0 or w.n % 128 != 0 or y_stride % 4 != 0) return error.Exl3Shape;
+        var r: launch_.Args = .{};
+        r.add(x);
+        r.add(@as(i64, @intCast(x_stride)));
+        r.add(w.suh);
+        r.add(xh);
+        r.add(@as(i32, @intCast(m)));
+        r.add(@as(i32, @intCast(w.k)));
+        try launch_.launch(l.rot_rows, .{
+            .grid = .{ .x = @intCast((w.k / 128 + 3) / 4), .y = @intCast(m), .z = 1 },
+            .block = .{ .x = 128, .y = 1, .z = 1 },
+            .shared = 0,
+        }, s, &r);
+
+        const nb = w.n / 128;
+        const wide = (m + 127) / 128 * nb >= dense_wide_blocks;
+        const rows: usize = if (wide) 128 else 64;
+        const rb = (m + rows - 1) / rows;
+        var args: launch_.Args = .{};
+        args.add(xh);
+        args.add(w.trellis);
+        args.add(@as(i64, @intCast(w.stride_k)));
+        args.add(@as(i64, @intCast(w.stride_nb)));
+        args.add(w.svh);
+        args.add(w.bias);
+        args.add(y);
+        args.add(@as(i64, @intCast(y_stride)));
+        args.add(@as(i32, @backingInt(y_dtype)));
+        args.add(@as(i32, @intCast(w.n)));
+        args.add(@as(i32, @intCast(m)));
+        args.add(@as(i32, @intCast(w.k)));
+        args.add(@as(i32, @intCast(@min(dense_group, rb))));
+        try launch_.launch(l.dense_fns[idx][@intFromBool(wide)], .{
+            .grid = .{ .x = @intCast(rb * nb), .y = 1, .z = 1 },
+            .block = .{ .x = 256, .y = 1, .z = 1 },
+            .shared = denseShared(w.halves, @intCast(rows)),
         }, s, &args);
     }
 };
