@@ -4,6 +4,7 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## 1.1.0
 
+- `--kv-cache fp8` stores GLM-5.3-Flash's CUDA latent cache (each DSA layer's and the MTP layer's) as e4m3 rows with an fp32 scale each: a stream's state at a 65,536-token window drops from 1.01 to 0.64 GiB a rank, and sparse latent attention at 32K reads half the bytes. bf16 stays the default and is unchanged; the ranks refuse to start with different settings.
 - Structured output and forced tool calls work with Nemotron 3.5 Super VL (`nemotron_h_omni`), whose text vocabulary is in `llm_config`: the server read `vocab_size` only from `text_config` and the top level, and refused those requests (reported in #951). A `vocab_size` that is not a positive integer within the C ABI's range is skipped rather than cast (#953). Thanks to @swbiggart and @BobClawblaw.
 - Accepted HTTP connections set `TCP_NODELAY`, so a streamed reply's small writes leave as they are written instead of waiting behind Nagle's algorithm; a connection that cannot be configured is closed and the server accepts the next one (#929). Thanks to @akol1.
 - The tool-call parser finds namespaced closers (`</NAME:tool_call>`) in one pass over the reply, so a reply with many openers and no closers parses in linear time instead of searching the rest of the reply once per opener. Parsed calls are unchanged (#913). Thanks to @jishnuvenugopal.
