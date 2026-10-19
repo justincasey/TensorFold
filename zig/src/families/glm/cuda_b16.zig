@@ -4,6 +4,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const glue = @import("cuda_glue.zig");
 const mm = @import("cuda_mm.zig");
+const xlin = @import("cuda_xlin.zig");
 
 /// qmm.SPLIT_TARGET, B16_SPLIT_COLS, B16_BK, geometry.MLA_B16_SLICES and MLA_B16_ROWS_FROM.
 pub const split_target = 192;
@@ -58,7 +59,7 @@ pub fn partBytes(m: usize, n: usize, k: usize) usize {
 pub fn matmul(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
     if (set.xl) |r| if (r.find(w)) |l| {
         const plain: glue.Set = .{ .glue = set.glue };
-        return r.run(plainMatmul, &plain, stream, l, x, x_stride, out, part, m, n, k, wide);
+        return r.run(plainMatmul, &plain, stream, l, null, x, x_stride, out, part, m, n, k, wide);
     };
     if (k % bk != 0) return error.KNotMultipleOf64;
     if (set.mm) |mk| { // tiled weights, packed or bf16
@@ -98,6 +99,21 @@ pub fn matmul(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u6
     }
     try cuda.launch.launch(set.glue.bmm_decode, .{ .grid = .{ .x = @intCast(cdiv(m, 16)), .y = @intCast(cdiv(n, 64)), .z = @intCast(sk) }, .block = .{ .x = 128 } }, stream, &a);
     if (sk > 1) try glue.sliceSum(set, stream, part, out, m * n, sk, wide);
+}
+
+/// matmul's columns of an EXL3 table linear's `only` parts (the same kernels and bits as the whole call's).
+pub fn matmulPart(set: glue.Set, stream: cuda.Stream, only: xlin.Kind, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
+    const r = set.xl orelse return error.Exl3LinearMissing;
+    const l = r.find(w) orelse return error.Exl3LinearMissing;
+    const plain: glue.Set = .{ .glue = set.glue };
+    return r.run(plainMatmul, &plain, stream, l, only, x, x_stride, out, part, m, n, k, wide);
+}
+
+/// Whether `w` names an EXL3 table linear with a bf16 part beside its EXL3 ones (RED-SNOW's KDA projection).
+pub fn mixed(set: glue.Set, w: u64) bool {
+    const l = (set.xl orelse return false).find(w) orelse return false;
+    for (l.parts[0..l.count]) |p| if (p == .b) return true;
+    return false;
 }
 
 /// An EXL3 linear's bf16 part: untiled, through the set the caller made (no table, no tiles).

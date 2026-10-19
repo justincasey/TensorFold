@@ -5,7 +5,7 @@ const cuda = @import("cuda");
 const mm_mod = @import("cuda_mm.zig");
 
 /// What the forward's kernels launch from: our glue's functions.
-pub const Set = struct { glue: *const Kernels, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, xl: ?*@import("cuda_xlin.zig").Runner = null }; // mm: linears tiled at load; xl: EXL3 linears
+pub const Set = struct { glue: *const Kernels, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, xl: ?*@import("cuda_xlin.zig").Runner = null, side: ?*const @import("cuda_side.zig").Side = null }; // mm: linears tiled at load; xl: EXL3 linears; side: a verify window's second stream
 
 /// Our glm_glue.cu's functions.
 pub const Kernels = struct {

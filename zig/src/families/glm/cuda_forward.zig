@@ -24,6 +24,8 @@ const images_mod = @import("cuda_images.zig");
 const exl3 = @import("cuda_exl3.zig");
 const shared = @import("cuda_shared.zig");
 const relay = @import("cuda_relay.zig");
+const pieces_mod = @import("cuda_pieces.zig");
+const side_mod = @import("cuda_side.zig");
 
 pub const prefill_rows = state.prefill_rows;
 pub const window_rows = state.window_rows;
@@ -43,6 +45,7 @@ pub const Modules = struct {
     tiled: bool = false, // the bf16 linears' weights are tiled (Engine.init, TF_GLM_MM unset or 1): glm_mm runs them
     packs: ?*const mm_mod.Packed = null, // the linears packed to 4, 6 or 8 bits (TF_GLM_DENSE_BITS, _HEAD_BITS)
     xl: ?*@import("cuda_xlin.zig").Runner = null, // RED-SNOW: the EXL3 linears behind b16.matmul's handles
+    side: ?side_mod.Side = null, // a verify window's second stream (TF_GLM_SIDE=0: none)
     copy_rows: cuda.Function,
     put_slot: cuda.Function,
     pack_dense: cuda.Function,
@@ -79,6 +82,7 @@ pub const Modules = struct {
         m.tiled = false;
         m.packs = null; // `m` starts undefined: the field default does not apply
         m.xl = null;
+        m.side = if (side_mod.Side.wanted()) try side_mod.Side.init(d) else null;
         return m;
     }
 
@@ -92,6 +96,7 @@ pub const Modules = struct {
     }
 
     pub fn deinit(m: *Modules) void {
+        if (m.side) |*sd| sd.deinit();
         m.exl3.unload();
         if (m.kda.chunk) |*c| c.unload();
         for (&m.mods) |*x| x.unload();
@@ -102,9 +107,10 @@ pub const Modules = struct {
     }
 };
 
-/// overlap.ROW_STEP and PIECES_MAX: piece boundaries on the BF16 prompt matmul's 128-row blocks, at most 16 pieces.
+/// overlap.ROW_STEP: piece boundaries on the BF16 prompt matmul's 128-row blocks.
 pub const row_step = 128;
-pub const max_pieces = 16;
+const max_pieces = pieces_mod.max_pieces;
+const Pieces = pieces_mod.Pieces;
 
 /// overlap.ranges: [lo, hi) row pieces of a chunk of `rows`, about equal on row_step boundaries (fewer when short).
 pub fn ranges(rows: usize, pieces: usize, out: *[max_pieces][2]usize) usize {
@@ -118,39 +124,6 @@ pub fn ranges(rows: usize, pieces: usize, out: *[max_pieces][2]usize) usize {
     }
     return n;
 }
-
-/// A prompt chunk's pieced exchanges (overlap.Overlap): second stream and events; `count`: TF_GLM_OVERLAP_PIECES (3).
-pub const Pieces = struct {
-    count: usize = 4,
-    side: cuda.Stream,
-    filled: [max_pieces]cuda.Event,
-    gathered: [max_pieces]cuda.Event,
-    glues: [max_pieces]cuda.Event, // split: a piece's own rows glued
-    shared: [max_pieces]cuda.Event, // split: every rank's glued rows of a piece in
-
-    pub fn init(d: *const cuda.Driver, count: usize) !Pieces {
-        if (count == 0 or count > max_pieces) return error.BadPieces;
-        var p: Pieces = .{ .count = count, .side = try cuda.Stream.init(d, false), .filled = undefined, .gathered = undefined, .glues = undefined, .shared = undefined };
-        for (&p.filled, &p.gathered, &p.glues, &p.shared) |*a, *b, *g, *s| {
-            a.* = try cuda.Event.init(d, false);
-            b.* = try cuda.Event.init(d, false);
-            g.* = try cuda.Event.init(d, false);
-            s.* = try cuda.Event.init(d, false);
-        }
-        return p;
-    }
-
-    pub fn deinit(p: *Pieces) void {
-        for (&p.filled, &p.gathered, &p.glues, &p.shared) |*a, *b, *g, *s| {
-            a.deinit();
-            b.deinit();
-            g.deinit();
-            s.deinit();
-        }
-        p.side.deinit();
-        p.* = undefined;
-    }
-};
 
 /// How the ranks' partials meet: every rank in-process copying into the others' slots, or one rank over NCCL.
 pub const Exchange = union(enum) {
@@ -189,7 +162,8 @@ pub const Forward = struct {
     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .glue = &f.m.glue, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .xl = f.m.xl };
+        const one = !f.ranks[0].b.prefill and f.ranks[0].segs.len == 0; // a one-sequence verify window: the side stream
+        return .{ .glue = &f.m.glue, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .xl = f.m.xl, .side = if (one) (if (f.m.side) |*sd| sd else null) else null };
     }
 
     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.

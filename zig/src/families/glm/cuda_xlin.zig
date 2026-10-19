@@ -10,6 +10,9 @@ pub const Part = union(enum) {
     b: u64, // bf16 [n][k] row-major, untiled
 };
 
+/// A part's kind: a window may run its EXL3 parts and its bf16 part on two streams.
+pub const Kind = std.meta.Tag(Part);
+
 pub const Lin = struct {
     id: u64,
     n: usize,
@@ -166,14 +169,15 @@ pub const Runner = struct {
         try stream.d.check(stream.d.api.cuMemcpy2DAsync_v2(&m, stream.handle), "EXL3 linear rows");
     }
 
-    /// out [m][n] (fp32 when `wide`, else bf16) = x [m][k] (bf16 rows `x_stride` apart) through linear `l`.
-    pub fn run(r: *Runner, bf: Bf16Fn, ctx: *const anyopaque, stream: cuda.Stream, l: *const Lin, x: u64, x_stride: usize, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
+    /// out [m][n] (fp32 when `wide`, else bf16) = x [m][k] (rows `x_stride` apart) through `l`; `only`: that kind's parts.
+    pub fn run(r: *Runner, bf: Bf16Fn, ctx: *const anyopaque, stream: cuda.Stream, l: *const Lin, only: ?Kind, x: u64, x_stride: usize, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
         if (n != l.n or k != l.k) return error.Exl3LinearShape;
         const s = try r.scratchFor(stream);
         const ye: usize = if (wide) 4 else 2;
         const yd: exl3.DType = if (wide) .f32 else .bf16;
         var xc: ?u64 = if (x_stride == k) x else null; // contiguous rows, copied once when a part needs them
         for (l.parts[0..l.count], l.cols[0..l.count], l.widths[0..l.count]) |p, col, w| {
+            if (only) |o| if (p != o) continue;
             if (p == .q and m >= prompt_rows and exl3.denseIndex(p.q) != null) { // in place at its columns
                 const xh = try r.grow(&s.xh, m * k * 2);
                 try (try r.linear()).dense(stream, p.q, x, x_stride, m, out + col * ye, n, yd, xh);

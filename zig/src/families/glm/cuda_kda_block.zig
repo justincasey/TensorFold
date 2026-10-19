@@ -48,14 +48,23 @@ pub fn body(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer
     if (prompt) try glue.convShift(set, stream, conv_state, s.p, rows, rows * l.width(), l.width(), 1, 3 * l.heads * kda.dk);
 }
 
-/// The projections of `rows` rows into s.p, s.ka (decay) and s.kg (gate), row by row so segments share one call.
+/// The projections of `rows` rows into s.p, s.ka and s.kg; with a side stream its bf16 part, f_b and g_b run there.
 pub fn project(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize) !void {
     const n = l.heads * kda.dk;
     const w = l.width();
     const fa = 3 * n;
-    try b16.matmul(set, stream, x, x_stride, l.proj, s.p, s.mm_part, rows, w, l.dims, false);
-    try b16.matmul(set, stream, s.p + fa * 2, w, l.fb, s.ka, s.mm_part, rows, n, kda.dk, false);
-    try b16.matmul(set, stream, s.p + (fa + kda.dk) * 2, w, l.gb, s.kg, s.mm_part, rows, n, kda.dk, false);
+    const side = if (set.side) |sd| (if (b16.mixed(set, l.proj)) sd else null) else null;
+    const ps = if (side) |sd| sd.s else stream;
+    if (side) |sd| {
+        try sd.fork(stream);
+        try b16.matmulPart(set, ps, .b, x, x_stride, l.proj, s.p, s.mm_part, rows, w, l.dims, false);
+    } else try b16.matmul(set, stream, x, x_stride, l.proj, s.p, s.mm_part, rows, w, l.dims, false);
+    try b16.matmul(set, ps, s.p + fa * 2, w, l.fb, s.ka, s.mm_part, rows, n, kda.dk, false);
+    try b16.matmul(set, ps, s.p + (fa + kda.dk) * 2, w, l.gb, s.kg, s.mm_part, rows, n, kda.dk, false);
+    if (side) |sd| {
+        try b16.matmulPart(set, stream, .q, x, x_stride, l.proj, s.p, s.mm_part, rows, w, l.dims, false);
+        try sd.join(stream);
+    }
 }
 
 /// The chain over `rows` projected rows (s.p, s.ka, s.kg) on one sequence's conv window and recurrent state.

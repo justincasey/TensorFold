@@ -7,6 +7,7 @@ const config = @import("config.zig");
 const shard = @import("cuda_shard.zig");
 const weights = @import("cuda_weights.zig");
 const fw = @import("cuda_forward.zig");
+const Pieces = @import("cuda_pieces.zig").Pieces;
 const ranks = @import("cuda_ranks.zig");
 const sampler = @import("cuda_sampler.zig");
 const heat = @import("heat");
@@ -61,7 +62,7 @@ pub const Engine = struct {
     settings: ranks.Settings,
     m: fw.Modules,
     stream: cuda.Stream,
-    pieces: fw.Pieces,
+    pieces: Pieces,
     w: weights.Weights,
     bp: fw.Buffers, // prompt chunks
     bd: fw.Buffers, // verify windows
@@ -125,7 +126,7 @@ pub const Engine = struct {
         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
         var m = try fw.Modules.load(d, ctx);
         errdefer m.deinit();
-        var pieces = try fw.Pieces.init(d, o.settings.pieces);
+        var pieces = try Pieces.init(d, o.settings.pieces);
         errdefer pieces.deinit();
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
