@@ -131,9 +131,10 @@ fn fusedRows(r: *Rig, exp: *const exl3e.Experts, router: cuda.grouped.Router, b:
         .hist = try r.zeros((if (wide) (P + 1023) / 1024 * ref.E else 1) * 4),
     };
     const sc = try exl3e.prompt.scratch(try r.zeros(try exl3e.prompt.bytes(b.layer, n, ref.SLOTS)), b.layer, n, ref.SLOTS);
-    try exp.prompt.run(exp, router, r.s, b.layer, b.dx + @as(u64, at) * ref.D * 2, ref.D, b.dpick + @as(u64, at) * ref.SLOTS * 4, n, sc, plan);
+    const y = try r.zeros(P * ref.D * 4);
+    try exp.prompt.run(exp, router, r.s, b.layer, b.dx + @as(u64, at) * ref.D * 2, ref.D, b.dpick + @as(u64, at) * ref.SLOTS * 4, n, sc, plan, y, ref.SLOTS);
     try r.s.synchronize();
-    return r.back(sc.y, P * ref.D * 4);
+    return r.back(y, P * ref.D * 4);
 }
 
 /// The fused path at RED-SNOW's widths, gate and up apart in one expert: f64, repeat, and chunks of 128 and 37 rows.

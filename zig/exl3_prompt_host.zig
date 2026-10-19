@@ -16,7 +16,7 @@ const Capture = struct {
             const sizes: []const u8 = switch (@intFromPtr(f)) {
                 11 => &.{ 8, 4, 8, 8, 4 },
                 12 => &.{ 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 4, 4, 4 },
-                else => &.{ 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4 },
+                else => &.{ 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 4, 4 },
             };
             for (sizes, 0..) |size, i| {
                 const bytes: [*]const u8 = @ptrCast(args.?[i].?);
@@ -81,10 +81,12 @@ test "exl3 prompt: dispatch rotates once per row only with verified shared scale
         try std.testing.expectEqual(@as(u64, if (shared) 8 else 1), Capture.by(12)[0].args[15]);
         try std.testing.expectEqual(@as(u64, 420), Capture.by(13)[0].args[2]);
         try std.testing.expectEqual(ex.prompt.shared(8, if (shared) 64 else 128), Capture.by(12)[0].shared);
-        try std.testing.expectEqual(@as(usize, 2), Capture.copied);
+        try std.testing.expectEqual(@as(u64, 0x400000000), Capture.by(13)[0].args[7]);
+        try std.testing.expectEqual(@as(u64, 8), Capture.by(13)[0].args[10]);
+        try std.testing.expectEqual(@as(u64, 9), Capture.by(13)[0].args[11]);
+        try std.testing.expectEqual(@as(usize, 1), Capture.copied);
         try std.testing.expectEqual(@as(usize, 8 * 4), Capture.copies[0].width);
         try std.testing.expectEqual(@as(usize, 9 * 4), Capture.copies[0].src_pitch);
-        try std.testing.expectEqual(@as(usize, 9 * 512 * 4), Capture.copies[1].dst_pitch);
     }
 }
 
@@ -98,8 +100,8 @@ test "exl3 prompt: RED-SNOW's mul1 experts at mixed widths take the fused kernel
         try std.testing.expectEqual(@as(u64, 410), gu.args[5]);
         try std.testing.expectEqual(@as(u64, 2), gu.args[18]);
         try std.testing.expectEqual(@as(u64, 12), gu.args[19]);
-        try std.testing.expectEqual(@as(u64, 2), dn.args[10]);
-        try std.testing.expectEqual(@as(u64, 12), dn.args[11]);
+        try std.testing.expectEqual(@as(u64, 2), dn.args[12]);
+        try std.testing.expectEqual(@as(u64, 12), dn.args[13]);
         try std.testing.expectEqual(ex.prompt.shared(12, if (shared) 64 else 128), gu.shared);
         try std.testing.expectEqual(ex.prompt.shared(12, 64), dn.shared);
         try std.testing.expect(gu.shared <= 50 * 1024); // two blocks an SM at the widest RED-SNOW width
@@ -109,7 +111,7 @@ test "exl3 prompt: RED-SNOW's mul1 experts at mixed widths take the fused kernel
 test "exl3 prompt: the fused scratch fits in the decode scratch and shared rotation storage is independent of pick count" {
     const decode = glm.exl3.scratchBytes(1024, 512, 256, false, false, .mcg, 8)[0];
     for ([_]bool{ true, false }) |shx| for ([_]ex.Codebook{ .mcg, .mul1 }) |cb| {
-        try std.testing.expectEqual(decode, glm.exl3.scratchBytes(1024, 512, 256, true, shx, cb, if (cb == .mcg) 8 else 0)[0]);
+        try std.testing.expect(glm.exl3.scratchBytes(1024, 512, 256, true, shx, cb, if (cb == .mcg) 8 else 0)[0] <= decode);
     };
     if (comptime @hasDecl(ex, "prompt")) {
         var l: ex.Layer = .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .dims = 512, .width = 256, .experts = 9, .codebook = .mcg, .uniform_k2 = 8, .shared_input = false };
@@ -119,25 +121,32 @@ test "exl3 prompt: the fused scratch fits in the decode scratch and shared rotat
         try std.testing.expect(bytes < separate and separate < decode);
         const sc = try ex.prompt.scratch(0x1000, l, 1024, 8);
         try std.testing.expectEqual(@as(u64, sc.xg), sc.xu);
-        try std.testing.expectEqual(@as(u64, 0x1000 + bytes), sc.y + 1024 * 8 * 512 * 4);
+        try std.testing.expectEqual(@as(u64, 0x1000 + bytes), sc.xd + 1024 * 8 * 256 * 2);
         try std.testing.expectError(error.Exl3Shape, ex.prompt.bytes(l, std.math.maxInt(usize), 8));
     } else try std.testing.expect(false);
 }
 
-test "exl3 prompt: 1024-row calls keep row and pick offsets on both sides of the boundary" {
-    try run(1030, true, true);
-    try std.testing.expectEqual(@as(usize, 4), Capture.copied);
-    try std.testing.expectEqual(@as(usize, 1024), Capture.copies[0].height);
-    try std.testing.expectEqual(@as(usize, 6), Capture.copies[2].height);
-    try std.testing.expectEqual(@as(u64, 0x300000000 + 1024 * 9 * 4), Capture.copies[2].src);
-    try std.testing.expectEqual(@as(u64, 0x400000000 + 1024 * 9 * 512 * 4), Capture.copies[3].dst);
+test "exl3 prompt: chunked calls keep row, pick and output offsets on both sides of the boundary" {
+    const n = glm.exl3.chunk_rows;
+    try run(n + 6, true, true);
+    try std.testing.expectEqual(@as(usize, 2), Capture.copied);
+    try std.testing.expectEqual(@as(usize, n), Capture.copies[0].height);
+    try std.testing.expectEqual(@as(usize, 6), Capture.copies[1].height);
+    try std.testing.expectEqual(@as(u64, 0x300000000 + n * 9 * 4), Capture.copies[1].src);
     var rotations: usize = 0;
-    for (Capture.calls[0..Capture.count]) |call| if (call.id == 11) {
-        const at: u64 = if (rotations == 0) 0 else 1024;
-        try std.testing.expectEqual(@as(u64, 0x200000000 + at * 520 * 2), call.args[0]);
-        rotations += 1;
-    };
+    var downs: usize = 0;
+    for (Capture.calls[0..Capture.count]) |call| {
+        const at: u64 = if (call.id == 11) rotations else if (call.id == 13) downs else continue;
+        if (call.id == 11) {
+            try std.testing.expectEqual(@as(u64, 0x200000000 + at * n * 520 * 2), call.args[0]);
+            rotations += 1;
+        } else {
+            try std.testing.expectEqual(@as(u64, 0x400000000 + at * n * 9 * 512 * 4), call.args[7]);
+            downs += 1;
+        }
+    }
     try std.testing.expectEqual(@as(usize, 2), rotations);
+    try std.testing.expectEqual(@as(usize, 2), downs);
 }
 
 test "exl3 prompt: decode retains the existing split-K launches" {
@@ -179,9 +188,8 @@ test "exl3 prompt: the common dispatch takes mcg and mul1 at widths 2 to 16 and 
         const size = try P.bytes(l, rows, slots);
         const sc = try P.scratch(4096, l, rows, slots);
         try std.testing.expect(sc.xg + rows * (if (shared) @as(usize, 1) else slots) * l.dims * 2 <= sc.xd);
-        try std.testing.expect(sc.xd + rows * slots * l.width * 2 <= sc.y);
-        try std.testing.expect(sc.y + rows * slots * l.dims * 4 <= 4096 + size);
-        for ([_]u64{ sc.xg, sc.xu, sc.xd, sc.y }) |p| try std.testing.expectEqual(@as(u64, 0), p % 256);
+        try std.testing.expect(sc.xd + rows * slots * l.width * 2 <= 4096 + size);
+        for ([_]u64{ sc.xg, sc.xu, sc.xd }) |p| try std.testing.expectEqual(@as(u64, 0), p % 256);
     };
     try std.testing.expectError(error.Exl3Shape, P.bytes(l, 1, 0));
     try std.testing.expectError(error.Exl3Shape, P.bytes(l, 1, 33));

@@ -165,11 +165,11 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
     }
 }
 
-// Block (256 model-width columns, item): y[row][slot][:] = the down epilogue of the item's pairs (this rank's share).
+// Block (256 model-width columns, item): y[pair / ps][slot pair % ps of ys][:] = the down epilogue of its pairs.
 template <int CB>
 __device__ __forceinline__ void tdown(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, const int* __restrict__ dk2,
         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
-        float* __restrict__ y, int K, int D, int kmax, unsigned char* smem_raw, int* rows_sh) {
+        float* __restrict__ y, int K, int D, int ps, int ys, int kmax, unsigned char* smem_raw, int* rows_sh) {
     const int cb = blockIdx.x, item = blockIdx.y;
     if (item >= counts[0]) return;
     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
@@ -192,7 +192,7 @@ __device__ __forceinline__ void tdown(const half* __restrict__ Xd, const uint64_
 #pragma unroll
                 for (int j = 0; j < 4; ++j) v[j] = Ed[(size_t)i * DN_ES + blk * 128 + 4 * lane + j];
                 fwht128(v, lane);
-                float* o = y + (size_t)p * D + n;
+                float* o = y + ((size_t)(p / ps) * ys + p % ps) * D + n;
 #pragma unroll
                 for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
             }

@@ -8,7 +8,7 @@ const Function = @import("module.zig").Function;
 const Stream = @import("stream.zig").Stream;
 
 pub const tile = 64;
-pub const Scratch = struct { xg: u64, xu: u64, xd: u64, y: u64, rows: usize, slots: usize };
+pub const Scratch = struct { xg: u64, xu: u64, xd: u64, rows: usize, slots: usize };
 /// The widest half-bit width of a layer's projections: the loader's maximum, else the verified one, else 16.
 pub fn widest(l: ex.Layer) u32 {
     return if (l.max_k2 != 0) l.max_k2 else if (l.uniform_k2 != 0) l.uniform_k2 else 16;
@@ -30,12 +30,12 @@ fn add(a: usize, b: usize) !usize {
 fn aligned(n: usize) !usize {
     return (try add(n, 255)) / 256 * 256;
 }
-fn sizes(l: ex.Layer, rows: usize, slots: usize) ![4]usize {
+fn sizes(l: ex.Layer, rows: usize, slots: usize) ![3]usize {
     if (!eligible(l) or rows == 0 or slots == 0 or slots > 32 or l.experts == 0 or l.experts > grouped.max_experts) return error.Exl3Shape;
     const pairs = try mul(rows, slots);
     if (pairs > std.math.maxInt(i32) or l.dims > std.math.maxInt(i32) or l.width > std.math.maxInt(i32)) return error.Exl3Shape;
     const rotated = try aligned(try mul(try mul(if (l.shared_input) rows else pairs, l.dims), 2));
-    return .{ rotated, if (l.shared_input) 0 else rotated, try aligned(try mul(try mul(pairs, l.width), 2)), try aligned(try mul(try mul(pairs, l.dims), 4)) };
+    return .{ rotated, if (l.shared_input) 0 else rotated, try aligned(try mul(try mul(pairs, l.width), 2)) };
 }
 pub fn bytes(l: ex.Layer, rows: usize, slots: usize) !usize {
     const ns = try sizes(l, rows, slots);
@@ -47,7 +47,7 @@ pub fn scratch(base: u64, l: ex.Layer, rows: usize, slots: usize) !Scratch {
     const ns = try sizes(l, rows, slots);
     const total = try bytes(l, rows, slots);
     _ = std.math.add(u64, base, total) catch return error.Exl3Shape;
-    return .{ .xg = base, .xu = if (l.shared_input) base else base + ns[0], .xd = base + ns[0] + ns[1], .y = base + ns[0] + ns[1] + ns[2], .rows = rows, .slots = slots };
+    return .{ .xg = base, .xu = if (l.shared_input) base else base + ns[0], .xd = base + ns[0] + ns[1], .rows = rows, .slots = slots };
 }
 fn go(f: Function, s: Stream, grid: [3]usize, threads: u32, smem: u32, values: anytype) !void {
     var args: launch.Args = .{};
@@ -67,8 +67,9 @@ pub const Kernels = struct {
         try k.down.allowDynamicShared(shared(16, tile));
         return k;
     }
-    pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
-        if (!eligible(l) or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32)) return error.Exl3Shape;
+    /// y: fp32 [rows][y_slots][dims], pick j of a row into its slot j (y_slots >= the scratch's slots).
+    pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, y: u64, y_slots: usize) !void {
+        if (!eligible(l) or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32) or y_slots < sc.slots or y_slots > 32) return error.Exl3Shape;
         _ = try bytes(l, rows, sc.slots);
         const pairs = rows * sc.slots;
         try router.route(s, picks, pairs, l.experts, tile, p);
@@ -83,6 +84,6 @@ pub const Kernels = struct {
         const k2 = widest(l);
         const cb: i32 = @backingInt(l.codebook);
         try go(k.gateup, s, .{ l.width / 128, items, 1 }, 256, shared(k2, if (l.shared_input) tile else 2 * tile), .{ sc.xg, sc.xu, l.gate, l.up, l.gate_k2, l.up_k2, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode, cb, @as(i32, @intCast(k2)) });
-        try go(k.down, s, .{ l.dims / 256, items, 1 }, 256, shared(k2, tile), .{ sc.xd, l.down, l.down_k2, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), cb, @as(i32, @intCast(k2)) });
+        try go(k.down, s, .{ l.dims / 256, items, 1 }, 256, shared(k2, tile), .{ sc.xd, l.down, l.down_k2, p.items, p.counts, p.members, l.svh_d, y, i(l.width), i(l.dims), i(sc.slots), i(y_slots), cb, @as(i32, @intCast(k2)) });
     }
 };
