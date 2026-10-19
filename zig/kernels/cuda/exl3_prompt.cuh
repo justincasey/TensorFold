@@ -16,10 +16,10 @@ __device__ __forceinline__ void ttile(int q, int cb, int& mat, int& nt) {
     nt = MATS == 2 ? cb * 8 + (q & 7) : cb * 16 + q;
 }
 
-// Main loop: acc[i][nb] = warp tile i x members nb * 8 .. + 7 over K; k2a, k2b: matrix 0's and 1's widths (2..16).
-template <int MATS, int XR, int CB>
-__device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ tp0,
-        const uint64_t* __restrict__ tp1, int k2a, int k2b, int kmax, const int* rows_sh, int cnt, int e, int K, int NTILES,
+// Main loop: acc[i][nb] = warp tile i x members nb * 8.. over K at widths k2a, k2b (2..16); NB 16-member blocks in use.
+template <int MATS, int XR, int CB, int NB>
+__device__ __forceinline__ void tloop(const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ tp0,
+        const uint64_t* __restrict__ tp1, int k2a, int k2b, int kmax, const int* rows_sh, int e, int K, int NTILES,
         int cb, int xdiv, half* stage, float (&acc)[TMT][TNB][4]) {
     const int ws = 4 * kmax, SH = tstage_halves(XR, ws);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -27,71 +27,100 @@ __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* _
     ttile<MATS>(warp * TMT, cb, mat, nt_unused);
     const int k2w = mat ? k2b : k2a;   // this warp's tiles' width
     const int chunks = K / TBK;
-    const uint32_t* T0 = reinterpret_cast<const uint32_t*>(tp0[e]);
-    const uint32_t* T1 = reinterpret_cast<const uint32_t*>(tp1[e]);
-    const int nblocks = (cnt + 15) >> 4;   // 16-member blocks in use
 #pragma unroll
     for (int i = 0; i < TMT; ++i)
 #pragma unroll
         for (int j = 0; j < TNB; ++j)
 #pragma unroll
             for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
-    auto load = [&](int chunk) {
-        half* dst = stage + (size_t)(chunk % TSTAGES) * SH;
-        const int k0 = chunk * TBK;
-        for (int idx = threadIdx.x; idx < XR * (TBK / 8); idx += TT) {
-            const int m = idx / (TPM * (TBK / 8)), rem = idx % (TPM * (TBK / 8)), i = rem / (TBK / 8), j = rem % (TBK / 8);
-            if (i >= nblocks * 16) continue;   // a 16-member block without a member: never read
-            const int r = rows_sh[i];
-            const half* src = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : (r / xdiv)) * K + k0 + j * 8;
-            cp_async16(dst + ((size_t)m * TPM + i) * TXS + j * 8, src, r >= 0);
-        }
-        uint32_t* wdst = reinterpret_cast<uint32_t*>(dst + (size_t)XR * TXS);
-        for (int idx = threadIdx.x; idx < 16 * TKT * 16; idx += TT) {   // a tile's 16-byte pieces: k2 of at most 16
-            const int q = idx / (TKT * 16), kk = (idx / 16) % TKT, part = idx % 16;
-            int wm, nt;
-            ttile<MATS>(q, cb, wm, nt);
-            const int k2 = wm ? k2b : k2a;
-            if (part >= k2) continue;
-            const uint32_t* src = (wm ? T1 : T0) + (((size_t)chunk * TKT + kk) * NTILES + nt) * (4 * k2) + part * 4;
-            cp_async16(wdst + ((size_t)q * TKT + kk) * ws + part * 4, src, true);
-        }
+    constexpr int XP = XR * (TBK / 8) / TT, WP = 16 * TKT * 16 / TT;   // this thread's x and weight pieces a stage
+    static_assert(XP * TT == XR * (TBK / 8) && WP * TT == 16 * TKT * 16, "a stage's pieces split evenly over the threads");
+    const half* xsrc[XP];
+    int xdst[XP];
+    bool xon[XP], xval[XP];
+#pragma unroll
+    for (int p = 0; p < XP; ++p) {
+        const int idx = threadIdx.x + p * TT, m = idx / (TPM * (TBK / 8)), rem = idx % (TPM * (TBK / 8));
+        const int i = rem / (TBK / 8), j = rem % (TBK / 8);
+        xon[p] = i < NB * 16;   // a 16-member block without a member: never read
+        const int r = xon[p] ? rows_sh[i] : -1;
+        xval[p] = r >= 0;
+        xsrc[p] = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : (r / xdiv)) * K + j * 8;
+        xdst[p] = (m * TPM + i) * TXS + j * 8;
+    }
+    const uint32_t* wsrc[WP];
+    int wdst[WP], wstep[WP];
+    bool won[WP];
+#pragma unroll
+    for (int p = 0; p < WP; ++p) {   // a tile's 16-byte pieces: k2 of at most 16
+        const int idx = threadIdx.x + p * TT, q = idx / (TKT * 16), kk = (idx / 16) % TKT, part = idx % 16;
+        int wm, nt;
+        ttile<MATS>(q, cb, wm, nt);
+        const int k2 = wm ? k2b : k2a;
+        won[p] = part < k2;
+        wsrc[p] = reinterpret_cast<const uint32_t*>((wm ? tp1 : tp0)[e]) + ((size_t)kk * NTILES + nt) * (4 * k2) + part * 4;
+        wstep[p] = TKT * NTILES * 4 * k2;
+        wdst[p] = XR * TXS / 2 + (q * TKT + kk) * ws + part * 4;
+    }
+    auto load = [&](int chunk, half* dst) {
+#pragma unroll
+        for (int p = 0; p < XP; ++p)
+            if (xon[p]) cp_async16(dst + xdst[p], xsrc[p] + chunk * TBK, xval[p]);
+#pragma unroll
+        for (int p = 0; p < WP; ++p)
+            if (won[p]) cp_async16(reinterpret_cast<uint32_t*>(dst) + wdst[p], wsrc[p] + (size_t)chunk * wstep[p], true);
     };
 #pragma unroll
     for (int c = 0; c < TSTAGES - 1; ++c) {
-        if (c < chunks) load(c);
+        if (c < chunks) load(c, stage + c * SH);
         cp_async_commit();
     }
+    int cs = 0, ls = TSTAGES - 1;   // the stages chunk c and chunk c + TSTAGES - 1 use
     for (int c = 0; c < chunks; ++c) {
         cp_async_wait<TSTAGES - 2>();
         __syncthreads();
-        if (c + TSTAGES - 1 < chunks) load(c + TSTAGES - 1);
+        if (c + TSTAGES - 1 < chunks) load(c + TSTAGES - 1, stage + ls * SH);
         cp_async_commit();
-        const half* base = stage + (size_t)(c % TSTAGES) * SH;
+        const half* base = stage + cs * SH;
+        cs = cs == TSTAGES - 1 ? 0 : cs + 1;
+        ls = ls == TSTAGES - 1 ? 0 : ls + 1;
         const half* xs = base + (size_t)(XR == TPM ? 0 : mat) * TPM * TXS;
         const uint32_t* wsh = reinterpret_cast<const uint32_t*>(base + (size_t)XR * TXS);
+        uint32_t a[TMT * TKT][4];   // tile i's kk at i * TKT + kk: the warp's tiles are ws words apart
+        decode_tiles_p<CB, TMT * TKT>(wsh + (size_t)warp * TMT * TKT * ws, ws, k2w, lane, a);
 #pragma unroll
         for (int kk = 0; kk < TKT; ++kk) {
-            uint32_t a[TMT][4];
-            decode_tiles_p<CB, TMT>(wsh + ((size_t)warp * TMT * TKT + kk) * ws, TKT * ws, k2w, lane, a);
 #pragma unroll
-            for (int jb = 0; jb < TPM / 16; ++jb) {
-                if (jb < nblocks) {
-                    uint32_t r[4];
-                    const int row = jb * 16 + (lane & 7) + ((lane >> 4) & 1) * 8;
-                    ldmatrix_x4(r, xs + (size_t)row * TXS + kk * 16 + ((lane >> 3) & 1) * 8);
-                    const uint32_t bl[2] = {r[0], r[1]}, bh[2] = {r[2], r[3]};
+            for (int jb = 0; jb < NB; ++jb) {
+                uint32_t r[4];
+                const int row = jb * 16 + (lane & 7) + ((lane >> 4) & 1) * 8;
+                ldmatrix_x4(r, xs + (size_t)row * TXS + kk * 16 + ((lane >> 3) & 1) * 8);
+                const uint32_t bl[2] = {r[0], r[1]}, bh[2] = {r[2], r[3]};
 #pragma unroll
-                    for (int i = 0; i < TMT; ++i) {
-                        mma16816(acc[i][2 * jb], a[i], bl);
-                        mma16816(acc[i][2 * jb + 1], a[i], bh);
-                    }
+                for (int i = 0; i < TMT; ++i) {
+                    mma16816(acc[i][2 * jb], a[i * TKT + kk], bl);
+                    mma16816(acc[i][2 * jb + 1], a[i * TKT + kk], bh);
                 }
             }
         }
     }
     cp_async_wait<0>();
     __syncthreads();   // the stages become the epilogue's sums
+}
+
+// tloop at the item's 16-member block count (cnt of 1..TPM members).
+template <int MATS, int XR, int CB>
+__device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ tp0,
+        const uint64_t* __restrict__ tp1, int k2a, int k2b, int kmax, const int* rows_sh, int cnt, int e, int K, int NTILES,
+        int cb, int xdiv, half* stage, float (&acc)[TMT][TNB][4]) {
+    switch ((cnt + 15) >> 4) {
+#define TF_TLOOP(NB_) tloop<MATS, XR, CB, NB_>(X0, X1, tp0, tp1, k2a, k2b, kmax, rows_sh, e, K, NTILES, cb, xdiv, stage, acc)
+    case 1: TF_TLOOP(1); break;
+    case 2: TF_TLOOP(2); break;
+    case 3: TF_TLOOP(3); break;
+    default: TF_TLOOP(4);
+#undef TF_TLOOP
+    }
 }
 
 // acc (members TPH * hf .. + TPH - 1) -> E[member - TPH * hf][col] fp32, row stride ES; col0: first tile's column.
@@ -158,9 +187,10 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
                 v[j] = act * __half2float(suh_d[(size_t)e * N + n + j]);
             }
             fwht128(v, lane);
-            half* o = xd + (size_t)p * N + n;
+            __align__(8) half o[4];
 #pragma unroll
             for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
+            *reinterpret_cast<uint2*>(xd + (size_t)p * N + n) = *reinterpret_cast<const uint2*>(o);
         }
     }
 }
@@ -192,9 +222,12 @@ __device__ __forceinline__ void tdown(const half* __restrict__ Xd, const uint64_
 #pragma unroll
                 for (int j = 0; j < 4; ++j) v[j] = Ed[(size_t)i * DN_ES + blk * 128 + 4 * lane + j];
                 fwht128(v, lane);
-                float* o = y + ((size_t)(p / ps) * ys + p % ps) * D + n;
-#pragma unroll
-                for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
+                float4 o;
+                o.x = v[0] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n]);
+                o.y = v[1] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + 1]);
+                o.z = v[2] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + 2]);
+                o.w = v[3] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + 3]);
+                *reinterpret_cast<float4*>(y + ((size_t)(p / ps) * ys + p % ps) * D + n) = o;
             }
         }
     }
