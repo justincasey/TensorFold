@@ -51,7 +51,9 @@ pub const Lanes = struct {
     }
 
     pub fn backend(self: *Lanes) be.Backend {
-        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else &steps_vt };
+        // the first token leaves before the first DFlash2 block (open_first): TTFT pays no draft pass
+        const early = self.x.e.drafter != null and !std.mem.eql(u8, std.mem.span(std.c.getenv("TF_GLM_FIRST_EARLY") orelse "1"), "0");
+        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else &steps_vt, .first_before_draft = early };
     }
 
     const whole_vt: be.Backend.VTable = .{
