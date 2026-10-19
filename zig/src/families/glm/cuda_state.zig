@@ -15,8 +15,8 @@ const glue = @import("cuda_glue.zig");
 const mlp = @import("cuda_mlp.zig");
 const kda_block = @import("cuda_kda_block.zig");
 
-/// A prompt chunk's rows (decode.PREFILL_ROWS).
-pub const prefill_rows = 2048;
+/// A prompt chunk's rows: 4,096 (each routed expert's weights read once for 4,096 rows).
+pub const prefill_rows = 4096;
 /// A decode window's rows (Engine's max_rows).
 pub const window_rows = 8;
 /// The context the buffers' dense attention partials reach (Buffers' min(capacity, 2560)).
@@ -123,7 +123,7 @@ pub const Buffers = struct {
         const lw: usize = c.kv_lora;
         const part_rows = if (prefill) @min(rows, dsa_block.prompt_att_rows) else seg;
         const nch = latent.chunksFor(@min(capacity, dense_reach) + seg);
-        const partial_rows = @max(nch * part_rows, latent.chunksFor(sparse.width) * seg); // dense calls, or one sparse
+        const partial_rows = @max(nch, latent.chunksFor(sparse.width)) * part_rows; // dense and sparse calls of part_rows rows
         const np_max = capacity / sparse.pool;
         var mm: usize = 4;
         // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)

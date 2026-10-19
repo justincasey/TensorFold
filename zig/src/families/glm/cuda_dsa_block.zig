@@ -120,7 +120,15 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
     if (host_pos < l.dense_limit) try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale);
     if (sparseRows(l, host_pos, rows)) {
         try sparse.selectTokens(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts);
-        try latent.sparseAttention(set, stream, v.qa, c.lc, v.tokens, v.counts, sparse.width, v.partials, v.ol, rows, l.heads, l.lw, scale);
+        // part_rows-row calls (a prompt chunk's partials stay 512 rows deep); each row's sums are its own and every
+        // call keeps the whole call's head block, so the bits are those of one call over all rows
+        const hb = latent.headBlock(rows);
+        var r: usize = 0;
+        while (r < rows) : (r += part_rows) {
+            const n = @min(part_rows, rows - r);
+            const off = r * l.heads * l.lw * 2;
+            try latent.sparseAttention(set, stream, v.qa + off, c.lc, v.tokens + r * sparse.width * 4, v.counts + r * 4, sparse.width, v.partials, v.ol + off, n, l.heads, l.lw, scale, hb);
+        }
     }
 }
 
