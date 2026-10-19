@@ -246,11 +246,11 @@ fn noBf16(_: *const anyopaque, _: cuda.Stream, _: u64, _: usize, _: u64, _: u64,
 }
 
 /// The head's rank rows as bf16 [n][k] for the 4-bit draft head: the identity's rows through the EXL3 linear
-/// (fp32 W[k][n] in 128-row passes), transposed and rounded on the host. The caller frees the buffer.
+/// (fp32 W[k][n] in 32-row passes), transposed and rounded on the host. The caller frees the buffer.
 pub fn headBf16(L: anytype, id: u64, n: usize, k: usize) !cuda.DeviceBuffer {
     const r = L.w.xl.?;
     const l = r.find(id) orelse return error.Exl3LinearMissing;
-    const pass = 128;
+    const pass = 32; // under xlin.prompt_rows: the decode kernel's bits
     const host = try L.gpa.alloc(u16, n * k);
     defer L.gpa.free(host);
     const eye = try L.gpa.alloc(u16, pass * k);

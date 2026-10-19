@@ -1,6 +1,6 @@
 //! RED-SNOW's EXL3 linears behind b16.matmul's weight handle. A handle names one linear [n][k] made of up to three
 //! parts written side by side in its output columns (KDA's [q|k|v | f_a|g_a|b], DSA's [q_a | kv_a], [gate | up]):
-//! an EXL3 group (exl3.Linear, the rows-invariant decode kernel) or a bf16 matrix (b16's untiled kernels).
+//! an EXL3 group (exl3.Linear: the rows-invariant decode kernel, or prompt rows' dense kernel) or a bf16 matrix.
 const std = @import("std");
 const cuda = @import("cuda");
 const exl3 = cuda.exl3;
@@ -25,6 +25,9 @@ pub const Bf16Fn = *const fn (ctx: *const anyopaque, stream: cuda.Stream, x: u64
 
 const max_streams = 4;
 const block_rows = 128; // exl3.Linear takes 1..128 rows; a row's bits never depend on the count
+
+/// Calls of this many rows or more (prompt chunks; decode windows stay under) run exl3.Linear.dense.
+pub const prompt_rows = 64;
 
 /// One stream's scratch: the rotated inputs, split-K partials, counters, a contiguous copy of x and a part's output.
 const Scratch = struct {
@@ -141,7 +144,7 @@ pub const Runner = struct {
     /// Grows each stream's scratch for `rows` rows a call (prompt chunks) before any decode window runs.
     pub fn reserve(r: *Runner, stream: cuda.Stream, rows: usize) !void {
         const s = try r.scratchFor(stream);
-        _ = try r.grow(&s.xh, block_rows * r.max_k * 2);
+        _ = try r.grow(&s.xh, @max(rows, block_rows) * r.max_k * 2);
         _ = try r.grow(&s.z, r.max_z);
         _ = try r.grow(&s.counters, r.max_counters);
         _ = try r.grow(&s.xc, rows * r.max_k * 2);
@@ -158,26 +161,39 @@ pub const Runner = struct {
         if (n != l.n or k != l.k) return error.Exl3LinearShape;
         const s = try r.scratchFor(stream);
         const ye: usize = if (wide) 4 else 2;
-        var xx = x;
-        if (x_stride != k) { // the kernel reads contiguous rows
-            xx = try r.grow(&s.xc, m * k * 2);
-            try copy2d(stream, xx, k * 2, x, x_stride * 2, k * 2, m);
-        }
+        const yd: exl3.DType = if (wide) .f32 else .bf16;
+        var xc: ?u64 = if (x_stride == k) x else null; // contiguous rows, copied once when a part needs them
         for (l.parts[0..l.count], l.cols[0..l.count], l.widths[0..l.count]) |p, col, w| {
+            if (p == .q and m >= prompt_rows and exl3.denseIndex(p.q) != null) { // in place at its columns
+                const xh = try r.grow(&s.xh, m * k * 2);
+                try (try r.linear()).dense(stream, p.q, x, x_stride, m, out + col * ye, n, yd, xh);
+                continue;
+            }
+            const xx = xc orelse blk: {
+                const c = try r.grow(&s.xc, m * k * 2);
+                try copy2d(stream, c, k * 2, x, x_stride * 2, k * 2, m);
+                xc = c;
+                break :blk c;
+            };
             const direct = l.count == 1;
             const y = if (direct) out else try r.grow(&s.yt, m * l.n * 4);
             switch (p) {
-                .q => |q| try r.blocks(s, stream, q, xx, m, y, if (wide) .f32 else .bf16),
+                .q => |q| try r.blocks(s, stream, q, xx, m, y, yd),
                 .b => |b| try bf(ctx, stream, xx, k, b, y, part, m, w, k, wide),
             }
             if (!direct) try copy2d(stream, out + col * ye, n * ye, y, w * ye, w * ye, m);
         }
     }
 
+    /// The kernels, loaded on first use: the loader's head pass runs before seal.
+    fn linear(r: *Runner) !*const exl3.Linear {
+        if (r.lin == null) r.lin = try exl3.Linear.load(r.d);
+        return &r.lin.?;
+    }
+
     /// exl3.Dense's 128-row blocks on this stream's scratch.
     fn blocks(r: *Runner, s: *Scratch, stream: cuda.Stream, w: exl3.Weight, x: u64, rows: usize, y: u64, yd: exl3.DType) !void {
-        if (r.lin == null) r.lin = try exl3.Linear.load(r.d); // the loader's head pass runs before seal
-        const lin = &r.lin.?;
+        const lin = try r.linear();
         const p = exl3.plan(w.k, w.n, 192, 8);
         const z: u64 = if (p.sk > 1) try r.grow(&s.z, @as(usize, p.sk) * block_rows * w.n * 4) else 0;
         const counters = try r.grow(&s.counters, exl3.Linear.counterBytes(w));
