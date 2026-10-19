@@ -340,7 +340,7 @@ pub const Engine = struct {
             first = t[0];
         }
         if (f.prof) |p| p.mark(e.stream, .draw);
-        if (e.mtp) {
+        if (e.mtp and e.drafter == null) { // DFlash2 drafts without the MTP head: its rows are never read
             if (last) try e.copy(e.hold.ptr, e.bp.fnormed + (rows - 1) * e.c.hidden * 2, e.c.hidden * 2);
             const nxt = as_i32[1..];
             if (nxt.len > 0) { // decode._absorb_rows
