@@ -169,7 +169,7 @@ pub const Runner = struct {
         try stream.d.check(stream.d.api.cuMemcpy2DAsync_v2(&m, stream.handle), "EXL3 linear rows");
     }
 
-    /// out [m][n] (fp32 when `wide`, else bf16) = x [m][k] (rows `x_stride` apart) through `l`; `only`: that kind's parts.
+    /// out [m][n] (fp32 with `wide`, else bf16) = x [m][k] (`x_stride` apart) by `l`; `only`: that kind's parts alone.
     pub fn run(r: *Runner, bf: Bf16Fn, ctx: *const anyopaque, stream: cuda.Stream, l: *const Lin, only: ?Kind, x: u64, x_stride: usize, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
         if (n != l.n or k != l.k) return error.Exl3LinearShape;
         const s = try r.scratchFor(stream);
