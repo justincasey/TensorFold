@@ -142,7 +142,7 @@ const Loader = struct {
     }
 
     fn hc(L: *Loader, i: u32, comptime site: []const u8) !Hc {
-        try L.whole(try L.get("layers.{d}.hc_" ++ site ++ "_fn", .{i}), if (L.w.config.exl3_all) .f32 else .bf16); // RED-SNOW: fp32
+        try L.whole(try L.get("layers.{d}.hc_" ++ site ++ "_fn", .{i}), .bf16);
         const f = try L.put("layers.{d}.{s}_hc.fn", .{ i, site });
         try L.whole(try L.get("layers.{d}.hc_" ++ site ++ "_base", .{i}), .f32);
         const base = try L.put("layers.{d}.{s}_hc.base", .{ i, site });

@@ -156,7 +156,6 @@ pub const Engine = struct {
         e.m.tiled = o.settings.tiled;
         if (o.settings.tiled) e.m.packs = &e.packs;
         e.m.xl = e.w.xl; // RED-SNOW: the EXL3 linears b16.matmul's handles name
-        e.m.hc_f32 = c.exl3_all; // and its hc fn in fp32
         try e.bind(0);
         errdefer {
             e.free(0);

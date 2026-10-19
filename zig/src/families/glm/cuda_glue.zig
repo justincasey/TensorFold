@@ -5,7 +5,7 @@ const cuda = @import("cuda");
 const mm_mod = @import("cuda_mm.zig");
 
 /// What the forward's kernels launch from: our glue's functions.
-pub const Set = struct { glue: *const Kernels, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, xl: ?*@import("cuda_xlin.zig").Runner = null, hc_f32: bool = false }; // mm: linears tiled at load; xl: EXL3 linears; hc_f32: fp32 hc fn
+pub const Set = struct { glue: *const Kernels, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, xl: ?*@import("cuda_xlin.zig").Runner = null }; // mm: linears tiled at load; xl: EXL3 linears
 
 /// Our glm_glue.cu's functions.
 pub const Kernels = struct {
@@ -30,8 +30,6 @@ pub const Kernels = struct {
     router_tile: cuda.Function,
     hc_partial: cuda.Function,
     hc_partial8: cuda.Function,
-    hc_partial_f32: cuda.Function, // RED-SNOW's fn in fp32 (the checkpoint's), same sums in the same order
-    hc_partial8_f32: cuda.Function,
     hc_finish: cuda.Function,
     absorb_q: cuda.Function,
     expand_v: cuda.Function,
@@ -181,10 +179,10 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
     inline for (.{ x, fn_w, part, i64of(s * d), @as(c_int, hc_blocks) }) |v| a.add(v);
     // Decode windows (16 blocks a row) take each block's 8 steps at once; prompt rows 4 rows a 128-thread block.
     if (rows < 64) {
-        try cuda.launch.launch(if (set.hc_f32) set.glue.hc_partial8_f32 else set.glue.hc_partial8, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 1024 } }, stream, &a);
+        try cuda.launch.launch(set.glue.hc_partial8, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 1024 } }, stream, &a);
     } else {
         a.add(i64of(rows));
-        try cuda.launch.launch(if (set.hc_f32) set.glue.hc_partial_f32 else set.glue.hc_partial, .{ .grid = .{ .x = cdiv(rows, 4), .y = hc_blocks }, .block = .{ .x = 128 } }, stream, &a);
+        try cuda.launch.launch(set.glue.hc_partial, .{ .grid = .{ .x = cdiv(rows, 4), .y = hc_blocks }, .block = .{ .x = 128 } }, stream, &a);
     }
     var b: cuda.Args = .{};
     inline for (.{ x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, @as(c_int, hc_blocks), cint(iters) }) |v| b.add(v);
