@@ -186,9 +186,9 @@ pub fn scratchBytes(rows: usize, dims: usize, width: usize, prefill: bool, shx: 
     const n: usize = @min(rows, chunk_rows);
     var l = shape(dims, width, book, uniform);
     l.shared_input = shx;
-    const slots_ = picksBytes(rows) + (common.scratchBytes(shape(dims, width, book, 0), n, top_k) catch unreachable);
-    if (prefill and common.prompt.eligible(l)) return .{ @max(slots_, picksBytes(rows) + (common.prompt.bytes(l, n, top_k) catch unreachable)), 4, 4, 4 };
-    return .{ slots_, 4, 4, 4 };
+    // a prompt chunk on eligible experts runs only the fused kernels (run: fused = prompt and eligible)
+    if (prefill and common.prompt.eligible(l)) return .{ picksBytes(rows) + (common.prompt.bytes(l, n, top_k) catch unreachable), 4, 4, 4 };
+    return .{ picksBytes(rows) + (common.scratchBytes(shape(dims, width, book, 0), n, top_k) catch unreachable), 4, 4, 4 };
 }
 /// `height` rows of `width` bytes, `spitch` apart at `src`, to `dpitch` apart at `dst`, in one call.
 fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usize, width: usize, height: usize, what: []const u8) !void {
