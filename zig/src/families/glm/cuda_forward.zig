@@ -43,6 +43,7 @@ pub const Modules = struct {
     tiled: bool = false, // the bf16 linears' weights are tiled (Engine.init, TF_GLM_MM unset or 1): glm_mm runs them
     packs: ?*const mm_mod.Packed = null, // the linears packed to 4, 6 or 8 bits (TF_GLM_DENSE_BITS, _HEAD_BITS)
     xl: ?*@import("cuda_xlin.zig").Runner = null, // RED-SNOW: the EXL3 linears behind b16.matmul's handles
+    hc_f32: bool = false, // RED-SNOW: hc fn in fp32, as its checkpoint stores it
     copy_rows: cuda.Function,
     put_slot: cuda.Function,
     pack_dense: cuda.Function,
@@ -77,6 +78,7 @@ pub const Modules = struct {
         m.tiled = false;
         m.packs = null; // `m` starts undefined: the field default does not apply
         m.xl = null;
+        m.hc_f32 = false;
         return m;
     }
 
@@ -186,7 +188,7 @@ pub const Forward = struct {
     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .glue = &f.m.glue, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .xl = f.m.xl };
+        return .{ .glue = &f.m.glue, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .xl = f.m.xl, .hc_f32 = f.m.hc_f32 };
     }
 
     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.

@@ -5,10 +5,21 @@
 
 using namespace glm_triton;
 
+namespace glm_hc_fn {
+// 8 consecutive weights of fn at p as floats: bf16 (one 16-byte load) or fp32 (two; RED-SNOW keeps fn in fp32).
+__device__ __forceinline__ void load8(const __nv_bfloat16* p, float (&w)[8]) {
+  const uint4 u = __ldg(reinterpret_cast<const uint4*>(p));
+  const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&u);
+  for (int j = 0; j < 8; ++j) w[j] = bf(h[j]);
+}
+__device__ __forceinline__ void load8(const float* p, float (&w)[8]) {
+  const float4 a = __ldg(reinterpret_cast<const float4*>(p)), b = __ldg(reinterpret_cast<const float4*>(p) + 1);
+  w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w; w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
+}
+
 // glue._hc_partial, block (4 rows, K block b) of 128 threads: a row's 24 dots and squares in Triton's fma order.
-extern "C" __global__ void __launch_bounds__(128)
-    tf_glm_hc_partial(
-            const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part, int64_t wide, int nb, int64_t rows) {
+template <typename W>
+__device__ __forceinline__ void partial(const __nv_bfloat16* x, const W* fn, float* part, int64_t wide, int nb, int64_t rows) {
   constexpr int R = 4;
   __shared__ float smem[R][4];
   const int64_t r0 = (int64_t)blockIdx.x * R, b = blockIdx.y, kb = wide / nb;
@@ -24,10 +35,8 @@ extern "C" __global__ void __launch_bounds__(128)
       for (int j = 0; j < 8; ++j) xv[q][j] = bf(h[j]);
     }
     for (int i = 0; i < 3; ++i) {
-      const uint4 u = __ldg(reinterpret_cast<const uint4*>(fn + (int64_t)(m0 + 8 * i) * wide + base + c * 8));
-      const __nv_bfloat16* hw = reinterpret_cast<const __nv_bfloat16*>(&u);
       float w[8];
-      for (int j = 0; j < 8; ++j) w[j] = bf(hw[j]);
+      load8(fn + (int64_t)(m0 + 8 * i) * wide + base + c * 8, w);
       for (int q = 0; q < R; ++q) {
         float d = __fmul_rn(xv[q][1], w[1]);
         d = __fmaf_rn(xv[q][0], w[0], d);
@@ -56,8 +65,8 @@ extern "C" __global__ void __launch_bounds__(128)
 }
 
 // The same for decode windows (16 blocks a row): 8 steps of 128 at once, a 128-thread group each; same ops, same order.
-extern "C" __global__ void __launch_bounds__(1024)
-    tf_glm_hc_partial8(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part, int64_t wide, int nb) {
+template <typename W>
+__device__ __forceinline__ void partial8(const __nv_bfloat16* x, const W* fn, float* part, int64_t wide, int nb) {
   __shared__ float dots[8][24];
   __shared__ float smem[4];
   const int64_t r = blockIdx.x, b = blockIdx.y, kb = wide / nb;
@@ -72,11 +81,11 @@ extern "C" __global__ void __launch_bounds__(1024)
       for (int j = 0; j < 8; ++j) xv[j] = bf(h[j]);
     }
     for (int i = 0; i < 3; ++i) {
-      const uint4 u = __ldg(reinterpret_cast<const uint4*>(fn + (int64_t)(m0 + 8 * i) * wide + base + c * 8));
-      const __nv_bfloat16* w = reinterpret_cast<const __nv_bfloat16*>(&u);
-      float d = __fmul_rn(xv[1], bf(w[1]));
-      d = __fmaf_rn(xv[0], bf(w[0]), d);
-      for (int j = 2; j < 8; ++j) d = __fmaf_rn(xv[j], bf(w[j]), d);
+      float w[8];
+      load8(fn + (int64_t)(m0 + 8 * i) * wide + base + c * 8, w);
+      float d = __fmul_rn(xv[1], w[1]);
+      d = __fmaf_rn(xv[0], w[0], d);
+      for (int j = 2; j < 8; ++j) d = __fmaf_rn(xv[j], w[j], d);
       for (int o = 8; o > 0; o >>= 1) d = d + __shfl_xor_sync(0xffffffffu, d, o);
       if (c == 0) dots[grp][m0 + 8 * i] = d;
     }
@@ -99,6 +108,24 @@ extern "C" __global__ void __launch_bounds__(1024)
   } else if (threadIdx.x == 32) {
     out[24] = (smem[0] + smem[2]) + (smem[1] + smem[3]);
   }
+}
+}  // namespace glm_hc_fn
+
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_hc_partial(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part, int64_t wide, int nb, int64_t rows) {
+  glm_hc_fn::partial(x, fn, part, wide, nb, rows);
+}
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_hc_partial_f32(const __nv_bfloat16* x, const float* fn, float* part, int64_t wide, int nb, int64_t rows) {
+  glm_hc_fn::partial(x, fn, part, wide, nb, rows);
+}
+extern "C" __global__ void __launch_bounds__(1024)
+    tf_glm_hc_partial8(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part, int64_t wide, int nb) {
+  glm_hc_fn::partial8(x, fn, part, wide, nb);
+}
+extern "C" __global__ void __launch_bounds__(1024)
+    tf_glm_hc_partial8_f32(const __nv_bfloat16* x, const float* fn, float* part, int64_t wide, int nb) {
+  glm_hc_fn::partial8(x, fn, part, wide, nb);
 }
 
 namespace glm_hc {
