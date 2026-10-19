@@ -177,6 +177,7 @@ pub fn run(gpu: Gpu, sigma_arg: ?[]const u8) !void {
     defer a.free(out);
     try bufs.items[ey_at].download(0, out);
     var h = std.hash.Wyhash.init(0);
-    for (0..rows) |row| h.update(out[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]);
+    const eb = glm.exl3.slotBytes(w, E, D, N, true);
+    for (0..rows) |row| h.update(out[row * slots * D * eb ..][0 .. (slots - 1) * D * eb]);
     std.debug.print("RESULT glm-exl3-bench {d} rows, {d} experts, D {d}, N {d}: {d:.3} ms a call, routed slots digest {x:0>16}\n", .{ rows, E, D, N, ms, h.final() });
 }

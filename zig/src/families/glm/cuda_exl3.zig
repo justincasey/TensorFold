@@ -195,6 +195,10 @@ fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usiz
     const m: cuda.abi.Memcpy2D = .{ .src = src, .src_pitch = spitch, .dst = dst, .dst_pitch = dpitch, .width = width, .height = height };
     try stream.d.check(stream.d.api.cuMemcpy2DAsync_v2(&m, stream.handle), what);
 }
+/// Bytes of a slot row's element in `ey`: bf16 when a prompt call takes the fused kernels, else fp32.
+pub fn slotBytes(w: Experts, count: usize, dims: usize, width: usize, prompt: bool) usize {
+    return if (prompt and common.prompt.eligible(layer(w, count, dims, width, 0))) 2 else 4;
+}
 pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, prompt: bool, ey: u64, xd: u64) !void {
     _ = xd;
     if (slots != top_k + 1) return error.UnsupportedTopK;
@@ -209,7 +213,7 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
         try copyRows(stream, sc.picks, top_k * 4, picks + at * slots * 4, slots * 4, top_k * 4, n, "EXL3 compact route rows");
         if (fused) {
             const scratch = try common.prompt.scratch(arena, l, cap, top_k);
-            try k.prompt.run(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, sc.picks, n, scratch, plan_buf, ey + at * slots * dims * 4, slots);
+            try k.prompt.run(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, sc.picks, n, scratch, plan_buf, ey + at * slots * dims * 2, slots);
             continue;
         }
         const scratch = try common.scratch(arena, l, cap, top_k);

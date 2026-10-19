@@ -141,7 +141,7 @@ test "exl3 prompt: chunked calls keep row, pick and output offsets on both sides
             try std.testing.expectEqual(@as(u64, 0x200000000 + at * n * 520 * 2), call.args[0]);
             rotations += 1;
         } else {
-            try std.testing.expectEqual(@as(u64, 0x400000000 + at * n * 9 * 512 * 4), call.args[7]);
+            try std.testing.expectEqual(@as(u64, 0x400000000 + at * n * 9 * 512 * 2), call.args[7]);
             downs += 1;
         }
     }

@@ -131,10 +131,10 @@ fn fusedRows(r: *Rig, exp: *const exl3e.Experts, router: cuda.grouped.Router, b:
         .hist = try r.zeros((if (wide) (P + 1023) / 1024 * ref.E else 1) * 4),
     };
     const sc = try exl3e.prompt.scratch(try r.zeros(try exl3e.prompt.bytes(b.layer, n, ref.SLOTS)), b.layer, n, ref.SLOTS);
-    const y = try r.zeros(P * ref.D * 4);
+    const y = try r.zeros(P * ref.D * 2);
     try exp.prompt.run(exp, router, r.s, b.layer, b.dx + @as(u64, at) * ref.D * 2, ref.D, b.dpick + @as(u64, at) * ref.SLOTS * 4, n, sc, plan, y, ref.SLOTS);
     try r.s.synchronize();
-    return r.back(y, P * ref.D * 4);
+    return r.back(y, P * ref.D * 2);
 }
 
 /// The fused path at RED-SNOW's widths, gate and up apart in one expert: f64, repeat, and chunks of 128 and 37 rows.
@@ -152,10 +152,15 @@ fn fused(r: *Rig, exp: *const exl3e.Experts) !void {
     const y = try fusedRows(r, exp, router, &b, 0, rows);
     const want = try ref.reference(r, &b, rows);
     var most: f64 = 0;
-    for (0..rows) |row| for (0..ref.D) |d| { // the reference's combine: fp32 fmas in slot order
+    for (0..rows) |row| for (0..ref.D) |d| { // the reference's combine: fp32 fmas in slot order over the bf16 slot rows
         var acc: f32 = 0;
-        for (0..ref.SLOTS) |k| acc = @mulAdd(f32, b.wts[row * ref.SLOTS + k], std.mem.bytesToValue(f32, y[((row * ref.SLOTS + k) * ref.D + d) * 4 ..][0..4]), acc);
-        most = @max(most, @abs(@as(f64, acc) - want.want[row * ref.D + d]) / want.tol[row * ref.D + d]);
+        var mag: f64 = 0; // the slot rows' bf16 rounding: at most 2^-9 of each slot's size
+        for (0..ref.SLOTS) |k| {
+            const v: f32 = @floatCast(quant_ref_tests.helpers.bfOf(std.mem.readInt(u16, y[((row * ref.SLOTS + k) * ref.D + d) * 2 ..][0..2], .little)));
+            acc = @mulAdd(f32, b.wts[row * ref.SLOTS + k], v, acc);
+            mag += @abs(@as(f64, b.wts[row * ref.SLOTS + k]) * v) / 512;
+        }
+        most = @max(most, @abs(@as(f64, acc) - want.want[row * ref.D + d]) / (want.tol[row * ref.D + d] + mag));
     };
     std.debug.print("RESULT exl3.prompt.fused.f64: largest difference {d:.3} of its tolerance\n", .{most});
     if (!(most <= 1)) return error.TestFailed;
@@ -164,7 +169,7 @@ fn fused(r: *Rig, exp: *const exl3e.Experts) !void {
         var at: usize = 0;
         while (at < rows) : (at += step) {
             const n: usize = @min(rows - at, step);
-            const per = ref.SLOTS * ref.D * 4;
+            const per = ref.SLOTS * ref.D * 2;
             try check.sameBytes("exl3.prompt.fused chunks", try fusedRows(r, exp, router, &b, at, n), y[at * per ..][0 .. n * per]);
         }
     }

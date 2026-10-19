@@ -67,7 +67,7 @@ pub const Kernels = struct {
         try k.down.allowDynamicShared(shared(16, tile));
         return k;
     }
-    /// y: fp32 [rows][y_slots][dims], pick j of a row into its slot j (y_slots >= the scratch's slots).
+    /// y: bf16 [rows][y_slots][dims], pick j of a row into its slot j (y_slots >= the scratch's slots).
     pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, y: u64, y_slots: usize) !void {
         if (!eligible(l) or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32) or y_slots < sc.slots or y_slots > 32) return error.Exl3Shape;
         _ = try bytes(l, rows, sc.slots);

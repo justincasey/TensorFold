@@ -131,9 +131,9 @@ fn picks(r: *Rig, rows: usize) ![]i32 {
     return out;
 }
 
-const Run = struct { ey: u64, rows: usize };
+const Run = struct { ey: u64, rows: usize, eb: usize };
 
-/// The family's dispatch on `x` (bf16 [rows][D]) and `pk`: ey [rows][slots][D] fp32, the shared slot left as filled.
+/// The family's dispatch on `x` (bf16 [rows][D]) and `pk`: ey [rows][slots][D] of eb-byte values, shared slot unset.
 fn run(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, s: Set, x: []const u16, pk: []const i32, rows: usize, prompt: bool) !Run {
     const P = rows * glm.exl3.top_k;
     const tile: usize = if (prompt) glm.experts.staged_tile else glm.experts.tile;
@@ -151,7 +151,7 @@ fn run(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, s: S
     const xd = try r.zeros(P * N * 2);
     try glm.exl3.run(k, ek, r.s, s.experts(), sc, plan, try r.dev(std.mem.sliceAsBytes(x)), D, try r.dev(std.mem.sliceAsBytes(pk)), slots, rows, E, D, N, limit, prompt, ey, xd);
     try r.s.synchronize();
-    return .{ .ey = ey, .rows = rows };
+    return .{ .ey = ey, .rows = rows, .eb = glm.exl3.slotBytes(s.experts(), E, D, N, prompt) };
 }
 
 /// The kernels' SwiGLU: gate and up rounded to bf16 and limited, silu to bf16, the product to bf16.
@@ -196,17 +196,17 @@ fn expect(r: *Rig, name: []const u8, out: Run, s: Set, x: []const u16, pk: []con
     const want = try r.a.alloc(f64, n);
     const tol = try r.a.alloc(f64, n);
     try reference(r, s, x, pk, out.rows, want, tol);
-    const raw = try r.back(out.ey, n * 4);
+    const raw = try r.back(out.ey, n * out.eb);
     var most: f64 = 0;
     var at: usize = 0;
     for (0..out.rows) |row| for (0..slots) |j| for (0..D) |c| {
         const i = (row * slots + j) * D + c;
-        const bits = std.mem.readInt(u32, raw[i * 4 ..][0..4], .little);
+        const bits: u32 = if (out.eb == 2) std.mem.readInt(u16, raw[i * 2 ..][0..2], .little) else std.mem.readInt(u32, raw[i * 4 ..][0..4], .little);
         if (j == slots - 1) { // the shared slot: the fill's bytes
-            try check.expect(bits == 0xffffffff, "{s}: the shared slot left alone", .{name});
+            try check.expect(bits == @as(u32, if (out.eb == 2) 0xffff else 0xffffffff), "{s}: the shared slot left alone", .{name});
             continue;
         }
-        const g: f64 = @as(f32, @bitCast(bits));
+        const g: f64 = if (out.eb == 2) h.bfOf(@intCast(bits)) else @as(f32, @bitCast(bits));
         const q = @abs(g - want[i]) / tol[i];
         if (!(q <= most)) {
             most = q;
@@ -267,15 +267,16 @@ pub fn run_(gpu: Gpu) !void {
             const got = try run(&r, &k, &ek, s, x, pk, rows, true);
             try expect(&r, try std.fmt.allocPrint(r.a, "glm-exl3 prompt, {s}, {s}", .{ cs.what, rot }), got, s, x, pk);
             if (rows == 1) continue;
-            const all = try r.back(got.ey, rows * slots * D * 4);
+            const eb = got.eb;
+            const all = try r.back(got.ey, rows * slots * D * eb);
             const again = try run(&r, &k, &ek, s, x, pk, rows, true);
-            try check.expect(std.mem.eql(u8, all, try r.back(again.ey, rows * slots * D * 4)), "glm-exl3 prompt, {s}: {d} rows repeat their bytes", .{ cs.what, rows });
+            try check.expect(std.mem.eql(u8, all, try r.back(again.ey, rows * slots * D * eb)), "glm-exl3 prompt, {s}: {d} rows repeat their bytes", .{ cs.what, rows });
             // rows either side of the calls' boundary, and rows whose items other rows share, keep their bits as alone
             for ([_]usize{ 0, rows / 2, glm.exl3.chunk_rows - 1, glm.exl3.chunk_rows, rows - 1 }) |row| {
                 if (row >= rows) continue;
                 const alone = try run(&r, &k, &ek, s, x[row * D ..][0..D], pk[row * slots ..][0..slots], 1, true);
-                const mine = try r.back(alone.ey, slots * D * 4);
-                try check.expect(std.mem.eql(u8, mine[0 .. (slots - 1) * D * 4], all[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]), "glm-exl3 prompt, {s}: row {d} of {d} equals the row alone", .{ cs.what, row, rows });
+                const mine = try r.back(alone.ey, slots * D * eb);
+                try check.expect(std.mem.eql(u8, mine[0 .. (slots - 1) * D * eb], all[row * slots * D * eb ..][0 .. (slots - 1) * D * eb]), "glm-exl3 prompt, {s}: row {d} of {d} equals the row alone", .{ cs.what, row, rows });
             }
         }
     };
@@ -287,9 +288,10 @@ pub fn run_(gpu: Gpu) !void {
         const pk = try picks(&r, rows);
         for ([_]bool{ false, true }) |prompt| {
             const got = try run(&r, &k, &ek, s, x, pk, rows, prompt);
-            const raw = try r.back(got.ey, rows * slots * D * 4);
+            const raw = try r.back(got.ey, rows * slots * D * got.eb);
             for (0..rows) |row| for (0..slots - 1) |j| for (0..D) |c| {
-                const v: f32 = @bitCast(std.mem.readInt(u32, raw[((row * slots + j) * D + c) * 4 ..][0..4], .little));
+                const i = (row * slots + j) * D + c;
+                const v: f64 = if (got.eb == 2) h.bfOf(std.mem.readInt(u16, raw[i * 2 ..][0..2], .little)) else @as(f32, @bitCast(std.mem.readInt(u32, raw[i * 4 ..][0..4], .little)));
                 try check.expect(if (row == 2) std.math.isNan(v) else std.math.isFinite(v), "glm-exl3 {s}: a NaN stays in its row ({d})", .{ if (prompt) "prompt" else "decode", row });
             };
         }

@@ -195,11 +195,11 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
     }
 }
 
-// Block (256 model-width columns, item): y[pair / ps][slot pair % ps of ys][:] = the down epilogue of its pairs.
+// Block (256 model-width columns, item): y[pair / ps][slot pair % ps of ys][:] = its pairs' down epilogue, bf16 (rne).
 template <int CB>
 __device__ __forceinline__ void tdown(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, const int* __restrict__ dk2,
         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
-        float* __restrict__ y, int K, int D, int ps, int ys, int kmax, unsigned char* smem_raw, int* rows_sh) {
+        __nv_bfloat16* __restrict__ y, int K, int D, int ps, int ys, int kmax, unsigned char* smem_raw, int* rows_sh) {
     const int cb = blockIdx.x, item = blockIdx.y;
     if (item >= counts[0]) return;
     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
@@ -222,12 +222,10 @@ __device__ __forceinline__ void tdown(const half* __restrict__ Xd, const uint64_
 #pragma unroll
                 for (int j = 0; j < 4; ++j) v[j] = Ed[(size_t)i * DN_ES + blk * 128 + 4 * lane + j];
                 fwht128(v, lane);
-                float4 o;
-                o.x = v[0] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n]);
-                o.y = v[1] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + 1]);
-                o.z = v[2] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + 2]);
-                o.w = v[3] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + 3]);
-                *reinterpret_cast<float4*>(y + ((size_t)(p / ps) * ys + p % ps) * D + n) = o;
+                __align__(8) __nv_bfloat16 o[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) o[j] = __float2bfloat16_rn(v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]));
+                *reinterpret_cast<uint2*>(y + ((size_t)(p / ps) * ys + p % ps) * D + n) = *reinterpret_cast<const uint2*>(o);
             }
         }
     }

@@ -474,7 +474,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu(const hal
 
 extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
         const int* __restrict__ dk2, const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members,
-        const half* __restrict__ svh_d, float* __restrict__ y, int K, int D, int ps, int ys, int cb, int kmax) {
+        const half* __restrict__ svh_d, __nv_bfloat16* __restrict__ y, int K, int D, int ps, int ys, int cb, int kmax) {
     extern __shared__ __align__(16) unsigned char tp_smem[];
     __shared__ int rows_sh[TPM];
     if (cb == CB_MUL1) tdown<CB_MUL1>(Xd, Td, dk2, items, counts, members, svh_d, y, K, D, ps, ys, kmax, tp_smem, rows_sh);
