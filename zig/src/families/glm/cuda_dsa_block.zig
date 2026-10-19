@@ -34,8 +34,9 @@ pub const Layer = struct {
     dense_limit: usize, // the largest context whose top-k selection keeps every visible key (Config.keyWidth)
 };
 
-/// The caches: latent bf16 [capacity][lw], index keys/gates bf16 [capacity][128], pooled keys bf16 [pk_rows][128].
-pub const Caches = struct { lc: u64, ik: u64, ig: u64, pk: u64, pk_rows: usize };
+/// The caches: latent bf16 [capacity][lw] (or e4m3 [capacity][lw] with fp32 row scales ls [capacity] under
+/// --kv-cache fp8; ls 0: bf16), index keys/gates bf16 [capacity][128], pooled keys bf16 [pk_rows][128].
+pub const Caches = struct { lc: u64, ik: u64, ig: u64, pk: u64, pk_rows: usize, ls: u64 = 0 };
 
 /// The block's scratch for up to `rows` rows.
 pub const Scratch = struct {
@@ -114,7 +115,7 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
     v.qa += r0 * l.heads * l.lw * 2;
     v.ol += r0 * l.heads * l.lw * 2;
     v.qi += r0 * ix.heads * ix.d * 2;
-    try latent.latentWrite(set, stream, v.lat, l.lw, c.lc, pos, rows, l.lw);
+    try latent.latentWrite(set, stream, v.lat, l.lw, c.lc, c.ls, pos, rows, l.lw);
     try sparse.indexUpdate(set, stream, v.ikr, kw_rows, v.igr, ix.ln_w, ix.ln_b, ix.ape, c.ik, c.ig, c.pk, pos, rows);
     const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));
     if (host_pos < l.dense_limit) try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale);
@@ -127,7 +128,7 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
         while (r < rows) : (r += part_rows) {
             const n = @min(part_rows, rows - r);
             const off = r * l.heads * l.lw * 2;
-            try latent.sparseAttention(set, stream, v.qa + off, c.lc, v.tokens + r * sparse.width * 4, v.counts + r * 4, sparse.width, v.partials, v.ol + off, n, l.heads, l.lw, scale, hb);
+            try latent.sparseAttention(set, stream, v.qa + off, c.lc, c.ls, v.tokens + r * sparse.width * 4, v.counts + r * 4, sparse.width, v.partials, v.ol + off, n, l.heads, l.lw, scale, hb);
         }
     }
 }
@@ -148,6 +149,6 @@ fn denseAttention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scrat
             at = s.at;
         }
         const off = r0 * l.heads * l.lw * 2;
-        try latent.attention(k.set, stream, s.qa + off, c.lc, at, s.partials, s.ol + off, s.dummy, n, l.heads, l.lw, nch, scale, hb);
+        try latent.attention(k.set, stream, s.qa + off, c.lc, c.ls, at, s.partials, s.ol + off, s.dummy, n, l.heads, l.lw, nch, scale, hb);
     }
 }

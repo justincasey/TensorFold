@@ -59,8 +59,14 @@ pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, out: u64, r
 }
 
 /// latent.latent_write: rows of `lat` (stride `lat_stride`) into slots pos .. pos + rows - 1 (pos an i32 on device).
-pub fn latentWrite(set: glue.Set, stream: cuda.Stream, lat: u64, lat_stride: usize, cache: u64, pos: u64, rows: usize, lw: usize) !void {
+/// `scales` (fp32 [capacity], 0 for a bf16 cache): the fp8 cache's write, e4m3 codes and each row's amax / 448.
+pub fn latentWrite(set: glue.Set, stream: cuda.Stream, lat: u64, lat_stride: usize, cache: u64, scales: u64, pos: u64, rows: usize, lw: usize) !void {
     var a: cuda.Args = .{};
+    if (scales != 0) {
+        if (lw != 512 or lat_stride % 4 != 0 or lat % 8 != 0) return error.LatentShape;
+        inline for (.{ lat, @as(i64, @intCast(lat_stride)), cache, scales, pos }) |v| a.add(v);
+        return cuda.launch.launch(set.glue.lat_write8, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 } }, stream, &a);
+    }
     inline for (.{ lat, @as(i64, @intCast(lat_stride)), cache, pos, @as(i64, @intCast(lw)) }) |v| a.add(v);
     try cuda.launch.launch(set.glue.lat_write, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 } }, stream, &a);
 }
@@ -69,30 +75,36 @@ pub fn latentWrite(set: glue.Set, stream: cuda.Stream, lat: u64, lat_stride: usi
 pub const Partials = struct { po: u64, pm: u64, pl: u64 };
 
 /// latent.attention: causal qa over the cache in `nch` 512-key chunks into out bf16; `dummy`: the merge's count i32.
-pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, pos: u64, p: Partials, out: u64, dummy: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32, hb: usize) !void {
-    try chunks(set, stream, qa, cache, pos, 0, 0, p, rows, heads, lw, nch, 0, scale, hb, false);
+/// `scales` as latentWrite's (0: a bf16 cache).
+pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, pos: u64, p: Partials, out: u64, dummy: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32, hb: usize) !void {
+    try chunks(set, stream, qa, cache, scales, pos, 0, 0, p, rows, heads, lw, nch, 0, scale, hb, false);
     try merge(set, stream, p, out, dummy, rows, heads, lw, nch, false);
 }
 
 /// latent._dense_chunks (sparse false: keys through pos + r) and _sparse_chunks (row r's `counts` tokens of `tokens`).
-fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, pos: u64, tokens: u64, counts: u64, p: Partials, rows: usize, heads: usize, lw: usize, nch: usize, w: usize, scale: f32, hb: usize, sparse: bool) !void {
+fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, pos: u64, tokens: u64, counts: u64, p: Partials, rows: usize, heads: usize, lw: usize, nch: usize, w: usize, scale: f32, hb: usize, sparse: bool) !void {
     if (lw != 512) return error.LatentShape;
+    const fp8 = scales != 0;
     const f = switch (hb) {
-        heads_tile => set.glue.chunks_16,
-        heads_tile_wide => set.glue.chunks_32,
+        heads_tile => if (fp8) set.glue.chunks8_16 else set.glue.chunks_16,
+        heads_tile_wide => if (fp8) set.glue.chunks8_32 else set.glue.chunks_32,
         else => return error.HeadBlock,
     };
     var a: cuda.Args = .{};
     inline for (.{ qa, cache, pos, tokens, counts, p.po, p.pm, p.pl, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(w)), scale, @as(c_int, @intFromBool(sparse)) }) |v| a.add(v);
-    const shared = if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
+    if (fp8) a.add(scales);
+    const shared = switch (hb) {
+        heads_tile_wide => if (fp8) glue.chunksSmem8(heads_tile_wide) else glue.chunksSmem(heads_tile_wide),
+        else => if (fp8) glue.chunksSmem8(heads_tile) else glue.chunksSmem(heads_tile),
+    };
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = 256 }, .shared = shared }, stream, &a);
 }
 
 /// latent.sparse_attention: rows with counts > 0 over their selected tokens (i32 [rows][w]); others left alone.
 /// `hb`: the head block (headBlock of the whole call's rows, so a call split in row slices keeps every row's bits).
-pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32, hb: usize) !void {
+pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32, hb: usize) !void {
     const nch = chunksFor(w);
-    try chunks(set, stream, qa, cache, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, hb, true);
+    try chunks(set, stream, qa, cache, scales, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, hb, true);
     try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
 }
 

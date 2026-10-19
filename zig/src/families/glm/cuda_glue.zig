@@ -34,6 +34,7 @@ pub const Kernels = struct {
     absorb_q: cuda.Function,
     expand_v: cuda.Function,
     lat_write: cuda.Function,
+    lat_write8: cuda.Function, // --kv-cache fp8: e4m3 codes and a row scale
     index_write: cuda.Function,
     pool_keys: cuda.Function,
     select_rows: cuda.Function,
@@ -48,6 +49,8 @@ pub const Kernels = struct {
     bmm_d64s2: cuda.Function,
     chunks_16: cuda.Function,
     chunks_32: cuda.Function,
+    chunks8_16: cuda.Function, // the fp8 cache's chunk kernels
+    chunks8_32: cuda.Function,
     merge: cuda.Function,
     scores: cuda.Function,
 
@@ -59,6 +62,8 @@ pub const Kernels = struct {
         try k.bmm_heads.allowDynamicShared(bmm_tile1_smem[0]);
         try k.chunks_16.allowDynamicShared(chunksSmem(16));
         try k.chunks_32.allowDynamicShared(chunksSmem(32));
+        try k.chunks8_16.allowDynamicShared(chunksSmem8(16));
+        try k.chunks8_32.allowDynamicShared(chunksSmem8(32));
         return k;
     }
 };
@@ -134,6 +139,11 @@ pub const bmm_tile1_smem = [2]u32{ 3 * (128 + 128) * 32 * 2, 128 * (128 + 4) * 4
 /// glm_glue_attn.cuh's wide_smem<hb>(): q (hb x 512), two 32-key tiles, p (hb x 32) in bf16, then max/sum scratch.
 pub fn chunksSmem(comptime hb: u32) u32 {
     return (hb * 512 + 2 * 32 * 512 + hb * 32) * 2 + (hb * 4 + 2 * hb) * 4;
+}
+
+/// wide_smem<hb, true>(): as chunksSmem, the second key tile the two fp8 staging tiles, then their [2][32] fp32 scales.
+pub fn chunksSmem8(comptime hb: u32) u32 {
+    return chunksSmem(hb) + 2 * 32 * 4;
 }
 
 /// K slices of the router's dot (glue.ROUTER_KS): fixed by the shape, as the sliced and the single pass differ in bits.

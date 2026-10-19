@@ -196,8 +196,10 @@ pub fn run(gpu: Gpu) !void {
     const set: glue.Set = .{ .glue = &ks };
     for ([_]Shape{ .{ .n = 512, .k = 4096 }, .{ .n = 1280, .k = 1536 }, .{ .n = 1024, .k = 128 } }) |sh| try matmuls(&r, set, sh);
     try routers(&r, set);
-    try @import("glm_ref_attn.zig").dense(&r, set);
-    try @import("glm_ref_attn.zig").sparse(&r, set);
+    for ([_]bool{ false, true }) |kv8| {
+        try @import("glm_ref_attn.zig").dense(&r, set, kv8);
+        try @import("glm_ref_attn.zig").sparse(&r, set, kv8);
+    }
     try @import("glm_ref_hc.zig").mixing(&r, set);
     try @import("glm_ref_kda.zig").chains(&r);
     var ops = try cuda.Module.load(gpu.d, cuda.kernels.glm_ops);

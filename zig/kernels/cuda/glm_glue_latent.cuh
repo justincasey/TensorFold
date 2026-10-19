@@ -72,3 +72,27 @@ extern "C" __global__ void tf_glm_lat_write(const __nv_bfloat16* lat, int64_t la
   const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
   for (int64_t k = threadIdx.x; k < lw; k += blockDim.x) cache[at * lw + k] = lat[r * lat_stride + k];
 }
+
+// The fp8 latent cache's write (--kv-cache fp8), block of 128 threads, 4 values a thread (lw 512): row r into slot
+// pos + r as e4m3 codes of x / s (round to nearest, saturating) and s = amax / 448 (1 for a zero row) at scales[pos + r].
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_lat_write8(const __nv_bfloat16* lat, int64_t lat_stride, uint8_t* cache, float* scales, const int* pos) {
+  constexpr int LW = 512;
+  __shared__ float wmax[4];
+  const int t = threadIdx.x;
+  const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
+  const uint2 raw = *reinterpret_cast<const uint2*>(lat + r * lat_stride + 4 * t);
+  const float2 lo = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
+  const float2 hi = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
+  float amax = fmaxf(fmaxf(fabsf(lo.x), fabsf(lo.y)), fmaxf(fabsf(hi.x), fabsf(hi.y)));
+  for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+  if ((t & 31) == 0) wmax[t >> 5] = amax;
+  __syncthreads();
+  amax = fmaxf(fmaxf(wmax[0], wmax[2]), fmaxf(wmax[1], wmax[3]));
+  const float s = amax > 0.0f ? glm_triton::div_full(amax, 448.0f) : 1.0f;
+  if (t == 0) scales[at] = s;
+  unsigned short c0, c1;
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(c0) : "f"(glm_triton::div_full(lo.y, s)), "f"(glm_triton::div_full(lo.x, s)));
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(c1) : "f"(glm_triton::div_full(hi.y, s)), "f"(glm_triton::div_full(hi.x, s)));
+  *reinterpret_cast<unsigned*>(cache + at * LW + 4 * t) = (unsigned)c0 | ((unsigned)c1 << 16);
+}
