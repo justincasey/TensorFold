@@ -34,6 +34,9 @@ pub const Header = extern struct {
 pub const Words = extern struct { w: [96]u32 };
 pub const put_ids = 96 - 16;
 
+/// Every step's first broadcast: its header and room for `put_ids` ids, so a short step crosses in one.
+const first_bytes = 64 + put_ids * 4;
+
 /// The most ids one step carries (a prompt at the engine's capacity).
 pub const Link = struct {
     d: *const cuda.Driver,
@@ -47,7 +50,7 @@ pub const Link = struct {
     asleep: bool = false, // rank 0: the other ranks sleep on their lines (cuda.tp_watch) until its next step
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, max_ids: usize) !Link {
-        const buf = try cuda.DeviceBuffer.alloc(d, 64 + max_ids * 4);
+        const buf = try cuda.DeviceBuffer.alloc(d, 64 + @max(max_ids, put_ids) * 4);
         errdefer {
             var owned = buf;
             owned.free();
@@ -70,7 +73,7 @@ pub const Link = struct {
         try l.lib.check(l.lib.api.ncclBroadcast(l.buf.ptr, l.buf.ptr, bytes, .u8, 0, l.comm, l.stream.handle), "ncclBroadcast");
     }
 
-    /// Rank 0: the step and ids to every rank; up to `put_ids` ids go by `put` unwaited, longer ones upload and wait.
+    /// Rank 0: the step to every rank in one broadcast with up to `put_ids` ids (put unwaited); longer: the ids again.
     pub fn send(l: *Link, put: cuda.Function, h: Header, ids: []const u32) !void {
         if (ids.len > l.ids.len) return error.TooManyIds;
         var hh = h;
@@ -84,16 +87,12 @@ pub const Link = struct {
             a.add(@as(u32, @intCast(16 + ids.len)));
             a.add(w);
             try cuda.launch.launch(put, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, l.stream, &a);
-            try l.post(64);
-            if (ids.len > 0) try l.post(64 + ids.len * 4);
-            return;
+            return l.post(first_bytes);
         }
         try l.buf.uploadAsync(0, std.mem.asBytes(&hh), l.stream.handle);
-        try l.bcast(64);
-        if (ids.len > 0) {
-            try l.buf.uploadAsync(64, std.mem.sliceAsBytes(ids), l.stream.handle);
-            try l.bcast(64 + ids.len * 4);
-        }
+        if (ids.len > 0) try l.buf.uploadAsync(64, std.mem.sliceAsBytes(ids), l.stream.handle);
+        try l.bcast(first_bytes);
+        if (ids.len > put_ids) try l.bcast(64 + ids.len * 4);
     }
 
     /// `bytes` at `ptr` from rank 0 into every rank's `ptr` (image rows: the follower's buffer is the same size).
@@ -104,14 +103,12 @@ pub const Link = struct {
 
     /// Other ranks: the next step and its ids (valid until the next receive).
     pub fn receive(l: *Link) !struct { h: Header, ids: []const u32 } {
-        try l.bcast(64);
+        try l.bcast(first_bytes);
         var h: Header = undefined;
         try l.buf.download(0, std.mem.asBytes(&h));
         if (h.n > l.ids.len) return error.TooManyIds;
-        if (h.n > 0) {
-            try l.bcast(64 + h.n * 4);
-            try l.buf.download(64, std.mem.sliceAsBytes(l.ids[0..h.n]));
-        }
+        if (h.n > put_ids) try l.bcast(64 + h.n * 4);
+        if (h.n > 0) try l.buf.download(64, std.mem.sliceAsBytes(l.ids[0..h.n]));
         return .{ .h = h, .ids = l.ids[0..h.n] };
     }
 };
