@@ -16,6 +16,7 @@ pub const row_dims = layers.len * 4096;
 pub const Taps = struct {
     f: cuda.Function,
     out: u64,
+    keep: usize = 0, // a prompt chunk's first row the drafter ingests (Drafter.keepFrom): rows before it aren't swapped
 
     /// After layer `j` of an `R`-row pass on residual `x` (bf16 [R][4][4096]): its tap slot, if `j` is tapped.
     pub fn at(t: Taps, s: cuda.Stream, j: usize, x: u64, R: usize) !void {

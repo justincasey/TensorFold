@@ -402,7 +402,7 @@ pub const Forward = struct {
             }
             try p.shared[q].record(p.side);
             sent |= @as(usize, 1) << @intCast(q);
-            if (tap_rows) try taps.?.swap(f.exchange, p.side, .{ .world = world, .rank = f.ranks[0].w.share.rank, .n = n }, lo, f.ring);
+            if (tap_rows and piece[1] > taps.?.keep) try taps.?.swap(f.exchange, p.side, .{ .world = world, .rank = f.ranks[0].w.share.rank, .n = n }, lo, f.ring);
         }
         if (tap_rows) try p.tapped.record(p.side);
         for (0..cut.len) |q| if (sent >> @intCast(q) & 1 == 1) try f.stream.wait(p.shared[q]);

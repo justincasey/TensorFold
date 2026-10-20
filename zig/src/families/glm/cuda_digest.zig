@@ -34,7 +34,7 @@ fn hex(h: *Hash) [16]u8 {
     return std.fmt.bytesToHex(out[0..8].*, .lower);
 }
 
-/// Sequence `st` after a whole prompt of `ids` from 0: KDA states and conv rows, DSA caches, its taps and logits row.
+/// Sequence `st` after a whole prompt of `ids` from 0: KDA states and conv rows, DSA caches, kept taps, logits row.
 pub fn seq(e: *engine.Engine, st: *fw.State, ids: []const u32, taps: u64, logits: u64, path: []const u8, first: u32) !void {
     const n = ids.len;
     var hk: Hash = .init(.{});
@@ -62,13 +62,14 @@ pub fn seq(e: *engine.Engine, st: *fw.State, ids: []const u32, taps: u64, logits
             di += 1;
         },
     };
-    var flat: usize = 0; // tap rows whose first and last layers' taps match: a residual left at its embedding
+    var flat: usize = 0; // kept tap rows whose first and last layers' taps match: a residual left at its embedding
     if (taps != 0) {
-        const buf = try fetch(e, taps, n * dflash.TAP_ROW);
+        const k = dflash.Drafter.keepFrom(n); // the rows the context ingests (a split chunk swaps no others)
+        const buf = try fetch(e, taps + k * dflash.TAP_ROW, (n - k) * dflash.TAP_ROW);
         defer e.gpa.free(buf);
         ht.update(buf);
         const w = dflash.D * 2;
-        for (0..n) |r| {
+        for (0..n - k) |r| {
             const row = buf[r * dflash.TAP_ROW ..][0..dflash.TAP_ROW];
             flat += @intFromBool(std.mem.eql(u8, row[0..w], row[dflash.TAP_ROW - w ..]));
         }

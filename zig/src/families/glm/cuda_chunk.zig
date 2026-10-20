@@ -26,6 +26,7 @@ pub fn run(e: *Engine, part: []const u32, start: usize, len: usize, from: ?engin
     }
     var one: [1]fw.Rank = undefined;
     var f = e.view(b, &one);
+    if (f.taps) |*t| t.keep = @import("dflash.zig").Drafter.keepFrom(len) -| start;
     const as_i32: []const i32 = @ptrCast(part);
     if (lo == 0) if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
     const size: usize = if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3;

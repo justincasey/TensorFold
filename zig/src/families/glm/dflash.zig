@@ -215,9 +215,14 @@ pub const Drafter = struct {
         return dr.promptTaps(e, i, start, rows, len, if (aside) dr.taps_aside else dr.taps_prefill);
     }
 
+    /// A `len`-id prompt's first position the context keeps (the last window's).
+    pub fn keepFrom(len: usize) usize {
+        return len -| @as(usize, @intCast(WIN));
+    }
+
     /// `prompt` with the chunk's tap rows at `taps` (a batched prompt pass's segment).
     pub fn promptTaps(dr: *Drafter, e: anytype, i: u32, start: usize, rows: usize, len: usize, rows_at: u64) !void {
-        const keep_from = @as(usize, @intCast(@max(0, @as(i64, @intCast(len)) - WIN)));
+        const keep_from = keepFrom(len);
         if (start + rows <= keep_from) return;
         const lo = keep_from -| start;
         const s = try dr.slot(i);
