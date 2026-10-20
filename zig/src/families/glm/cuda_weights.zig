@@ -552,6 +552,20 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
         ck.releasePrefix(mine);
     }
     ck.release(); // a rank reads about half the checkpoint: its pages would crowd the GPU's allocations out
+    // the rest read ahead together too (~5 GB: faulted alone it took ~12 s of a boot); all joined before mtp's release
+    var tail: [3]?*core.checkpoint.Prefetch = @splat(null);
+    const joinAll = struct {
+        fn all(t: *[3]?*core.checkpoint.Prefetch) void {
+            for (t) |*x| if (x.*) |p| {
+                p.join();
+                x.* = null;
+            };
+        }
+    }.all;
+    defer joinAll(&tail);
+    tail[0] = try ck.prefetch(gpa, prefix ++ "embed_tokens.");
+    tail[1] = try head_ck.prefetch(gpa, "lm_head.");
+    if (with_mtp and c.mtp > 0) tail[2] = try ck.prefetch(gpa, try layerPrefix(&names[0], c.layers));
     try L.whole(try L.get("embed_tokens.weight", .{}), .bf16);
     w.embed = try L.put("embed", .{});
     try L.whole(try L.get("norm.weight", .{}), .bf16);
@@ -560,6 +574,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
         try L.rows(try head_ck.get("lm_head.weight"), share.vocab.lo, share.vocab.hi, c.vocab, .bf16);
         w.head = try L.put("head", .{});
     }
+    joinAll(&tail); // before mtp's ck.release: no reader puts back pages it drops
     if (with_mtp and c.mtp > 0) w.mtp = try L.mtp();
     if (w.xl) |r| try r.seal();
     return w;
