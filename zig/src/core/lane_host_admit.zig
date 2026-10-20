@@ -1,12 +1,13 @@
 //! Which queued request a lane host admits next: the head, or one behind a head that waits for pool room.
 const api = @import("engine_api.zig");
 const LaneHost = @import("lane_host.zig").LaneHost;
+const fill = @import("lane_host_fill.zig");
 const Job = LaneHost.Job;
 const lanes = @import("lanes");
 
 /// The queued job to admit (its index), or null to hold; the caller holds the lock and a lane is free.
 pub fn pick(h: *LaneHost) ?usize {
-    const a = h.info_.admit orelse return 0;
+    const a = h.info_.admit orelse return shortest(h);
     if (h.core.activeCount() == 0) return 0; // alone: the whole pool is free (kept prefixes give their blocks back)
     const head = h.queued.items[0];
     if (fits(a, head)) return 0;
@@ -17,6 +18,19 @@ pub fn pick(h: *LaneHost) ?usize {
         return null;
     };
     return null;
+}
+
+/// Without a pool: the head's class, shortest prompt first; one passed over preference_rounds times goes next.
+fn shortest(h: *LaneHost) usize {
+    const q = h.queued.items;
+    var at: usize = 0;
+    for (q[1..], 1..) |j, i| {
+        if (j.request.background != q[0].request.background or q[at].fill_wait >= fill.preference_rounds) break;
+        if (j.fill_wait >= fill.preference_rounds or j.request.prompt.len < q[at].request.prompt.len) at = i;
+    }
+    for (q[0..at]) |j| j.fill_wait +|= 1;
+    q[at].fill_wait = 0;
+    return at;
 }
 
 fn fits(a: api.Admit, job: *const Job) bool {

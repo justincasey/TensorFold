@@ -68,6 +68,7 @@ pub const Fake = struct {
     release_hook: ?*const fn (ctx: *anyopaque, s: *Stream) void = null, // after a stream's release, as a backend ending another
     release_hook_ctx: ?*anyopaque = null,
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
+    held_fill: bool = false, // `prefill_chunks` steps are one chunk's layer groups: another fill waits (error.FillBusy)
     ranked: bool = false, // the head gives its held chain back (alternatives)
     memory_lanes: ?usize = null, // prefill past this many live lanes fails with error.LaneMemory (no room yet)
     reserve: ?Reserve = null, // a new lane's caches come from here first (LaneMemory: no room yet); release gives them back
@@ -244,6 +245,10 @@ pub const Fake = struct {
         const x = self(ptr);
         if (x.refuse_sampled and s.sampling != null) return error.SamplingRefused;
         if (x.memory_lanes) |n| if (!x.lanes.contains(s) and x.lanes.count() >= n) return error.LaneMemory;
+        if (x.held_fill and !s.mid_chunk) {
+            var it = x.lanes.valueIterator();
+            while (it.next()) |o| if (o.filling and o.filled > 0) return error.FillBusy;
+        }
         const got = try x.newLane(s);
         if (got.found_existing and !got.value_ptr.filling) freeLane(x.gpa, got.value_ptr);
         if (!got.found_existing or !got.value_ptr.filling) got.value_ptr.* = .{ .filling = true };
@@ -253,6 +258,7 @@ pub const Fake = struct {
         if (s.isCancelled()) return error.Cancelled;
         l.filled += 1;
         s.fill_at.store(@intCast(s.prompt_len * l.filled / @max(1, x.prefill_chunks)), .monotonic);
+        s.mid_chunk = x.held_fill and l.filled < @max(1, x.prefill_chunks);
         if (l.filled < @max(1, x.prefill_chunks)) return false;
         l.filling = false;
         try x.fillPrompt(l, s);

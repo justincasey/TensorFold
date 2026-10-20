@@ -94,7 +94,7 @@ pub const LaneHost = struct {
         prefill_sent: bool = false, // a lone driver's prefilled event went out
         fill_began: bool = false, // its first prompt chunk ran
         submitted: i96 = 0,
-        fill_wait: usize = 0, // chunk choices it has waited since admission or its last chunk
+        fill_wait: usize = 0, // queued: admissions that passed it; admitted: chunk choices since admission or last chunk
         began: i96 = 0,
         /// The engine thread says the prompt pass is going: status readers may count this job's fill atomics.
         fill_on: std.atomic.Value(bool) = .init(false),
@@ -384,37 +384,13 @@ pub const LaneHost = struct {
         };
     }
 
-    /// The next filling job's next prompt chunk: the other streams' rounds run between chunks, not after the prompt.
-    fn fillOne(h: *LaneHost) void {
-        if (h.filling.items.len == 0) return;
-        const at = fill.next(h);
-        const job = h.filling.items[at];
-        const first = !job.fill_began;
-        job.fill_began = true;
-        const done = h.core.fillStreamCommitted(&job.stream, first, .{ .ptr = job, .call = firstCommitted }) catch |e| {
-            _ = switch (e) {
-                error.Cancelled => h.cancel(job),
-                error.LaneMemory => blk: {
-                    fill.unfill(h, job);
-                    break :blk h.requeue(job);
-                },
-                else => h.drop(job, h.words(e)),
-            };
-            return;
-        };
-        if (!done) return;
-        _ = h.filling.orderedRemove(at);
-        h.prefilled(job, job.began);
-        _ = h.deliver(job);
-    }
-
     /// A reply's grammar from the server's compiler (Info.structures engines get requests that carry one).
     pub fn constraint(h: *LaneHost, st: api.Structure) !*lanes.grammar.Constraint {
         const c = st.compiler orelse return error.NoGrammarCompiler;
         return c.constraint(h.gpa, h.io, @fromBackingInt(@intCast(@backingInt(st.kind))), st.text, st.after);
     }
 
-    fn firstCommitted(ptr: *anyopaque) void {
+    pub fn firstCommitted(ptr: *anyopaque) void {
         const job: *Job = @ptrCast(@alignCast(ptr));
         job.host.prefilled(job, job.began);
         job.host.send(job);
@@ -471,7 +447,7 @@ pub const LaneHost = struct {
     }
 
     /// No memory for another lane yet: the job waits at the queue's head, and admission holds until a job ends.
-    fn requeue(h: *LaneHost, job: *Job) bool {
+    pub fn requeue(h: *LaneHost, job: *Job) bool {
         if (job.stream.pending != null or job.delivered != 0) return h.drop(job, "memory failure after first-token commit");
         h.lock();
         for (h.admitted.items, 0..) |j, i| if (j == job) {
@@ -544,7 +520,7 @@ pub const LaneHost = struct {
             rows_host.answer(h);
             learn.refuse(h);
             while (h.admitOne()) {}
-            h.fillOne();
+            fill.one(h); // a prompt step: a chunk, or a layer group of one
             h.core.sweep() catch |err| {
                 ends.failAll(h, @errorName(err));
                 continue;

@@ -123,6 +123,74 @@ test "a foreground prompt arriving while a background one fills takes the next c
     try std.testing.expectEqualSlices(Id, &.{ 2, 1 }, &order.prefilled);
 }
 
+test "a fill the backend holds between layer groups goes on while a shorter one waits busy, then both finish" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 4, .held_fill = true };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.stepped(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    const Order = struct {
+        mutex: std.Io.Mutex = .init,
+        prefilled: [2]Id = .{ 0, 0 },
+        count: usize = 0,
+        done: usize = 0,
+        failed: usize = 0,
+        fn event(ctx: *anyopaque, id: Id, e: *const Event) void {
+            const o: *@This() = @ptrCast(@alignCast(ctx));
+            o.mutex.lockUncancelable(std.testing.io);
+            defer o.mutex.unlock(std.testing.io);
+            switch (e.*) {
+                .prefilled => {
+                    o.prefilled[o.count] = id;
+                    o.count += 1;
+                },
+                .finished => |f| {
+                    o.done += 1;
+                    if (f.reason != .stop and f.reason != .length) o.failed += 1;
+                },
+                else => {},
+            }
+        }
+    };
+    var order: Order = .{};
+    const long = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3 };
+    const short = [_]u32{ 2, 7, 1, 8 };
+    const first: Request = .{ .prompt = &long, .max_tokens = 4 };
+    const second: Request = .{ .prompt = &short, .max_tokens = 4 };
+    const e = host.engine();
+    const Arrive = struct {
+        engine: api.Engine,
+        request: *const Request,
+        order: *Order,
+        sent: bool = false,
+        fn call(ctx: *anyopaque, _: *lanes.Stream, _: usize) void {
+            const a: *@This() = @ptrCast(@alignCast(ctx));
+            if (a.sent) return;
+            a.sent = true;
+            a.engine.submit(2, a.request, .{ .ctx = a.order, .event = Order.event }) catch {};
+        }
+    };
+    var arrive: Arrive = .{ .engine = e, .request = &second, .order = &order };
+    target.prefill_hook = Arrive.call;
+    target.prefill_hook_ctx = &arrive;
+    try e.submit(1, &first, .{ .ctx = &order, .event = Order.event });
+    try host.start();
+    defer host.stop();
+    while (true) {
+        order.mutex.lockUncancelable(std.testing.io);
+        const d = order.done;
+        order.mutex.unlock(std.testing.io);
+        if (d == 2) break;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expectEqualSlices(Id, &.{ 1, 2 }, &order.prefilled); // the short one could not start beside it
+    try std.testing.expectEqual(@as(usize, 0), order.failed);
+}
+
 test "status reads a filling prompt's tokens while its pass runs, and none once it ends" {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);

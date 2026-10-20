@@ -40,3 +40,36 @@ test "fill aging: every admitted fill gets chunks within a fixed round bound und
         for (chunks[0..slow]) |count| try std.testing.expect(count >= 16);
     };
 }
+
+test "fill: the short fill is chosen first; a chunk between its layer groups is the held one a busy backend runs" {
+    const tokens: [1024]u32 = @splat(7);
+    var h = Host.init(a, std.testing.io, undefined, .{ .lanes = 2 });
+    defer h.filling.deinit(a);
+    const long: api.Request = .{ .prompt = &tokens, .max_tokens = 1 };
+    const short: api.Request = .{ .prompt = &.{1}, .max_tokens = 1 };
+    var jobs = [_]Host.Job{ job(&h, &long), job(&h, &short) };
+    for (&jobs) |*j| try h.filling.append(a, j);
+    try std.testing.expectEqual(@as(?usize, null), fill.held(&h));
+    jobs[0].stream.mid_chunk = true;
+    try std.testing.expectEqual(@as(usize, 1), fill.next(&h));
+    try std.testing.expectEqual(@as(?usize, 0), fill.held(&h));
+}
+
+test "admit: without a pool the shortest queued prompt goes first, one passed over eight times goes next" {
+    const admit = @import("lane_host_admit.zig");
+    const tokens: [1024]u32 = @splat(7);
+    var h = Host.init(a, std.testing.io, undefined, .{ .lanes = 1 });
+    defer h.queued.deinit(a);
+    const long: api.Request = .{ .prompt = &tokens, .max_tokens = 1 };
+    const short: api.Request = .{ .prompt = tokens[0..4], .max_tokens = 1 };
+    const back: api.Request = .{ .prompt = &.{1}, .max_tokens = 1, .background = true };
+    var head = job(&h, &long);
+    var later = [_]Host.Job{ job(&h, &short), job(&h, &back) };
+    try h.queued.appendSlice(a, &.{ &head, &later[0], &later[1] });
+    for (0..fill.preference_rounds) |i| {
+        try std.testing.expectEqual(@as(?usize, 1), admit.pick(&h)); // a foreground short one, not the background one
+        try std.testing.expectEqual(i + 1, head.fill_wait);
+    }
+    try std.testing.expectEqual(@as(?usize, 0), admit.pick(&h));
+    try std.testing.expectEqual(@as(usize, 0), head.fill_wait);
+}

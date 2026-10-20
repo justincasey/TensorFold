@@ -22,6 +22,46 @@ pub fn next(h: *const LaneHost) usize {
     return at;
 }
 
+/// The filling job whose chunk stands between layer groups (the backend's error.FillBusy: it goes on first), if any.
+pub fn held(h: *const LaneHost) ?usize {
+    for (h.filling.items, 0..) |j, i| if (j.stream.mid_chunk) return i;
+    return null;
+}
+
+/// The next filling job's next prompt step: the other streams' rounds run between steps, not after the prompt.
+pub fn one(h: *LaneHost) void {
+    if (h.filling.items.len == 0) return;
+    var at = next(h);
+    var job = h.filling.items[at];
+    var done = false;
+    while (true) {
+        const first = !job.fill_began;
+        job.fill_began = true;
+        done = h.core.fillStreamCommitted(&job.stream, first, .{ .ptr = job, .call = LaneHost.firstCommitted }) catch |e| {
+            if (e == error.FillBusy) if (held(h)) |mid| if (mid != at) { // its chunk could not start beside another's
+                job.fill_wait +|= 1;
+                at = mid;
+                job = h.filling.items[at];
+                continue;
+            };
+            _ = switch (e) {
+                error.Cancelled => h.cancel(job),
+                error.LaneMemory => blk: {
+                    unfill(h, job);
+                    break :blk h.requeue(job);
+                },
+                else => h.drop(job, h.words(e)),
+            };
+            return;
+        };
+        break;
+    }
+    if (!done) return;
+    _ = h.filling.orderedRemove(at);
+    h.prefilled(job, job.began);
+    _ = h.deliver(job);
+}
+
 /// Takes `job` off the filling list, wherever it is.
 pub fn unfill(h: *LaneHost, job: anytype) void {
     for (h.filling.items, 0..) |j, i| if (j == job) {
