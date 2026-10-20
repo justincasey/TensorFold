@@ -13,12 +13,18 @@ pub fn on() bool {
     return v[0] == '1';
 }
 
-fn add(e: *engine.Engine, h: *Hash, ptr: u64, bytes: usize) !void {
-    if (bytes == 0) return;
+fn fetch(e: *engine.Engine, ptr: u64, bytes: usize) ![]u8 {
     const buf = try e.gpa.alloc(u8, bytes);
-    defer e.gpa.free(buf);
+    errdefer e.gpa.free(buf);
     try e.stream.synchronize();
     try e.d.check(e.d.api.cuMemcpyDtoH_v2(buf.ptr, ptr, bytes), "cuMemcpyDtoH");
+    return buf;
+}
+
+fn add(e: *engine.Engine, h: *Hash, ptr: u64, bytes: usize) !void {
+    if (bytes == 0) return;
+    const buf = try fetch(e, ptr, bytes);
+    defer e.gpa.free(buf);
     h.update(buf);
 }
 
@@ -56,8 +62,18 @@ pub fn seq(e: *engine.Engine, st: *fw.State, ids: []const u32, taps: u64, logits
             di += 1;
         },
     };
-    if (taps != 0) try add(e, &ht, taps, n * dflash.TAP_ROW);
+    var flat: usize = 0; // tap rows whose first and last layers' taps match: a residual left at its embedding
+    if (taps != 0) {
+        const buf = try fetch(e, taps, n * dflash.TAP_ROW);
+        defer e.gpa.free(buf);
+        ht.update(buf);
+        const w = dflash.D * 2;
+        for (0..n) |r| {
+            const row = buf[r * dflash.TAP_ROW ..][0..dflash.TAP_ROW];
+            flat += @intFromBool(std.mem.eql(u8, row[0..w], row[dflash.TAP_ROW - w ..]));
+        }
+    }
     try add(e, &hg, logits, e.w.share.vocab.len() * 2);
     hi.update(std.mem.sliceAsBytes(ids));
-    std.debug.print("DIGEST rank={d} path={s} len={d} ids={s} kda={s} conv={s} lat={s} idx={s} taps={s} logits={s} first={d}\n", .{ e.share.rank, path, n, hex(&hi), hex(&hk), hex(&hc), hex(&hl), hex(&hx), hex(&ht), hex(&hg), first });
+    std.debug.print("DIGEST rank={d} path={s} len={d} ids={s} kda={s} conv={s} lat={s} idx={s} taps={s} flat={d} logits={s} first={d}\n", .{ e.share.rank, path, n, hex(&hi), hex(&hk), hex(&hc), hex(&hl), hex(&hx), hex(&ht), flat, hex(&hg), first });
 }
