@@ -22,13 +22,21 @@ pub const default_fill_layers = 2;
 
 /// With DFlash2: a window's ms by rows on two GB10s (EXL3, TF_GLM_PROF: 86 to 107 ms at 5 to 8), shared as glm_cuda's.
 const gb10_window_costs = costTable(max_rows, 52.0, 6.8);
-const gb10_shared_costs = costTable(engine.shared_rows, 76.0, 4.1);
 
 fn costTable(comptime n: usize, comptime one: f64, comptime row: f64) [n]lanes.config.Cost {
     var c: [n]lanes.config.Cost = undefined;
     for (&c, 0..) |*x, i| x.* = .{ .width = i + 1, .ms = one + row * @as(f64, @floatFromInt(i)) };
     return c;
 }
+
+/// A shared window's ms by total rows on two GB10s (TF_GLM_PROF_BY=rows; mul1 linears in one pass to 32 rows).
+const gb10_shared_ms = [_]f64{ 44, 52, 60, 66, 75, 84.5, 93, 101.5, 110, 117, 123.5, 129.5, 137.5, 144, 148.5, 155, 159.5, 164, 168.5, 175, 180 };
+const gb10_shared_costs = shared: {
+    var c: [gb10_shared_ms.len + 1]lanes.config.Cost = undefined;
+    for (c[0..gb10_shared_ms.len], gb10_shared_ms, 1..) |*x, ms, w| x.* = .{ .width = w, .ms = ms };
+    c[gb10_shared_ms.len] = .{ .width = engine.shared_rows, .ms = 180 + 6.0 * @as(f64, @floatFromInt(engine.shared_rows - gb10_shared_ms.len)) };
+    break :shared c;
+};
 
 /// A stream's place in the backend: its sequence's slot, the rows its last verify left uncommitted, its held drafts.
 const Lane = struct {

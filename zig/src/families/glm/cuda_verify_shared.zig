@@ -8,11 +8,23 @@ const prof_mod = @import("cuda_prof.zig");
 const Engine = engine.Engine;
 const Part = engine.Part;
 
-/// TF_GLM_PROF's shared windows, by streams: 2, 3 to 4, 5 to 8, 9 to 16.
-pub const prof_buckets = 4;
-const labels = [prof_buckets][]const u8{ "shared 2 streams", "shared 3-4 streams", "shared 5-8 streams", "shared 9-16 streams" };
+/// TF_GLM_PROF's shared windows: by streams (2, 3 to 4, 5 to 8, 9 to 16), or by rows with TF_GLM_PROF_BY=rows.
+pub const prof_buckets = engine.shared_rows;
+const by_streams = [_][]const u8{ "shared 2 streams", "shared 3-4 streams", "shared 5-8 streams", "shared 9-16 streams" };
+const by_rows = rows: {
+    var l: [prof_buckets][]const u8 = undefined;
+    for (&l, 1..) |*x, i| x.* = std.fmt.comptimePrint("shared {d} rows", .{i});
+    break :rows l;
+};
 
-fn bucket(streams: usize) usize {
+/// Whether shared windows' profiles go by rows (each counts its streams) rather than by streams (each counts rows).
+pub fn profByRows() bool {
+    const v = std.c.getenv("TF_GLM_PROF_BY") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "rows");
+}
+
+fn bucket(rows_by: bool, streams: usize, rows: usize) usize {
+    if (rows_by) return rows - 1;
     return if (streams <= 2) 0 else if (streams <= 4) 1 else if (streams <= 8) 2 else 3;
 }
 
@@ -33,10 +45,13 @@ pub fn verifyShared(e: *Engine, parts: []const Part) !void {
     }
     var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
     var f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(.step) else null };
-    f.prof = e.shared_profs[bucket(parts.len)];
+    const rows_by = profByRows();
+    const at = bucket(rows_by, parts.len, rows);
+    f.prof = e.shared_profs[at];
     if (f.prof) |p| {
-        try p.begin(e.stream, labels[bucket(parts.len)]);
-        p.rows += rows;
+        try p.begin(e.stream, if (rows_by) by_rows[at] else by_streams[at]);
+        p.count = if (rows_by) parts.len else rows;
+        p.count_name = if (rows_by) "stream" else "row";
     }
     defer if (f.prof) |p| p.end();
     try f.run(@ptrCast(ids[0..rows]));
@@ -49,9 +64,10 @@ pub fn verifyShared(e: *Engine, parts: []const Part) !void {
     if (f.prof) |p| p.mark(e.stream, .draw);
 }
 
-test "shared window profiles bucket by streams" {
-    try std.testing.expectEqual(@as(usize, 0), bucket(2));
-    try std.testing.expectEqual(@as(usize, 1), bucket(4));
-    try std.testing.expectEqual(@as(usize, 2), bucket(5));
-    try std.testing.expectEqual(@as(usize, 3), bucket(16));
+test "shared window profiles bucket by streams or by rows" {
+    try std.testing.expectEqual(@as(usize, 0), bucket(false, 2, 9));
+    try std.testing.expectEqual(@as(usize, 1), bucket(false, 4, 9));
+    try std.testing.expectEqual(@as(usize, 2), bucket(false, 5, 9));
+    try std.testing.expectEqual(@as(usize, 3), bucket(false, 16, 32));
+    try std.testing.expectEqual(@as(usize, 31), bucket(true, 16, 32));
 }

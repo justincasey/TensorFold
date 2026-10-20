@@ -18,8 +18,9 @@ pub const Prof = struct {
     gpu_ms: f64 = 0,
     wall_ms: f64 = 0,
     calls: u64 = 0,
-    rows: u64 = 0, // this call's rows, when the caller counts them (shared windows): the gpu ms fit by rows
-    fit: [5]f64 = @splat(0), // the counted calls': n, sum rows, sum rows^2, sum gpu ms, sum rows x gpu ms
+    count: u64 = 0, // this call's count of `count_name`s, when the caller counts them: the gpu ms fit by it
+    count_name: []const u8 = "row",
+    fit: [5]f64 = @splat(0), // the counted calls': n, sum count, sum count^2, sum gpu ms, sum count x gpu ms
     label: []const u8 = "",
     every: u64 = 64, // calls a report sums
 
@@ -54,7 +55,7 @@ pub const Prof = struct {
     /// A call begins on `s` (its wall clock and its first event).
     pub fn begin(p: *Prof, s: cuda.Stream, label: []const u8) !void {
         p.n = 0;
-        p.rows = 0;
+        p.count = 0;
         p.open = true;
         p.label = label;
         p.t0 = std.Io.Clock.awake.now(p.io).toNanoseconds();
@@ -81,8 +82,8 @@ pub const Prof = struct {
         p.gpu_ms += gpu;
         p.wall_ms += wall;
         p.calls += 1;
-        if (p.rows > 0) {
-            const x: f64 = @floatFromInt(p.rows);
+        if (p.count > 0) {
+            const x: f64 = @floatFromInt(p.count);
             for (&p.fit, [_]f64{ 1, x, x * x, gpu, x * gpu }) |*s, v| s.* += v;
         }
         if (p.calls % p.every != 0) return;
@@ -93,7 +94,7 @@ pub const Prof = struct {
         const f = p.fit;
         const det = f[0] * f[2] - f[1] * f[1];
         const slope = if (det > 0) (f[0] * f[4] - f[1] * f[3]) / det else 0;
-        if (f[0] > 0) w.print(" rows {d:.1}; fit {d:.1} + {d:.2} a row;", .{ f[1] / f[0], (f[3] - slope * f[1]) / f[0], slope }) catch {};
+        if (f[0] > 0) w.print(" {s}s {d:.1}; fit {d:.1} + {d:.2} a {s};", .{ p.count_name, f[1] / f[0], (f[3] - slope * f[1]) / f[0], slope, p.count_name }) catch {};
         for (names, p.sections) |nm, ms| if (ms > 0) w.print(" {s} {d:.2}", .{ nm, ms / k }) catch {};
         std.log.info("{s}", .{w.buffered()});
         p.sections = @splat(0);

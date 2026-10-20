@@ -193,6 +193,7 @@ pub const Engine = struct {
         };
         if (prof_mod.Prof.wanted()) for (&e.shared_profs) |*p| {
             p.* = try prof_mod.Prof.init(d, io);
+            if (shared_verify.profByRows()) p.*.?.every = 16; // 32 widths share the calls
         };
         e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
         errdefer e.shared_buf.free();
