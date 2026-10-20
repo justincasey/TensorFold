@@ -55,10 +55,49 @@ pub fn fillTogether(e: *Engine, ss: []const *Stream, hooks: []const ?be.Committe
     _ = e.arena.reset(.retain_capacity);
     if (!try many(e.backend.ptr, ss)) return false;
     for (ss) |s| try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
-    for (ss, hooks, errs) |s, hook, *x| openedCommitted(e, s, .rule, hook) catch |err| { // cancelled in the pass: no first token
-        x.* = err;
-    };
+    if (!(e.backend.first_before_draft and e.cfg.family_mtp and e.cfg.draft_streams)) {
+        for (ss, hooks, errs) |s, hook, *x| openedCommitted(e, s, .rule, hook) catch |err| { // cancelled in the pass
+            x.* = err;
+        };
+        return true;
+    }
+    try openedTogether(e, ss, hooks, errs);
     return true;
+}
+
+/// Every stream's first token handed off, then one draft call asks every drafting stream's first drafts.
+fn openedTogether(e: *Engine, ss: []const *Stream, hooks: []const ?be.Committed, errs: []?anyerror) !void {
+    const early = @import("open_first.zig");
+    try e.live.ensureUnusedCapacity(e.gpa, ss.len);
+    var reqs: [max_together]be.DraftRequest = undefined;
+    var who: [max_together]usize = undefined;
+    var k: usize = 0;
+    for (ss, hooks, errs, 0..) |s, hook, *x, i| {
+        if (!s.drafts) {
+            openedCommitted(e, s, .rule, hook) catch |err| {
+                x.* = err;
+            };
+            continue;
+        }
+        const depth = early.first(e, s, .rule, hook) catch |err| {
+            x.* = err;
+            continue;
+        } orelse continue;
+        reqs[k] = early.request(s, depth);
+        who[k] = i;
+        k += 1;
+    }
+    if (k == 0) return;
+    e.backend.draft(reqs[0..k]) catch |err| {
+        for (who[0..k]) |i| {
+            if (err == error.Cancelled) e.release(ss[i]);
+            errs[i] = err;
+        }
+        return;
+    };
+    for (reqs[0..k], who[0..k]) |r, i| early.drafted(e, ss[i], r.depth) catch |err| {
+        errs[i] = err;
+    };
 }
 
 fn addEach(e: *Engine, ss: []const *Stream, errs: []?anyerror) void {

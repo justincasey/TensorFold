@@ -56,7 +56,7 @@ pub const Lanes = struct {
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
     fill_layers: usize = 0, // a prompt chunk's layers a group with other streams held (TF_GLM_FILL_LAYERS; 0: whole)
     aside: bool = false, // a short chunk may start on Engine.bq while another holds Engine.bp (TF_GLM_FILL_ASIDE)
-    batch: bool = false, // fresh short prompts in one prompt pass (TF_GLM_BATCH_FILL=1, cuda_lanes_batch)
+    batch: bool = false, // fresh short prompts in one prompt pass (cuda_lanes_batch; TF_GLM_BATCH_FILL=0: off)
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,

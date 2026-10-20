@@ -218,8 +218,8 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
     // TF_GLM_FILL_LAYERS (rank 0): a chunk's layers a group while others decode (0: whole); TF_GLM_FILL_ASIDE=0: no bq
     const fill_layers = if (std.c.getenv("TF_GLM_FILL_LAYERS")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadFillLayers else glm_lanes.default_fill_layers;
-    const batch = std.mem.eql(u8, std.mem.span(std.c.getenv("TF_GLM_BATCH_FILL") orelse "0"), "1"); // short prompts in one pass
-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .fill_layers = fill_layers, .aside = !off("TF_GLM_FILL_ASIDE"), .batch = batch };
+    // TF_GLM_BATCH_FILL=0: each fresh short prompt fills alone (no prompts in one pass)
+    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .fill_layers = fill_layers, .aside = !off("TF_GLM_FILL_ASIDE"), .batch = !off("TF_GLM_BATCH_FILL") };
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),

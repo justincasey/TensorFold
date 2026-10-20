@@ -71,7 +71,8 @@ fn run(cases: []const Case, mode: Mode, record: bool) ![][]u32 {
     recorder.floor = 0;
     defer recorder.deinit();
     if (mode.planted) |p| recorder.space.symLink(io, p[0], p[1], .{}) catch |e| return if (e == error.PermissionDenied and @import("builtin").os.tag == .windows) error.SkipZigTest else e; // symlinks need privilege on Windows
-    const inner = if (mode.batched) target.batched() else if (mode.chunks > 0) target.stepped() else target.backend();
+    var inner = if (mode.batched) target.batched() else if (mode.chunks > 0) target.stepped() else target.backend();
+    inner.first_before_draft = mode.together; // together: first tokens out before one draft call for every stream
     var recorded = try rec.Recorded.init(inner, &recorder);
     var clock: fake.FixedClock = .{};
     var engine = Engine.init(gpa, &cfg, if (record) recorded.backend() else inner, clock.clock());

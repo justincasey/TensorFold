@@ -34,7 +34,7 @@ pub fn held(h: *const LaneHost) ?usize {
 /// The next filling job's next prompt step: the other streams' rounds run between steps, not after the prompt.
 pub fn one(h: *LaneHost) void {
     if (h.filling.items.len == 0) return;
-    if (together(h)) return;
+    if (gathers(h) or together(h)) return;
     var at = next(h);
     var job = h.filling.items[at];
     var done = false;
@@ -64,6 +64,24 @@ pub fn one(h: *LaneHost) void {
     _ = h.filling.orderedRemove(at);
     h.prefilled(job, job.began);
     _ = h.deliver(job);
+}
+
+/// An idle engine's fresh fills wait for others sent with them while the last arrived within this (a batching backend)
+pub const gather_quiet_ns: i96 = 10 * std.time.ns_per_ms;
+/// and the first within this.
+pub const gather_ns: i96 = 60 * std.time.ns_per_ms;
+
+fn gathers(h: *LaneHost) bool {
+    if (!h.core.batchesPrompts() or h.core.activeCount() != 0) return false;
+    var first: i96 = std.math.maxInt(i96);
+    var last: i96 = 0;
+    for (h.filling.items) |j| {
+        if (j.fill_began or j.request.background) return false;
+        first = @min(first, j.began);
+        last = @max(last, j.began);
+    }
+    const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+    return now - last < gather_quiet_ns and now - first < gather_ns;
 }
 
 fn shorter(_: void, a: *Job, b: *Job) bool {

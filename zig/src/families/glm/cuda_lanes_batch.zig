@@ -1,4 +1,4 @@
-//! TF_GLM_BATCH_FILL=1: fresh short prompts in one prompt pass (cuda_batch), each stream's first token held for it.
+//! Fresh short prompts in one prompt pass (cuda_batch; TF_GLM_BATCH_FILL=0: off), each stream's first token held.
 
 const std = @import("std");
 const lanes = @import("lanes");

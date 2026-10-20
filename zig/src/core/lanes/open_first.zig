@@ -11,11 +11,21 @@ const str = trail.str;
 const int = trail.int;
 
 pub fn opened(e: *Engine, s: *Stream, reach: open.Reach, hook: ?be.Committed) !void {
+    try e.live.ensureUnusedCapacity(e.gpa, 1);
+    const depth = try first(e, s, reach, hook) orelse return;
+    e.backend.draft(&.{request(s, depth)}) catch |err| {
+        if (err == error.Cancelled) e.release(s);
+        return err;
+    };
+    try drafted(e, s, depth);
+}
+
+/// `opened` to its first drafts: the first token committed and handed off; their depth, or null when it finished.
+pub fn first(e: *Engine, s: *Stream, reach: open.Reach, hook: ?be.Committed) !?u32 {
     if (s.isCancelled()) {
         e.backend.release(s);
         return error.Cancelled;
     }
-    try e.live.ensureUnusedCapacity(e.gpa, 1);
     s.context.shrinkRetainingCapacity(s.prompt_len);
     s.rows.clearRetainingCapacity();
     s.pending = null;
@@ -42,7 +52,7 @@ pub fn opened(e: *Engine, s: *Stream, reach: open.Reach, hook: ?be.Committed) !v
             try trail.finish(e, s);
         }
         if (hook) |h| h.call(h.ptr);
-        return;
+        return null;
     }
     try trail.resolve(e);
     if (hook) |h| h.call(h.ptr);
@@ -50,15 +60,21 @@ pub fn opened(e: *Engine, s: *Stream, reach: open.Reach, hook: ?be.Committed) !v
         e.release(s);
         return error.Cancelled;
     }
-    e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = .{ .value = value }, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = depth }}) catch |err| {
-        if (err == error.Cancelled) e.release(s);
-        return err;
-    };
+    return depth;
+}
+
+/// The first drafts' request after `first` (its pending token, `depth` drafts).
+pub fn request(s: *Stream, depth: u32) be.DraftRequest {
+    return .{ .stream = s, .follow = &.{}, .first = .{ .value = s.pending.? }, .rows = null, .start = s.prompt_len, .position = s.prompt_len + 1, .depth = depth };
+}
+
+/// `opened` after its first drafts were asked: the stream joins the rounds (live has room for it).
+pub fn drafted(e: *Engine, s: *Stream, depth: u32) !void {
     s.dropHeld(e.gpa);
     s.next = .{ .count = depth };
     if (e.backend.vtable.tree) |tree| if (try tree(e.backend.ptr, s, e.gpa)) |held| {
         s.next = held;
     };
-    try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(depth)), f("position", int(position + 1)), f("follow", .{ .u32s = &.{value} }), f("rows", .null) });
+    try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(depth)), f("position", int(s.prompt_len + 1)), f("follow", .{ .u32s = &.{s.pending.?} }), f("rows", .null) });
     e.live.appendAssumeCapacity(s);
 }
