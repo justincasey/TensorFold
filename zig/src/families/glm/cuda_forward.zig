@@ -358,12 +358,14 @@ pub const Forward = struct {
         try glue.streamMean(f.set(), f.stream, r.b.x + lo * c.hc * c.hidden * 2, r.b.hidden + lo * c.hidden * 2, hi - lo, c.hidden, c.hc);
     }
 
-    /// overlap.Overlap.glue: each piece's glue once its exchange is in, its rows then shared on the second stream.
+    /// overlap.Overlap.glue: each piece's glue and taps once its exchange is in, its rows then shared on the side.
     pub fn gluePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut: []const [2]usize) !void {
         const c = &f.ranks[0].w.config;
         const D: usize = c.hidden;
         const world = f.ranks[0].w.share.world;
         const last = site == .ffn and j + 1 == f.ranks[0].w.layers.len;
+        const taps: ?taps_mod.Taps = if (site == .ffn) f.taps else null;
+        const tap_rows = taps != null and j == taps_mod.last; // hcsplit.glue: tap rows swapped with the peer's
         var sent: usize = 0;
         for (cut, 0..) |piece, q| {
             const lo = piece[0];
@@ -371,11 +373,13 @@ pub const Forward = struct {
             try f.stream.wait(p.gathered[q]);
             if (!f.splits(n)) {
                 for (f.ranks) |r| try f.glueRows(r, j, site, lo, piece[1], room(r, lo));
+                if (taps) |t| try t.rows(f.stream, j, f.ranks[0].b.x, lo, piece[1]);
                 continue;
             }
             for (f.ranks) |r| {
                 const mine = cuda.rank_scatter.share(n, world, r.w.share.rank);
                 try f.glueRows(r, j, site, lo + mine[0], lo + mine[1], room(r, lo));
+                if (taps) |t| try t.rows(f.stream, j, r.b.x, lo + mine[0], lo + mine[1]); // local ranks: disjoint rows of one buffer
             }
             try p.glues[q].record(f.stream);
             try p.side.wait(p.glues[q]);
@@ -398,7 +402,9 @@ pub const Forward = struct {
             }
             try p.shared[q].record(p.side);
             sent |= @as(usize, 1) << @intCast(q);
+            if (tap_rows) try taps.?.swap(f.exchange, p.side, .{ .world = world, .rank = f.ranks[0].w.share.rank, .n = n }, lo, f.ring);
         }
+        if (tap_rows) try p.tapped.record(p.side);
         for (0..cut.len) |q| if (sent >> @intCast(q) & 1 == 1) try f.stream.wait(p.shared[q]);
     }
 
@@ -414,12 +420,12 @@ pub const Forward = struct {
             for (f.ranks) |r| try f.ffn(r, r.w.layers[j], R, null);
             try f.exchangePieces(p, j, .ffn, cut, 0, 0);
             try f.gluePieces(p, j, .ffn, cut);
-            if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, R);
             switch (layers[j].mixer) {
                 .kda => li += 1,
                 .mla => di += 1,
             }
         }
+        try taps_mod.swapped(f.taps, f.stream, p, lo, hi);
     }
 
     /// forward.forward of `ids`: logits in b.logits; a prompt chunk's KDA layers committed, a window's at `commit`.

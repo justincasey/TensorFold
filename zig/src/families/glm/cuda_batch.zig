@@ -116,11 +116,11 @@ fn layers(e: *Engine, f: *const fw.Forward, segs: []const Seg, R: usize) !void {
         try f.ffn(r, l, R, null);
         try f.exchangePieces(p, j, .ffn, cut[0..q], 0, 0);
         try f.gluePieces(p, j, .ffn, cut[0..q]);
-        if (f.taps) |t| try t.at(f.stream, j, b.x, R);
         switch (l.mixer) {
             .kda => li += 1,
             .mla => di += 1,
         }
     }
+    try @import("cuda_taps.zig").swapped(f.taps, f.stream, p, 0, e.w.layers.len);
     try glue.rmsnorm(f.set(), f.stream, b.hidden, D, e.w.norm, b.fnormed, D, b.fxs, c.eps, R, D);
 }
