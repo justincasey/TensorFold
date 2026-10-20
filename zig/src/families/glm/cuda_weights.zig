@@ -530,17 +530,28 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
     defer L.host.deinit(gpa);
     w.layers = try gpa.alloc(Layer, layers.len);
     if (c.exl3_all) w.xl = try xlin.Runner.init(gpa, d);
-    for (layers, w.layers) |i, *l| {
+    // Layer k+1's bytes are read by 8 threads while layer k loads (page faults alone read one 128 KiB window at a
+    // time, ~0.43 GB/s); after a layer, only its own pages leave the page cache, so at most two layers' stay.
+    var names: [2][96]u8 = undefined;
+    const layerPrefix = struct {
+        fn of(buf: *[96]u8, i: u32) ![]const u8 {
+            return std.fmt.bufPrint(buf, prefix ++ "layers.{d}.", .{i});
+        }
+    }.of;
+    var ahead: ?*core.checkpoint.Prefetch = if (layers.len > 0) try ck.prefetch(gpa, try layerPrefix(&names[0], layers[0])) else null;
+    defer if (ahead) |p| p.join();
+    for (layers, w.layers, 0..) |i, *l, k| {
         if (i >= c.layers) return error.BadLayer;
-        // the layer's bytes read by 8 threads while it loads (one fault window at a time is ~0.43 GB/s): boot ~3x faster
-        const pf = try ck.prefetch(gpa, try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.", .{i}));
-        l.* = L.layer(i) catch |err| {
-            if (pf) |p| p.join();
-            return err;
-        };
-        if (pf) |p| p.join(); // before release: no reader puts back pages it drops
-        ck.release(); // a rank reads about half the checkpoint: its pages would crowd the GPU's allocations out
+        const now = ahead;
+        ahead = null;
+        errdefer if (now) |p| p.join();
+        const mine = try layerPrefix(&names[k % 2], i); // its prefetch copied its spans: the buffer is free again
+        if (k + 1 < layers.len) ahead = try ck.prefetch(gpa, try layerPrefix(&names[(k + 1) % 2], layers[k + 1]));
+        l.* = try L.layer(i);
+        if (now) |p| p.join(); // before release: no reader puts back pages it drops
+        ck.releasePrefix(mine);
     }
+    ck.release(); // a rank reads about half the checkpoint: its pages would crowd the GPU's allocations out
     try L.whole(try L.get("embed_tokens.weight", .{}), .bf16);
     w.embed = try L.put("embed", .{});
     try L.whole(try L.get("norm.weight", .{}), .bf16);

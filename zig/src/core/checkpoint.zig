@@ -143,6 +143,11 @@ pub const Checkpoint = struct {
         for (self.files.items) |*f| f.release();
     }
 
+    /// The pages of every tensor named `prefix`*, out of the page cache (others stay: a prefetch ahead keeps its).
+    pub fn releasePrefix(self: *const Checkpoint, prefix: []const u8) void {
+        for (self.files.items) |*f| if (f.span(prefix)) |s| f.releaseSpan(s[0], s[1]);
+    }
+
     /// Starts parallel read-ahead of every tensor named `prefix`*, in every mapped file (prefetch.zig); null: none.
     /// The caller joins it before `release`, so no reader repopulates pages the release drops.
     pub fn prefetch(self: *const Checkpoint, gpa: std.mem.Allocator, prefix: []const u8) !?*Prefetch {
