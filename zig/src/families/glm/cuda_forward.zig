@@ -162,8 +162,8 @@ pub const Forward = struct {
     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
 
     pub fn set(f: *const Forward) glue.Set {
-        const one = !f.ranks[0].b.prefill and f.ranks[0].segs.len == 0; // a one-sequence verify window: the side stream
-        return .{ .glue = &f.m.glue, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .xl = f.m.xl, .side = if (one) (if (f.m.side) |*sd| sd else null) else null };
+        const window = !f.ranks[0].b.prefill; // a verify window (one sequence's or shared): the side stream
+        return .{ .glue = &f.m.glue, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .xl = f.m.xl, .side = if (window) (if (f.m.side) |*sd| sd else null) else null };
     }
 
     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.

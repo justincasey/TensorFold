@@ -16,11 +16,13 @@ pub const Kernels = struct {
     prep: cuda.Function,
     step: cuda.Function,
     out: cuda.Function,
+    prep_segs: cuda.Function,
+    step_segs: cuda.Function,
     chunk: ?Chunk = null, // prompt chunks in chunked (WY) form (Modules.load), else the three-kernel chain
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
-        inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "out" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
+        inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "out", "prep_segs", "step_segs" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
         k.chunk = null;
         return k;
     }
@@ -149,6 +151,58 @@ pub fn chain(ks: *const Kernels, stream: cuda.Stream, c: Chain, rows: usize, s: 
     a.add(@as(c_int, @intCast(rows)));
     for ([_]u64{ s.out, s.state_out, s.k, s.v, s.g, s.b }) |v| a.add(v);
     try cuda.launch.launch(ks.chain, .{ .grid = .{ .x = @intCast(c.heads) }, .block = .{ .x = 1024 } }, stream, &a);
+}
+
+/// The segments a shared window's chain takes at most (glm_kda.cu's MAX_SEGS).
+pub const max_segs = 16;
+
+/// glm_kda.cu's Segs: each segment's rows (one stream's) and its sequence's conv window, states, saves and kept rows.
+pub const Segs = extern struct {
+    n: c_int = 0,
+    row0: [max_segs]c_int = @splat(0),
+    rows: [max_segs]c_int = @splat(0),
+    cs: [max_segs]u64 = @splat(0),
+    state_in: [max_segs]u64 = @splat(0),
+    state_out: [max_segs]u64 = @splat(0),
+    keep: [max_segs]u64 = @splat(0),
+    k: [max_segs]u64 = @splat(0),
+    v: [max_segs]u64 = @splat(0),
+    g: [max_segs]u64 = @splat(0),
+    b: [max_segs]u64 = @splat(0),
+};
+
+/// chain's kernels over a shared window (c's p, a, g by window row; each segment's own conv window and states).
+pub fn chainSegs(ks: *const Kernels, stream: cuda.Stream, c: Chain, segs: *const Segs, rows: usize, out: u64, w: Wide) !void {
+    if (segs.n < 1 or segs.n > max_segs) return error.BadSegments;
+    const h: c_int = @intCast(c.heads);
+    var a: cuda.Args = .{};
+    a.add(segs.*);
+    a.add(h);
+    a.add(c.p);
+    a.add(@as(c_int, @intCast(c.p_stride)));
+    a.add(@as(c_int, @intCast(c.b_off)));
+    a.add(c.a);
+    a.add(@as(c_int, @intCast(c.a_stride)));
+    for ([_]u64{ c.conv_w, c.a_log, c.dt_bias }) |v| a.add(v);
+    a.add(c.lower);
+    a.add(w.q);
+    const grid: cuda.launch.Dim3 = .{ .x = @intCast(rows), .y = @intCast(c.heads) };
+    try cuda.launch.launch(ks.prep_segs, .{ .grid = grid, .block = .{ .x = 512 } }, stream, &a);
+    var b: cuda.Args = .{};
+    b.add(segs.*);
+    b.add(h);
+    b.add(w.q);
+    b.add(w.y);
+    try cuda.launch.launch(ks.step_segs, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / 8, .z = @intCast(segs.n) }, .block = .{ .x = 8 * 32 } }, stream, &b);
+    var o: cuda.Args = .{};
+    o.add(h);
+    o.add(w.y);
+    o.add(c.g);
+    o.add(@as(c_int, @intCast(c.g_stride)));
+    o.add(c.norm_w);
+    o.add(c.eps);
+    o.add(out);
+    try cuda.launch.launch(ks.out, .{ .grid = grid, .block = .{ .x = dv } }, stream, &o);
 }
 
 /// kda.replay: the state after the first `rows` saved rows, from state_in.

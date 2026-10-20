@@ -81,6 +81,27 @@ pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales
     try merge(set, stream, p, out, dummy, rows, heads, lw, nch, false);
 }
 
+/// glm_glue_attn.cuh's GlmAttnSegs: each segment's first row, position (i32 on device), cache and scales; lc 0: skip.
+pub const Segs = extern struct {
+    n: c_int = 0,
+    row0: [16]c_int = @splat(0),
+    pos: [16]u64 = @splat(0),
+    lc: [16]u64 = @splat(0),
+    ls: [16]u64 = @splat(0),
+};
+
+/// attention over a shared window's `rows` rows, each segment's on its own cache (decode head block, `nch` chunks).
+pub fn attentionSegs(set: glue.Set, stream: cuda.Stream, segs: *const Segs, fp8: bool, qa: u64, p: Partials, out: u64, dummy: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32) !void {
+    if (lw != 512) return error.LatentShape;
+    if (segs.n < 1 or segs.n > 16) return error.BadSegments;
+    var a: cuda.Args = .{};
+    inline for (.{ segs.*, qa, p.po, p.pm, p.pl, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), scale }) |v| a.add(v);
+    const f = if (fp8) set.glue.chunks8_16s else set.glue.chunks_16s;
+    const shared = if (fp8) glue.chunksSmem8(heads_tile) else glue.chunksSmem(heads_tile);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, heads_tile), .z = @intCast(nch) }, .block = .{ .x = 256 }, .shared = shared }, stream, &a);
+    try merge(set, stream, p, out, dummy, rows, heads, lw, nch, false);
+}
+
 /// latent._dense_chunks (sparse false: keys through pos + r) and _sparse_chunks (row r's `counts` tokens of `tokens`).
 fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, pos: u64, tokens: u64, counts: u64, p: Partials, rows: usize, heads: usize, lw: usize, nch: usize, w: usize, scale: f32, hb: usize, sparse: bool) !void {
     if (lw != 512) return error.LatentShape;

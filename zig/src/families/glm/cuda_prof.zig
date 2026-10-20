@@ -18,6 +18,8 @@ pub const Prof = struct {
     gpu_ms: f64 = 0,
     wall_ms: f64 = 0,
     calls: u64 = 0,
+    rows: u64 = 0, // this call's rows, when the caller counts them (shared windows): the gpu ms fit by rows
+    fit: [5]f64 = @splat(0), // the counted calls': n, sum rows, sum rows^2, sum gpu ms, sum rows x gpu ms
     label: []const u8 = "",
     every: u64 = 64, // calls a report sums
 
@@ -52,6 +54,7 @@ pub const Prof = struct {
     /// A call begins on `s` (its wall clock and its first event).
     pub fn begin(p: *Prof, s: cuda.Stream, label: []const u8) !void {
         p.n = 0;
+        p.rows = 0;
         p.open = true;
         p.label = label;
         p.t0 = std.Io.Clock.awake.now(p.io).toNanoseconds();
@@ -74,20 +77,78 @@ pub const Prof = struct {
         if (p.n == 0) return;
         p.events[p.n].synchronize() catch return;
         for (0..p.n) |i| p.sections[@backingInt(p.ends[i])] += cuda.Event.elapsedMs(p.events[i], p.events[i + 1]) catch 0;
-        p.gpu_ms += cuda.Event.elapsedMs(p.events[0], p.events[p.n]) catch 0;
+        const gpu = cuda.Event.elapsedMs(p.events[0], p.events[p.n]) catch 0;
+        p.gpu_ms += gpu;
         p.wall_ms += wall;
         p.calls += 1;
+        if (p.rows > 0) {
+            const x: f64 = @floatFromInt(p.rows);
+            for (&p.fit, [_]f64{ 1, x, x * x, gpu, x * gpu }) |*s, v| s.* += v;
+        }
         if (p.calls % p.every != 0) return;
         const k: f64 = @floatFromInt(p.calls);
         var buf: [512]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         w.print("glm prof {s} ({d} calls): wall {d:.2} ms, gpu {d:.2} ms a call;", .{ p.label, p.calls, p.wall_ms / k, p.gpu_ms / k }) catch {};
+        const f = p.fit;
+        const det = f[0] * f[2] - f[1] * f[1];
+        const slope = if (det > 0) (f[0] * f[4] - f[1] * f[3]) / det else 0;
+        if (f[0] > 0) w.print(" rows {d:.1}; fit {d:.1} + {d:.2} a row;", .{ f[1] / f[0], (f[3] - slope * f[1]) / f[0], slope }) catch {};
         for (names, p.sections) |nm, ms| if (ms > 0) w.print(" {s} {d:.2}", .{ nm, ms / k }) catch {};
         std.log.info("{s}", .{w.buffered()});
         p.sections = @splat(0);
         p.gpu_ms = 0;
         p.wall_ms = 0;
+        p.fit = @splat(0);
         p.calls = 0;
+    }
+};
+
+/// TF_GLM_PROF=1: shared rounds' host wall time by backend call (verify, draft, keep) and the lane core's between.
+pub const Rounds = struct {
+    on: ?bool = null,
+    shared: bool = false, // the calls since the last verify belong to a shared round
+    last: i96 = 0, // when the last timed call ended (0: none this round yet)
+    ms: [4]f64 = @splat(0),
+    rounds: u64 = 0,
+    streams: u64 = 0,
+
+    pub const Call = enum { verify, draft, keep };
+    const what = [_][]const u8{ "verify", "draft", "keep", "between" };
+
+    /// A verify of `streams` windows starts a round: a report every 64 shared rounds.
+    pub fn round(r: *Rounds, streams: usize) void {
+        if (r.on == null) r.on = Prof.wanted();
+        r.shared = r.on.? and streams > 1;
+        if (!r.shared) {
+            r.last = 0;
+            return;
+        }
+        if (r.rounds == 64) {
+            var buf: [256]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            w.print("glm rounds (64 shared, {d:.1} streams): ms a round", .{@as(f64, @floatFromInt(r.streams)) / 64}) catch {};
+            for (what, r.ms) |nm, v| w.print(" {s} {d:.2}", .{ nm, v / 64 }) catch {};
+            std.log.info("{s}", .{w.buffered()});
+            r.* = .{ .on = true, .shared = true, .last = r.last };
+        }
+        r.rounds += 1;
+        r.streams += streams;
+    }
+
+    /// A backend call starts (null: not timed); the lane core's time since the last call ended counts as between.
+    pub fn begin(r: *Rounds, io: std.Io) ?i96 {
+        if (!r.shared) return null;
+        const now = std.Io.Clock.awake.now(io).toNanoseconds();
+        if (r.last != 0) r.ms[3] += @as(f64, @floatFromInt(now - r.last)) / 1e6;
+        return now;
+    }
+
+    pub fn end(r: *Rounds, io: std.Io, call: Call, t0: ?i96) void {
+        const t = t0 orelse return;
+        const now = std.Io.Clock.awake.now(io).toNanoseconds();
+        r.ms[@backingInt(call)] += @as(f64, @floatFromInt(now - t)) / 1e6;
+        r.last = now;
     }
 };
 

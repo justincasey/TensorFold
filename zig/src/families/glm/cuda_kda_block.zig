@@ -69,9 +69,17 @@ pub fn project(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
 
 /// The chain over `rows` projected rows (s.p, s.ka, s.kg) on one sequence's conv window and recurrent state.
 pub fn chainRows(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt: bool) !void {
-    const n = l.heads * kda.dk;
-    const fa = 3 * n;
-    const c: kda.Chain = .{ .p = s.p, .p_stride = l.width(), .b_off = fa + 2 * kda.dk, .a = s.ka, .a_stride = n, .g = s.kg, .g_stride = n, .conv_state = conv_state, .conv_w = l.conv_w, .state_in = state_in, .a_log = l.a_log, .dt_bias = l.dt_bias, .norm_w = l.norm_w, .eps = l.eps, .lower = l.lower, .heads = l.heads };
+    const c = chainOf(l, s, conv_state, state_in);
     if (prompt) if (ks.chunk) |*ck| return ck.run(stream, c, rows, s.saves); // a prompt chunk commits whole: no saves
     try kda.chain(ks, stream, c, rows, s.saves, if (wide or rows >= kda.wide_rows) s.wide else null);
+}
+
+/// The three-kernel chain over a shared window's `rows` rows (s.p, s.ka, s.kg, s.saves.out by row), on `segs`.
+pub fn chainSegs(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, segs: *const kda.Segs, rows: usize) !void {
+    try kda.chainSegs(ks, stream, chainOf(l, s, 0, 0), segs, rows, s.saves.out, s.wide);
+}
+
+fn chainOf(l: Layer, s: Scratch, conv_state: u64, state_in: u64) kda.Chain {
+    const fa = 3 * l.heads * kda.dk;
+    return .{ .p = s.p, .p_stride = l.width(), .b_off = fa + 2 * kda.dk, .a = s.ka, .a_stride = l.heads * kda.dk, .g = s.kg, .g_stride = l.heads * kda.dk, .conv_state = conv_state, .conv_w = l.conv_w, .state_in = state_in, .a_log = l.a_log, .dt_bias = l.dt_bias, .norm_w = l.norm_w, .eps = l.eps, .lower = l.lower, .heads = l.heads };
 }

@@ -236,14 +236,14 @@ pub const Leader = struct {
         try x.e.draft(from_prompt, follow_ids, depth, out);
     }
 
-    /// DFlash2's round on every rank (Engine.draftBlock): each stream's slot, kept rows and anchor.
-    pub fn block(x: Leader, reqs: []dflash.Req) !void {
-        if (reqs.len == 0 or reqs.len > dflash.MAX_S) return error.TooManyStreams;
+    /// DFlash2's round on every rank (Engine.draftBlock), each stream's last verify committed first (`keeps`, 0: none).
+    pub fn block(x: Leader, reqs: []dflash.Req, keeps: []const u32) !void {
+        if (reqs.len == 0 or reqs.len > dflash.MAX_S or keeps.len != reqs.len) return error.TooManyStreams;
         try x.flush();
-        var buf: [3 * dflash.MAX_S]u32 = undefined;
-        for (reqs, 0..) |q, i| buf[3 * i ..][0..3].* = .{ q.slot, @intCast(q.n), q.anchor };
-        try x.send(.{ .kind = @backingInt(Kind.block), .depth = @intCast(reqs.len) }, buf[0 .. 3 * reqs.len]);
-        try x.e.draftBlock(reqs);
+        var buf: [4 * dflash.MAX_S]u32 = undefined;
+        for (reqs, keeps, 0..) |q, n, i| buf[4 * i ..][0..4].* = .{ q.slot, @intCast(q.n), q.anchor, n };
+        try x.send(.{ .kind = @backingInt(Kind.block), .depth = @intCast(reqs.len) }, buf[0 .. 4 * reqs.len]);
+        try keepThen(x.e, reqs, keeps);
     }
 
     /// The other ranks leave their loops.
@@ -251,6 +251,15 @@ pub const Leader = struct {
         try x.send(.{ .kind = @backingInt(Kind.end) }, &.{});
     }
 };
+
+/// Each stream's last verify committed (its `keeps` rows), then the block round (every rank alike).
+fn keepThen(e: *Engine, reqs: []dflash.Req, keeps: []const u32) !void {
+    for (reqs, keeps) |q, n| if (n > 0) {
+        try e.bind(q.slot);
+        try e.keep(n);
+    };
+    try e.draftBlock(reqs);
+}
 
 /// A rank other than 0 runs rank 0's steps until it ends; a cancelled prefill is error.Cancelled and the loop goes on.
 pub fn follow(e: *Engine, link: *Link) !void {
@@ -309,10 +318,14 @@ pub fn follow(e: *Engine, link: *Link) !void {
             },
             .block => {
                 const k = h.depth;
-                if (k == 0 or k > dflash.MAX_S or step.ids.len != 3 * k) return error.BadStep;
+                if (k == 0 or k > dflash.MAX_S or step.ids.len != 4 * k) return error.BadStep;
                 var reqs: [dflash.MAX_S]dflash.Req = undefined;
-                for (reqs[0..k], 0..) |*q, i| q.* = .{ .slot = step.ids[3 * i], .pos = 0, .n = step.ids[3 * i + 1], .anchor = step.ids[3 * i + 2] };
-                try e.draftBlock(reqs[0..k]);
+                var keeps: [dflash.MAX_S]u32 = undefined;
+                for (reqs[0..k], keeps[0..k], 0..) |*q, *n, i| {
+                    q.* = .{ .slot = step.ids[4 * i], .pos = 0, .n = step.ids[4 * i + 1], .anchor = step.ids[4 * i + 2] };
+                    n.* = step.ids[4 * i + 3];
+                }
+                try keepThen(e, reqs[0..k], keeps[0..k]);
             },
             .image => {
                 const v = e.images orelse return error.NoVision; // the ranks agreed on --vision (cuda_ranks)

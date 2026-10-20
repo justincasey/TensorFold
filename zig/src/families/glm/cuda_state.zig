@@ -137,7 +137,8 @@ pub const Buffers = struct {
         const lw: usize = c.kv_lora;
         const part_rows = if (prefill) @min(rows, dsa_block.prompt_att_rows) else seg;
         const nch = latent.chunksFor(@min(capacity, dense_reach) + seg);
-        const partial_rows = @max(nch, latent.chunksFor(sparse.width)) * part_rows; // dense and sparse calls of part_rows rows
+        const att_rows = if (!prefill and seg < rows) rows else part_rows; // a shared window's dense pass takes every row
+        const partial_rows = @max(nch, latent.chunksFor(sparse.width)) * att_rows; // dense and sparse calls
         const np_max = capacity / sparse.pool;
         var mm: usize = 4;
         // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)

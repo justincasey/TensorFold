@@ -6,6 +6,7 @@ const engine = @import("cuda_engine.zig");
 const follow = @import("cuda_follow.zig");
 const fw = @import("cuda_forward.zig");
 const dflash = @import("dflash.zig");
+const prof_mod = @import("cuda_prof.zig");
 
 const be = lanes.backend;
 
@@ -49,6 +50,7 @@ pub const Lanes = struct {
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
+    clock: prof_mod.Rounds = .{}, // TF_GLM_PROF=1: shared rounds' host time by call
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
 
@@ -307,6 +309,9 @@ pub const Lanes = struct {
     /// Each window in its own forward on its stream's sequence (the core sends one when no forward is shared).
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const self = of(ptr);
+        self.clock.round(windows.len);
+        const t0 = self.clock.begin(self.x.e.io);
+        defer self.clock.end(self.x.e.io, .verify, t0);
         if (windows.len > 1) return self.verifyShared(windows, out);
         for (windows, out) |w, *o| {
             if (w.parents != null) return error.TreesNotBuilt;
@@ -361,6 +366,8 @@ pub const Lanes = struct {
 
     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
         const self = of(ptr);
+        const t0 = self.clock.begin(self.x.e.io);
+        defer self.clock.end(self.x.e.io, .keep, t0);
         for (windows, paths) |w, path| {
             if (path.len == 0) return error.EmptyPath;
             for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
@@ -370,6 +377,8 @@ pub const Lanes = struct {
 
     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const self = of(ptr);
+        const t0 = self.clock.begin(self.x.e.io);
+        defer self.clock.end(self.x.e.io, .draft, t0);
         if (self.x.e.drafter != null) return self.draftBlock(requests);
         if (!self.x.e.mtp) return error.NoDraftHead;
         for (requests) |r| {
@@ -388,14 +397,18 @@ pub const Lanes = struct {
         }
     }
 
-    /// DFlash2: every request's kept rows committed, then one block round for them all (cuda_follow's block step).
+    /// DFlash2: one block round for every request, each one's kept rows committed first (cuda_follow's block step).
     fn draftBlock(self: *Lanes, requests: []const be.DraftRequest) !void {
         if (requests.len > dflash.MAX_S) return error.TooManyStreams;
         var reqs: [dflash.MAX_S]dflash.Req = undefined;
+        var keeps: [dflash.MAX_S]u32 = undefined;
         var held: [dflash.MAX_S]*Lane = undefined;
         for (requests, 0..) |r, i| {
-            const l = try self.bind(r.stream, if (r.rows) |rows| rows.len else null);
-            if (r.position != self.x.e.pos() + 1) return error.PositionMismatch;
+            const l = self.lanes.getPtr(r.stream) orelse return error.UnknownStream;
+            const kept: usize = if (l.pending_rows) |rows| (if (r.rows) |rr| rr.len else rows) else 0;
+            l.pending_rows = null;
+            const seq = (if (l.slot < self.x.e.seqs.items.len) self.x.e.seqs.items[l.slot] else null) orelse return error.UnknownSlot;
+            if (r.position != seq.st.pos + kept + 1) return error.PositionMismatch;
             if (r.lanes != null) return error.TreesNotBuilt;
             var n: usize = 0;
             const anchor = if (r.rows) |rows| a: {
@@ -404,9 +417,10 @@ pub const Lanes = struct {
                 break :a r.follow[rows.len - 1];
             } else self.value(r.first orelse return error.NoFirstToken);
             reqs[i] = .{ .slot = l.slot, .pos = 0, .n = n, .anchor = anchor, .out = &l.held, .probs = &l.chances };
+            keeps[i] = @intCast(kept);
             held[i] = l;
         }
-        try self.x.block(reqs[0..requests.len]);
+        try self.x.block(reqs[0..requests.len], keeps[0..requests.len]);
         const cut = confidence();
         for (requests, held[0..requests.len]) |r, l| {
             l.held_n = @min(r.depth, max_held);

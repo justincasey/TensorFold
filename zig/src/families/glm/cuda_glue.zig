@@ -51,6 +51,8 @@ pub const Kernels = struct {
     chunks_32: cuda.Function,
     chunks8_16: cuda.Function, // the fp8 cache's chunk kernels
     chunks8_32: cuda.Function,
+    chunks_16s: cuda.Function, // a shared window's dense attention, each segment on its own cache
+    chunks8_16s: cuda.Function,
     merge: cuda.Function,
     scores: cuda.Function,
 
@@ -64,6 +66,8 @@ pub const Kernels = struct {
         try k.chunks_32.allowDynamicShared(chunksSmem(32));
         try k.chunks8_16.allowDynamicShared(chunksSmem8(16));
         try k.chunks8_32.allowDynamicShared(chunksSmem8(32));
+        try k.chunks_16s.allowDynamicShared(chunksSmem(16));
+        try k.chunks8_16s.allowDynamicShared(chunksSmem8(16));
         return k;
     }
 };

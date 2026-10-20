@@ -206,20 +206,21 @@ __device__ __forceinline__ void replay_layers_kernel_body(
 
 // Long windows: state-free work batched (prep_kernel, out_kernel), delta rule per row (step_kernel): chain_kernel bits.
 
-// Block (row, head), 512 threads: conv + SiLU of the 3 x 128 q|k|v channels, the decay, beta, then the q/k norms.
+// Block (row r, head), 512 threads: conv + SiLU of q|k|v, decay, beta, q/k norms; `keep` takes r's conv channels.
 __device__ __forceinline__ void prep_kernel_body(
         int H, const __nv_bfloat16* __restrict__ P, int p_stride, int b_off,
         const __nv_bfloat16* __restrict__ A, int a_stride, const __nv_bfloat16* __restrict__ cs,
         const float* __restrict__ cw, const float* __restrict__ a_log, const float* __restrict__ dt_bias,
         float lower, float* __restrict__ q_out, float* __restrict__ k_save, __nv_bfloat16* __restrict__ v_save,
-        float* __restrict__ g_save, float* __restrict__ b_save) {
+        float* __restrict__ g_save, float* __restrict__ b_save, int r, __nv_bfloat16* __restrict__ keep) {
     const int C = 3 * H * DK;
-    const int r = blockIdx.x, h = blockIdx.y;
+    const int h = blockIdx.y;
     const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
     __shared__ float qs[DK], ks[DK];
     const size_t base = ((size_t)r * H + h) * DK;
     if (t < 3 * DK) {
         const int c = (t / DK) * H * DK + h * DK + (t % DK);
+        if (keep != nullptr) keep[(size_t)r * p_stride + c] = P[(size_t)r * p_stride + c];
         float acc = 0.0f;
 #pragma unroll
         for (int tap = 0; tap < TAPS; ++tap) {
@@ -381,6 +382,26 @@ __device__ __forceinline__ void out_kernel_body(
     out[(size_t)r * H * DV + h * DV + t] = __float2bfloat16_rn(yw * sigmoidf_(gate));
 }
 
+// A shared window's segments: each one stream's rows (row0.., rows) on its own conv window, states and saves.
+constexpr int MAX_SEGS = 16;
+struct Segs {
+    int n, row0[MAX_SEGS], rows[MAX_SEGS];
+    const __nv_bfloat16* cs[MAX_SEGS];
+    const float* state_in[MAX_SEGS];
+    float* state_out[MAX_SEGS];
+    __nv_bfloat16* keep[MAX_SEGS];
+    float* k[MAX_SEGS];
+    __nv_bfloat16* v[MAX_SEGS];
+    float* g[MAX_SEGS];
+    float* b[MAX_SEGS];
+};
+
+__device__ __forceinline__ int seg_of(const Segs& s, int row) {
+    int i = 0;
+    while (i + 1 < s.n && row >= s.row0[i + 1]) ++i;
+    return i;
+}
+
 }  // namespace
 
 extern "C" __global__ void __launch_bounds__(1024) tf_glm_kda_chain(
@@ -417,7 +438,22 @@ extern "C" __global__ void __launch_bounds__(512) tf_glm_kda_prep(
         float* __restrict__ k_save, __nv_bfloat16* __restrict__ v_save, float* __restrict__ g_save,
         float* __restrict__ b_save) {
     prep_kernel_body(
-        H, P, p_stride, b_off, A, a_stride, cs, cw, a_log, dt_bias, lower, q_out, k_save, v_save, g_save, b_save);
+        H, P, p_stride, b_off, A, a_stride, cs, cw, a_log, dt_bias, lower, q_out, k_save, v_save, g_save, b_save,
+        blockIdx.x, nullptr);
+}
+
+// prep over a shared window (block x: its row), each row on its segment's conv window, saves and kept rows (whole).
+extern "C" __global__ void __launch_bounds__(512) tf_glm_kda_prep_segs(
+        Segs s, int H, const __nv_bfloat16* __restrict__ P, int p_stride, int b_off,
+        const __nv_bfloat16* __restrict__ A, int a_stride, const float* __restrict__ cw,
+        const float* __restrict__ a_log, const float* __restrict__ dt_bias, float lower, float* __restrict__ q_out) {
+    const int i = seg_of(s, blockIdx.x), r0 = s.row0[i];
+    prep_kernel_body(
+        H, P + (size_t)r0 * p_stride, p_stride, b_off, A + (size_t)r0 * a_stride, a_stride, s.cs[i], cw, a_log,
+        dt_bias, lower, q_out + (size_t)r0 * H * DK, s.k[i], s.v[i], s.g[i], s.b[i], blockIdx.x - r0, s.keep[i]);
+    if (blockIdx.y == 0)  // the row's channels past q|k|v (decay, gate and beta inputs), as a lone window keeps them
+        for (int c = 3 * H * DK + threadIdx.x; c < p_stride; c += blockDim.x)
+            s.keep[i][(size_t)(blockIdx.x - r0) * p_stride + c] = P[(size_t)blockIdx.x * p_stride + c];
 }
 
 extern "C" __global__ void __launch_bounds__(256) tf_glm_kda_step(
@@ -425,6 +461,15 @@ extern "C" __global__ void __launch_bounds__(256) tf_glm_kda_step(
         const __nv_bfloat16* __restrict__ v_save, const float* __restrict__ g_save, const float* __restrict__ b_save,
         int rows, __nv_bfloat16* __restrict__ y_out, float* __restrict__ state_out) {
     step_kernel_body<8, 16>(H, state_in, q_in, k_save, v_save, g_save, b_save, rows, y_out, state_out);
+}
+
+// step over a shared window (block z: its segment), each segment's rows from its own state; q_in, y_out by rows.
+extern "C" __global__ void __launch_bounds__(256) tf_glm_kda_step_segs(
+        Segs s, int H, const float* __restrict__ q_in, __nv_bfloat16* __restrict__ y_out) {
+    const int i = blockIdx.z, r0 = s.row0[i];
+    step_kernel_body<8, 16>(
+        H, s.state_in[i], q_in + (size_t)r0 * H * DK, s.k[i], s.v[i], s.g[i], s.b[i], s.rows[i],
+        y_out + (size_t)r0 * H * DV, s.state_out[i]);
 }
 
 extern "C" __global__ void __launch_bounds__(128) tf_glm_kda_out(

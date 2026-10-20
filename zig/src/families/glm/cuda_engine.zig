@@ -19,6 +19,7 @@ const mm_mod = @import("cuda_mm.zig");
 const dflash = @import("dflash.zig");
 const prof_mod = @import("cuda_prof.zig");
 const decode = @import("cuda_decode.zig");
+const shared_verify = @import("cuda_verify_shared.zig");
 
 pub const Options = @import("cuda_engine_types.zig").Options;
 
@@ -59,6 +60,7 @@ pub const Engine = struct {
     drafter: ?*dflash.Drafter = null, // --drafter: DFlash2 (every rank runs its passes; rank 0 selects the drafts)
     profs: [fw.window_rows]?*prof_mod.Prof = @splat(null), // TF_GLM_PROF=1: verify sections' GPU time, by rows
     prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024, 2048 rows
+    shared_profs: [shared_verify.prof_buckets]?*prof_mod.Prof = @splat(null), // and shared windows', by streams
     checkpoint_digest: [32]u8,
     settings: ranks.Settings,
     m: fw.Modules,
@@ -189,6 +191,9 @@ pub const Engine = struct {
             p.* = try prof_mod.Prof.init(d, io);
             p.*.?.every = 4;
         };
+        if (prof_mod.Prof.wanted()) for (&e.shared_profs) |*p| {
+            p.* = try prof_mod.Prof.init(d, io);
+        };
         e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
         errdefer e.shared_buf.free();
         errdefer @import("cuda_load_owner.zig").drain(stream, d);
@@ -198,7 +203,6 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         e.stream.synchronize() catch {};
-        e.graphs.deinit();
         e.gpa.free(e.packs.ptrs);
         e.gpa.free(e.packs.bits);
         if (e.drafter) |dr| dr.deinit();
@@ -218,6 +222,7 @@ pub const Engine = struct {
         e.bq.deinit();
         for (0..e.seqs.items.len) |i| e.free(i);
         e.seqs.deinit(e.gpa);
+        e.graphs.deinit(); // after the sequences: freeing one clears the graphs
         e.w.deinit();
         e.pieces.deinit();
         e.m.deinit();
@@ -228,17 +233,13 @@ pub const Engine = struct {
     }
 
     fn freeProfs(e: *Engine) void {
-        for (&e.profs) |*p| {
+        for ([_][]?*prof_mod.Prof{ &e.profs, &e.prompt_profs, &e.shared_profs }) |set| for (set) |*p| {
             if (p.*) |v| v.deinit();
             p.* = null;
-        }
-        for (&e.prompt_profs) |*p| {
-            if (p.*) |v| v.deinit();
-            p.* = null;
-        }
+        };
     }
 
-    fn exchange(e: *const Engine) fw.Exchange {
+    pub fn exchange(e: *const Engine) fw.Exchange {
         return .{ .nccl = .{ .lib = e.lib, .comm = e.comm, .group = e.group } };
     }
 
@@ -457,31 +458,8 @@ pub const Engine = struct {
         return l[@min(rows, l.len) - 1];
     }
 
-    /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
-    pub fn verifyShared(e: *Engine, parts: []const Part) !void {
-        const b = if (e.bs) |*x| x else return error.NoSharedWindows;
-        if (parts.len == 0 or parts.len > max_shared) return error.WindowTooWide;
-        var segs: [max_shared]fw.Seg = undefined;
-        var ids: [shared_rows]u32 = undefined;
-        var rows: usize = 0;
-        for (parts, 0..) |p, i| {
-            if (p.ids.len == 0 or p.ids.len > fw.window_rows or rows + p.ids.len > shared_rows) return error.WindowTooWide;
-            for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
-            try e.bind(p.slot);
-            segs[i] = .{ .st = &e.cur.st, .row0 = rows, .rows = p.ids.len };
-            @memcpy(ids[rows..][0..p.ids.len], p.ids);
-            rows += p.ids.len;
-        }
-        var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(.step) else null };
-        try f.run(@ptrCast(ids[0..rows]));
-        if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
-        for (parts, segs[0..parts.len]) |p, g| {
-            try e.bind(p.slot);
-            e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
-            try e.draw(b.logits + g.row0 * e.share.vocab.len() * 2, g.rows, g.st.pos + 1, p.out);
-        }
-    }
+    /// Several streams' windows in one forward (cuda_verify_shared).
+    pub const verifyShared = shared_verify.verifyShared;
 
     /// DFlash2's round (every rank, the same `reqs`): each stream's kept rows into its context, then the block pass.
     pub fn draftBlock(e: *Engine, reqs: []dflash.Req) !void {

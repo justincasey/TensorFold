@@ -105,31 +105,51 @@ pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
 
 /// One sequence's rows r0..r0 + rows at pos: latent and index keys written, dense then sparse attention into s.ol.
 pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, r0: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize) !void {
-    const set = k.set;
+    try write(k.set, stream, l, c, s, r0, rows, pos);
+    if (host_pos < l.dense_limit) try denseAttention(k, stream, l, c, from(l, s, r0), pos, rows, nch, part_rows, scaleOf(l));
+    if (sparseRows(l, host_pos, rows)) try sparseAttend(k, stream, l, c, s, r0, rows, pos, host_pos, part_rows);
+}
+
+/// The query's scale, qk^-0.5.
+pub fn scaleOf(l: Layer) f32 {
+    return @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));
+}
+
+/// The scratch from row r0 (the rows of one sequence in a shared window).
+fn from(l: Layer, s: Scratch, r0: usize) Scratch {
     const ix = l.index;
-    const kw_rows = ix.d + ix.heads;
-    var v = s; // the scratch from row r0
+    var v = s;
     v.lat += r0 * l.lw * 2;
-    v.ikr += r0 * kw_rows * 2;
+    v.ikr += r0 * (ix.d + ix.heads) * 2;
     v.igr += r0 * ix.d * 4;
     v.qa += r0 * l.heads * l.lw * 2;
     v.ol += r0 * l.heads * l.lw * 2;
     v.qi += r0 * ix.heads * ix.d * 2;
+    return v;
+}
+
+/// One sequence's rows r0..r0 + rows at pos: their latent rows and index keys into its caches.
+pub fn write(set: glue.Set, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, r0: usize, rows: usize, pos: u64) !void {
+    const ix = l.index;
+    const v = from(l, s, r0);
     try latent.latentWrite(set, stream, v.lat, l.lw, c.lc, c.ls, pos, rows, l.lw);
-    try sparse.indexUpdate(set, stream, v.ikr, kw_rows, v.igr, ix.ln_w, ix.ln_b, ix.ape, c.ik, c.ig, c.pk, pos, rows);
-    const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));
-    if (host_pos < l.dense_limit) try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale);
-    if (sparseRows(l, host_pos, rows)) {
-        try sparse.selectTokens(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts);
-        // part_rows-row calls (a prompt chunk's partials stay 512 rows deep); each row's sums are its own and every
-        // call keeps the whole call's head block, so the bits are those of one call over all rows
-        const hb = latent.headBlock(rows);
-        var r: usize = 0;
-        while (r < rows) : (r += part_rows) {
-            const n = @min(part_rows, rows - r);
-            const off = r * l.heads * l.lw * 2;
-            try latent.sparseAttention(set, stream, v.qa + off, c.lc, c.ls, v.tokens + r * sparse.width * 4, v.counts + r * 4, sparse.width, v.partials, v.ol + off, n, l.heads, l.lw, scale, hb);
-        }
+    try sparse.indexUpdate(set, stream, v.ikr, ix.d + ix.heads, v.igr, ix.ln_w, ix.ln_b, ix.ape, c.ik, c.ig, c.pk, pos, rows);
+}
+
+/// One sequence's rows past the dense limit: token selection, then sparse attention over its picks into s.ol.
+pub fn sparseAttend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, r0: usize, rows: usize, pos: u64, host_pos: usize, part_rows: usize) !void {
+    const ix = l.index;
+    const kw_rows = ix.d + ix.heads;
+    const v = from(l, s, r0);
+    try sparse.selectTokens(k.set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts);
+    // part_rows-row calls (a prompt chunk's partials stay 512 rows deep); each row's sums are its own and every
+    // call keeps the whole call's head block, so the bits are those of one call over all rows
+    const hb = latent.headBlock(rows);
+    var r: usize = 0;
+    while (r < rows) : (r += part_rows) {
+        const n = @min(part_rows, rows - r);
+        const off = r * l.heads * l.lw * 2;
+        try latent.sparseAttention(k.set, stream, v.qa + off, c.lc, c.ls, v.tokens + r * sparse.width * 4, v.counts + r * 4, sparse.width, v.partials, v.ol + off, n, l.heads, l.lw, scaleOf(l), hb);
     }
 }
 

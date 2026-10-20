@@ -70,10 +70,11 @@ __device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint32_t c, uint32_t sel) {
   return *reinterpret_cast<const uint32_t*>(&b);
 }
 
+// Row r (qa, tokens, partials) of `rows`; a dense row sees keys through `limit`; `live` false: an empty chunk.
 template <int HB, bool FP8>
-__device__ void chunks_wide(const __nv_bfloat16* qa, const void* cache, const int* pos, const int* tok,
+__device__ void chunks_wide(const __nv_bfloat16* qa, const void* cache, int64_t limit, const int* tok,
                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
-                            float scale, int sparse, const float* ls) {
+                            float scale, int sparse, const float* ls, int64_t r, bool on) {
   constexpr int MT = HB / 16;
   extern __shared__ __align__(16) unsigned char smem[];
   __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(smem);
@@ -87,9 +88,9 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const void* cache, const in
   const uint8_t* lc8 = static_cast<const uint8_t*>(cache);
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, q = lane & 3;
   const int kg = warp & 3, hh = warp >> 2;
-  const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
-  const int64_t n = sparse ? cnt[r] : 0, limit = sparse ? 0 : (int64_t)pos[0] + r, start = c * CH;
-  const bool live = sparse ? start < n : start <= limit;
+  const int64_t h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
+  const int64_t n = sparse ? cnt[r] : 0, start = c * CH;
+  const bool live = on && (sparse ? start < n : start <= limit);
   auto load_kv = [&](int tile) {
     const int64_t first = start + tile * KT;
     __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
@@ -294,13 +295,15 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const void* cache, const in
 extern "C" __global__ void __launch_bounds__(256)
     tf_glm_chunks_16(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
-  glm_attn::chunks_wide<16, false>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, nullptr);
+  glm_attn::chunks_wide<16, false>(qa, lc, sparse ? 0 : (int64_t)pos[0] + blockIdx.x, tok, cnt, po, pm, pl, rows, heads,
+                                   w, scale, sparse, nullptr, blockIdx.x, true);
 }
 
 extern "C" __global__ void __launch_bounds__(256)
     tf_glm_chunks_32(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
-  glm_attn::chunks_wide<32, false>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, nullptr);
+  glm_attn::chunks_wide<32, false>(qa, lc, sparse ? 0 : (int64_t)pos[0] + blockIdx.x, tok, cnt, po, pm, pl, rows, heads,
+                                   w, scale, sparse, nullptr, blockIdx.x, true);
 }
 
 // The fp8 cache's forms (--kv-cache fp8): e4m3 codes `lc` [cap][512] and their row scales `ls`, wide_smem<HB, true>().
@@ -308,14 +311,48 @@ extern "C" __global__ void __launch_bounds__(256)
     tf_glm_chunks8_16(const __nv_bfloat16* qa, const uint8_t* lc, const int* pos, const int* tok, const int* cnt,
                       float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse,
                       const float* ls) {
-  glm_attn::chunks_wide<16, true>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, ls);
+  glm_attn::chunks_wide<16, true>(qa, lc, sparse ? 0 : (int64_t)pos[0] + blockIdx.x, tok, cnt, po, pm, pl, rows, heads,
+                                  w, scale, sparse, ls, blockIdx.x, true);
 }
 
 extern "C" __global__ void __launch_bounds__(256)
     tf_glm_chunks8_32(const __nv_bfloat16* qa, const uint8_t* lc, const int* pos, const int* tok, const int* cnt,
                       float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse,
                       const float* ls) {
-  glm_attn::chunks_wide<32, true>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, ls);
+  glm_attn::chunks_wide<32, true>(qa, lc, sparse ? 0 : (int64_t)pos[0] + blockIdx.x, tok, cnt, po, pm, pl, rows, heads,
+                                  w, scale, sparse, ls, blockIdx.x, true);
+}
+
+// A shared window's dense attention: each segment's rows (row0..) on its own cache and position; lc 0: skipped.
+struct GlmAttnSegs {
+  int n, row0[16];
+  const int* pos[16];
+  const void* lc[16];
+  const float* ls[16];
+};
+
+template <bool FP8>
+__device__ __forceinline__ void chunks_segs(const GlmAttnSegs& s, const __nv_bfloat16* qa, float* po, float* pm,
+                                            float* pl, int64_t rows, int64_t heads, float scale) {
+  const int r = blockIdx.x;
+  int i = 0;
+  while (i + 1 < s.n && r >= s.row0[i + 1]) ++i;
+  const bool on = s.lc[i] != nullptr;
+  const int64_t limit = on ? (int64_t)s.pos[i][0] + (r - s.row0[i]) : 0;
+  glm_attn::chunks_wide<16, FP8>(qa, s.lc[i], limit, nullptr, nullptr, po, pm, pl, rows, heads, 0, scale, 0, s.ls[i], r,
+                                 on);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks_16s(GlmAttnSegs s, const __nv_bfloat16* qa, float* po, float* pm, float* pl, int64_t rows,
+                      int64_t heads, float scale) {
+  chunks_segs<false>(s, qa, po, pm, pl, rows, heads, scale);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks8_16s(GlmAttnSegs s, const __nv_bfloat16* qa, float* po, float* pm, float* pl, int64_t rows,
+                       int64_t heads, float scale) {
+  chunks_segs<true>(s, qa, po, pm, pl, rows, heads, scale);
 }
 
 // latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.
