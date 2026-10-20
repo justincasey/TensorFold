@@ -466,10 +466,10 @@ pub const Lanes = struct {
         }
     }
 
-    /// TF_GLM_DRAFT_CONFIDENCE: where a DFlash2 chain's chance product stops it (glm_cuda's 0.7).
+    /// TF_GLM_DRAFT_CONFIDENCE: where a DFlash2 chain's chance product stops it (0.6; glm_cuda's 0.7).
     fn confidence() f64 {
-        const v = std.c.getenv("TF_GLM_DRAFT_CONFIDENCE") orelse return 0.7;
-        return std.fmt.parseFloat(f64, std.mem.span(v)) catch 0.7;
+        const v = std.c.getenv("TF_GLM_DRAFT_CONFIDENCE") orelse return 0.6;
+        return std.fmt.parseFloat(f64, std.mem.span(v)) catch 0.6;
     }
 
     /// DFlash2's chance for each held draft (the MTP head gives none: the lane core's per-depth rates stand).
