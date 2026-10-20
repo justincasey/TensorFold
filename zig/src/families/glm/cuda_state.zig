@@ -17,6 +17,8 @@ const kda_block = @import("cuda_kda_block.zig");
 
 /// A prompt chunk's rows: 4,096 (each routed expert's weights read once for 4,096 rows).
 pub const prefill_rows = 4096;
+/// A short prompt chunk's rows at most on the aside buffers (Engine.bq), while a chunk between layer groups holds bp.
+pub const aside_rows = 512;
 /// A decode window's rows (Engine's max_rows).
 pub const window_rows = 8;
 /// The context the buffers' dense attention partials reach (Buffers' min(capacity, 2560)).
@@ -102,6 +104,18 @@ pub const Buffers = struct {
     /// A shared window's scratch: `rows` rows of several streams, each one's attention and KDA chain on `window_rows`.
     pub fn initShared(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, capacity: usize) !Buffers {
         return make(d, w, rows, false, capacity, window_rows);
+    }
+
+    /// A short chunk's buffers beside `main`'s mid chunk: its own rows crossing a layer, `main`'s scratch else.
+    pub fn aside(d: *const cuda.Driver, w: *const weights.Weights, main: *const Buffers, rows: usize) !Buffers {
+        const S: usize = w.config.hc;
+        const D: usize = w.config.hidden;
+        var p: [5]u64 = undefined;
+        var b = main.*;
+        b.arena = try arena(d, &.{ rows * S * D * 2, rows * D * 2, rows * (D / 64) * 4, rows * S * 4, rows * S * S * 4 }, &p);
+        b.rows = rows;
+        b.x, b.normed, b.xs, b.post, b.comb = p;
+        return b;
     }
 
     /// `seg`: the most rows one stream's attention takes (a decode window's rows, or a shared window's segment).

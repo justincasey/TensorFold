@@ -15,6 +15,7 @@ pub const Seq = struct {
     sampling: ?sampler.Sampling = null, // null: greedy
     in_head: usize = 0, // drafted rows the MTP caches hold past the kept ones (st.mtp_drafted)
     rows_at: u64 = 0, // its last verify's final-norm rows (bf16 [rows][hidden]), which the next draft reads
+    layer: usize = 0, // a prompt chunk's next layer while its groups run (0: no chunk between groups)
 };
 
 /// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.

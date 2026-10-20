@@ -16,6 +16,8 @@ const ring = 1024;
 pub const max_rows = fw.window_rows;
 const mtp_rows = 1 + engine.max_drafts;
 const max_held = dflash.BLOCK - 1; // a DFlash2 block's drafts (the MTP head's chains stop at max_drafts)
+/// A prompt chunk's layers a group while other streams hold lanes: a round runs between groups (TF_GLM_FILL_LAYERS).
+pub const default_fill_layers = 2;
 
 /// With DFlash2: a window's ms by rows on two GB10s (EXL3, TF_GLM_PROF: 86 to 107 ms at 5 to 8), shared as glm_cuda's.
 const gb10_window_costs = costTable(max_rows, 52.0, 6.8);
@@ -35,11 +37,15 @@ const Lane = struct {
     chances: [max_held]f64 = undefined, // DFlash2's: each held draft's chance from the selector
     held_n: usize = 0,
     fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
+    layer: usize = 0, // that chunk's next layer group (0: the chunk starts there)
+    aside: bool = false, // that chunk's rows are in the aside prompt buffers (Engine.bq)
 };
 
 pub const Lanes = struct {
     x: follow.Leader,
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
+    fill_layers: usize = 0, // a prompt chunk's layers a group with other streams held (TF_GLM_FILL_LAYERS; 0: whole)
+    aside: bool = false, // a short chunk may start on Engine.bq while another holds Engine.bp (TF_GLM_FILL_ASIDE)
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
@@ -161,23 +167,66 @@ pub const Lanes = struct {
         _ = self.take(try self.x.prefill(s.prompt(), from, .{ .ptr = s, .check = cancelled }, marksOf(s)));
     }
 
-    /// One chunk of the stream's prompt pass (fillOne runs other rounds between); true once the first token is drawn.
+    /// One layer group of the stream's prompt pass (fillOne runs other rounds between); true once the first token drew.
     fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
         const self = of(ptr);
-        const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
+        const known = self.lanes.getPtr(s);
+        const going: ?usize = if (known) |l| l.fill else null;
+        const len = s.prompt().len;
+        const mid = if (known) |l| l.layer > 0 else false;
+        const aside = if (mid) known.?.aside else try self.room(@min(len - (going orelse self.resumable(s, len)), engine.prompt_rows));
         const from = if (going == null) try self.opening(s) else null;
         if (going == null) try self.images(s, from);
         const l = self.lanes.getPtr(s).?;
         if (going != null) try self.x.bind(l.slot);
         const at = going orelse if (from) |r| r.at else 0;
-        errdefer l.fill = null;
-        if (try self.x.chunk(s.prompt(), at, from, .{ .ptr = s, .check = cancelled }, marksOf(s))) |first| {
+        errdefer {
+            l.fill = null;
+            l.layer = 0;
+            l.aside = false;
+            s.mid_chunk = false;
+        }
+        const lo = l.layer;
+        const hi = self.groupEnd(lo, @min(len - at, engine.prompt_rows), aside);
+        const got = try self.x.chunk(s.prompt(), at, from, .{ .ptr = s, .check = cancelled }, marksOf(s), lo, hi, aside);
+        if (hi < self.x.e.w.layers.len) { // the chunk goes on from here: its rows stay in its prompt buffers
+            l.fill = at;
+            l.layer = hi;
+            l.aside = aside;
+            s.mid_chunk = true;
+            return false;
+        }
+        l.layer = 0;
+        l.aside = false;
+        s.mid_chunk = false;
+        if (got) |first| {
             _ = self.take(first);
             l.fill = null;
             return true;
         }
         l.fill = at + engine.prompt_rows;
         return false;
+    }
+
+    /// Whether a chunk of `rows` rows starts on the aside prompt buffers: short, while another's holds the main ones.
+    fn room(self: *const Lanes, rows: usize) !bool {
+        var main = false;
+        var side = false;
+        var it = self.lanes.valueIterator();
+        while (it.next()) |x| if (x.layer > 0) {
+            if (x.aside) side = true else main = true;
+        };
+        if (!main) return false;
+        if (self.aside and !side and rows <= engine.aside_rows) return true;
+        return error.FillBusy; // the host runs the chunk that holds them on first
+    }
+
+    /// A group's end from `lo`: whole alone or short (halves aside, beside a long one), else fill_layers' chunk time.
+    fn groupEnd(self: *const Lanes, lo: usize, rows: usize, aside: bool) usize {
+        const layers = self.x.e.w.layers.len;
+        if (self.fill_layers == 0 or (lo == 0 and self.lanes.count() < 2)) return layers;
+        if (rows <= engine.aside_rows) return if (aside) @min(layers, lo + (layers + 1) / 2) else layers;
+        return @min(layers, lo + self.fill_layers * engine.prompt_rows / @max(rows, 1));
     }
 
     /// A prompt pass begins: the stream's slot bound and its sequence fresh; where the pass resumes (a kept state).
@@ -188,6 +237,7 @@ pub const Lanes = struct {
         l.pending_rows = null;
         l.held_n = 0;
         l.fill = null;
+        l.layer = 0;
         try self.x.bind(l.slot);
         if (self.x.e.images) |v| v.clear(); // no earlier request's rows splice into this one
         try self.x.begin(s.sampling);
@@ -211,13 +261,21 @@ pub const Lanes = struct {
     fn resumeFrom(self: *Lanes, s: *lanes.Stream, len: usize) ?engine.Resume {
         const saved = s.reuse.saved orelse return null;
         const k: *const engine.Kept = @ptrCast(@alignCast(saved));
-        if (k.at != s.reuse.at or k.at == 0 or k.at >= len or k.at % fw.prefill_rows != 0 or !self.x.e.holds(k.id)) {
+        if (self.resumable(s, len) == 0) {
             s.reuse_failed = true;
             s.reuse_error = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at or k.at % fw.prefill_rows != 0) error.SnapshotOutOfStep else error.SnapshotStale;
             return null;
         }
         s.cached = k.at;
         return .{ .id = k.id, .at = k.at };
+    }
+
+    /// Where the stream's prompt pass would start: its kept state's position if it resumes there, else 0.
+    fn resumable(self: *const Lanes, s: *const lanes.Stream, len: usize) usize {
+        const saved = s.reuse.saved orelse return 0;
+        const k: *const engine.Kept = @ptrCast(@alignCast(saved));
+        if (k.at != s.reuse.at or k.at == 0 or k.at >= len or k.at % fw.prefill_rows != 0 or !self.x.e.holds(k.id)) return 0;
+        return k.at;
     }
 
     /// The prompt pass stands at a mark: the lane host keeps the state there (cuda_native's snap_save).

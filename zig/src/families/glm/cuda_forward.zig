@@ -402,13 +402,12 @@ pub const Forward = struct {
         for (0..cut.len) |q| if (sent >> @intCast(q) & 1 == 1) try f.stream.wait(p.shared[q]);
     }
 
-    /// forward.pieced_layers: a prompt chunk's layers with exchanges in row pieces; same kernels and bits as unpieced.
-    fn pieced(f: *const Forward, p: *const Pieces, R: usize, cut: []const [2]usize) !void {
+    /// forward.pieced_layers: a chunk's layers lo..hi with exchanges in row pieces; same kernels and bits as unpieced.
+    fn pieced(f: *const Forward, p: *const Pieces, R: usize, cut: []const [2]usize, lo: usize, hi: usize) !void {
         const layers = f.ranks[0].w.layers;
-        for (f.ranks) |r| try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, R);
-        var li: usize = 0;
-        var di: usize = 0;
-        for (layers, 0..) |_, j| {
+        if (lo == 0) for (f.ranks) |r| try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, R);
+        var li, var di = mixersBefore(layers, lo);
+        for (layers[lo..hi], lo..) |_, j| {
             for (f.ranks) |r| try f.mixer(r, r.w.layers[j], li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), null);
             try f.exchangePieces(p, j, .mixer, cut);
             try f.gluePieces(p, j, .mixer, cut);
@@ -444,24 +443,42 @@ pub const Forward = struct {
 
     /// GPU work after `begin` (rows checked, sequences readied, ids on the device); cuda_decode replays a window's.
     pub fn body(f: *const Forward, R: usize) !void {
+        return f.layersOf(R, 0, f.ranks[0].w.layers.len);
+    }
+
+    /// `body`'s layers lo..hi (a prompt chunk's group; other rounds may run between): embed at 0, the head at the end.
+    pub fn layersOf(f: *const Forward, R: usize, lo: usize, hi: usize) !void {
         const c = &f.ranks[0].w.config;
-        for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
-        if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
-        if (f.prof) |p| p.mark(f.stream, .embed);
+        if (lo == 0) {
+            for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
+            if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
+            if (f.prof) |p| p.mark(f.stream, .embed);
+        }
         var cut: [max_pieces][2]usize = undefined;
         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill) ranges(R, p.count, &cut) else 0) else 0;
         // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
-        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
+        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces], lo, hi) else try f.whole(R, lo, hi);
+        if (hi < f.ranks[0].w.layers.len) return;
         try f.finish(R);
         if (f.prof) |p| p.mark(f.stream, .head);
     }
 
-    /// The unpieced loop over the layers (and the stream mean): each site's partials whole, then the glue.
-    fn whole(f: *const Forward, R: usize) !void {
-        const c = &f.ranks[0].w.config;
+    /// The KDA and DSA layers before layer `lo` (the mixers' indices among their kinds).
+    fn mixersBefore(layers: []const weights.Layer, lo: usize) struct { usize, usize } {
         var li: usize = 0;
         var di: usize = 0;
-        for (f.ranks[0].w.layers, 0..) |_, j| {
+        for (layers[0..lo]) |l| switch (l.mixer) {
+            .kda => li += 1,
+            .mla => di += 1,
+        };
+        return .{ li, di };
+    }
+
+    /// The unpieced loop over layers lo..hi (the stream mean after the last): each site's partials whole, then glue.
+    fn whole(f: *const Forward, R: usize, lo: usize, hi: usize) !void {
+        const c = &f.ranks[0].w.config;
+        var li, var di = mixersBefore(f.ranks[0].w.layers, lo);
+        for (f.ranks[0].w.layers[lo..hi], lo..) |_, j| {
             for (f.ranks) |r| {
                 const l = r.w.layers[j];
                 try f.pre(r, l.attn_hc, l.in_norm, R);
@@ -486,6 +503,7 @@ pub const Forward = struct {
                 .mla => di += 1,
             }
         }
+        if (hi < f.ranks[0].w.layers.len) return;
         for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, R, c.hidden, c.hc);
     }
 

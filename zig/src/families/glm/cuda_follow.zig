@@ -16,7 +16,7 @@ pub const Header = extern struct {
     kind: u32,
     n: u32 = 0, // ids that follow
     depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts
-    flags: u32 = 0, // begin: sampled; draft: from the prompt
+    flags: u32 = 0, // begin: sampled; draft: from the prompt; chunk: its layers lo | hi << 16 (0: all), aside 1 << 31
     a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none)
     seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position
     temperature: f64 = 0,
@@ -191,13 +191,14 @@ pub const Leader = struct {
         return x.e.prefill(ids, from, cancel, marks);
     }
 
-    /// One chunk of a prompt pass on every rank (Engine.prefillChunk); the first token once the chunk ends the prompt.
-    pub fn chunk(x: Leader, ids: []const u32, start: usize, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !?u32 {
+    /// Layers lo..hi of a prompt chunk on every rank (Engine.prefillLayers); the first token if it ends the prompt.
+    pub fn chunk(x: Leader, ids: []const u32, start: usize, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks, lo: usize, hi: usize, aside: bool) !?u32 {
         if (start >= ids.len) return error.BadChunk;
         try x.flush();
         const part = ids[start..@min(ids.len, start + engine.prompt_rows + 1)];
-        try x.send(.{ .kind = @backingInt(Kind.chunk), .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
-        return x.e.prefillChunk(part, start, ids.len, from, cancel, marks);
+        const flags: u32 = @intCast(lo | hi << 16 | @as(usize, @intFromBool(aside)) << 31);
+        try x.send(.{ .kind = @backingInt(Kind.chunk), .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len), .flags = flags }, part);
+        return x.e.prefillLayers(part, start, ids.len, from, cancel, marks, lo, hi, aside);
     }
 
     pub fn verify(x: Leader, ids: []const u32, out: []u32) !void {
@@ -276,7 +277,9 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 const ids = try e.gpa.dupe(u32, step.ids);
                 defer e.gpa.free(ids);
                 const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
-                _ = e.prefillChunk(ids, h.depth, h.top_k, from, null, null) catch |err| switch (err) {
+                const lo = h.flags & 0xffff;
+                const hi = if (h.flags == 0) e.w.layers.len else h.flags >> 16 & 0x7fff;
+                _ = e.prefillLayers(ids, h.depth, h.top_k, from, null, null, lo, hi, h.flags >> 31 == 1) catch |err| switch (err) {
                     error.Cancelled => {},
                     else => return err,
                 };

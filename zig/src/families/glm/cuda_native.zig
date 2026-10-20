@@ -216,7 +216,9 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         }
     }.get;
     own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED") };
+    // TF_GLM_FILL_LAYERS (rank 0): a chunk's layers a group while others decode (0: whole); TF_GLM_FILL_ASIDE=0: no bq
+    const fill_layers = if (std.c.getenv("TF_GLM_FILL_LAYERS")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadFillLayers else glm_lanes.default_fill_layers;
+    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .fill_layers = fill_layers, .aside = !off("TF_GLM_FILL_ASIDE") };
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
@@ -282,6 +284,7 @@ fn close(ptr: *anyopaque) void {
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.BadRoceCap => "TF_ROCE_MAX_KB: give an integer from 1 through 4194303 KiB, or unset it for 4096 KiB",
+        error.BadFillLayers => "TF_GLM_FILL_LAYERS: give a prompt chunk's layers a group as an integer (0: whole chunks), or unset it",
         error.NoRank => "GLM-5.3-Flash runs at TP over hosts: set TF_GLM_RANK and TF_GLM_WORLD on every host (WORLD 1: one GPU, with TF_GLM_LAYERS for a thin model)",
         error.NoCommId => "GLM-5.3-Flash's ranks meet over NCCL: with TF_GLM_WORLD 2 or more, set NCCL_COMM_ID to rank 0's address:port on every host",
         error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",
