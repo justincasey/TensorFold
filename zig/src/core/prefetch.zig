@@ -15,7 +15,7 @@ pub const Prefetch = struct {
     next: std.atomic.Value(u64) = .init(0),
     threads: [max_threads]?std.Thread = @splat(null),
 
-    pub const max_threads = 8;
+    pub const max_threads = 8; // 16 measured slower (108 s vs 96-102 s a boot): the loader, not the drive, is the pace
     const block: u64 = 4 << 20;
 
     /// Starts `threads` readers over `spans` (copied); `join` waits for them and frees it. Null: nothing to read.
