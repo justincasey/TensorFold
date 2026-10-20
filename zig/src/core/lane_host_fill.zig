@@ -41,6 +41,7 @@ pub fn one(h: *LaneHost) void {
     while (true) {
         const first = !job.fill_began;
         job.fill_began = true;
+        job.stream.fill_coarse = coarse(h, job);
         done = h.core.fillStreamCommitted(&job.stream, first, .{ .ptr = job, .call = LaneHost.firstCommitted }) catch |e| {
             if (e == error.FillBusy) if (held(h)) |mid| if (mid != at) { // its chunk could not start beside another's
                 job.fill_wait +|= 1;
@@ -104,6 +105,7 @@ fn together(h: *LaneHost) bool {
     while (n >= 2) : (n -= 1) {
         for (jobs[0..n], 0..) |job, i| {
             streams[i] = &job.stream;
+            job.stream.fill_coarse = coarse(h, job);
             hooks[i] = .{ .ptr = job, .call = LaneHost.firstCommitted };
         }
         const took = h.core.fillTogether(streams[0..n], hooks[0..n], errs[0..n]) catch |e| {
@@ -127,6 +129,16 @@ fn together(h: *LaneHost) bool {
         return true;
     }
     return false;
+}
+
+/// Whether prompts other than `job`'s wait to fill (admitted, or queued in the foreground), as many as streams decode.
+pub fn coarse(h: *LaneHost, job: *const Job) bool {
+    var others: usize = 0;
+    for (h.filling.items) |j| others += @intFromBool(j != job and !j.request.background);
+    h.lock();
+    defer h.unlock();
+    for (h.queued.items) |j| others += @intFromBool(!j.request.background);
+    return others > 0 and others >= h.core.activeCount();
 }
 
 /// Takes `job` off the filling list, wherever it is.

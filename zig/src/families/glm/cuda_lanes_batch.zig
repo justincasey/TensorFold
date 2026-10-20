@@ -19,11 +19,14 @@ pub fn prefillMany(self: *Lanes, ss: []const *lanes.Stream) !bool {
     var it = self.lanes.valueIterator();
     while (it.next()) |l| if (l.layer > 0) return false; // a chunk between its layer groups holds bp
     const busy = self.lanes.count() > 0;
+    var coarse = false; // prompts wait behind few decoders (the host's word): a busy pass takes longer prompts too
+    for (ss) |s| coarse = coarse or s.fill_coarse;
+    const each: usize = if (!busy) engine.prompt_rows else if (coarse) busy_rows else engine.aside_rows;
     var rows: usize = 0;
     for (ss) |s| {
         const n = s.prompt().len;
         if (n < min_rows or n > engine.prompt_rows or s.images.len > 0 or self.resumable(s, n) != 0) return false;
-        if (n + s.max_new + glm_lanes.max_rows >= self.x.e.capacity or (busy and n > engine.aside_rows)) return false;
+        if (n + s.max_new + glm_lanes.max_rows >= self.x.e.capacity or n > each) return false;
         rows += n;
     }
     if (rows > @as(usize, if (busy) busy_rows else engine.prompt_rows)) return false;

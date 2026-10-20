@@ -208,7 +208,8 @@ pub const Lanes = struct {
             s.mid_chunk = false;
         }
         const lo = l.layer;
-        const hi = self.groupEnd(lo, @min(len - at, engine.prompt_rows), aside);
+        const coarse = !aside and (s.fill_coarse or len <= engine.prompt_rows); // a one-chunk prompt's token waits on it
+        const hi = self.groupEnd(lo, @min(len - at, engine.prompt_rows), aside, coarse);
         const got = try self.x.chunk(s.prompt(), at, from, .{ .ptr = s, .check = cancelled }, marksOf(s), lo, hi, aside);
         if (hi < self.x.e.w.layers.len) { // the chunk goes on from here: its rows stay in its prompt buffers
             l.fill = at;
@@ -242,13 +243,22 @@ pub const Lanes = struct {
         return error.FillBusy; // the host runs the chunk that holds them on first
     }
 
-    /// A group's end from `lo`: whole alone or short (halves aside, beside a long one), else fill_layers' chunk time.
-    fn groupEnd(self: *const Lanes, lo: usize, rows: usize, aside: bool) usize {
+    /// A group's end from `lo`: whole alone or short (halves aside); else fill_layers' time, coarse: fill_bound_ms'.
+    fn groupEnd(self: *const Lanes, lo: usize, rows: usize, aside: bool, coarse: bool) usize {
         const layers = self.x.e.w.layers.len;
         if (self.fill_layers == 0 or (lo == 0 and self.lanes.count() < 2)) return layers;
         if (rows <= engine.aside_rows) return if (aside) @min(layers, lo + (layers + 1) / 2) else layers;
-        return @min(layers, lo + self.fill_layers * engine.prompt_rows / @max(rows, 1));
+        const fine = self.fill_layers * engine.prompt_rows / @max(rows, 1);
+        const ms = pass_ms + row_ms * @as(f64, @floatFromInt(rows));
+        const within: usize = @intFromFloat(fill_bound_ms * @as(f64, @floatFromInt(layers)) / ms);
+        return @min(layers, lo + if (coarse) @max(fine, within) else fine);
     }
+
+    /// A prompt pass's ms on two GB10s: per pass and per row (EXL3, a whole chunk's 45 layers).
+    pub const pass_ms = 345.0;
+    pub const row_ms = 0.525;
+    /// The longest a coarse prompt step may hold the decoders (between two of their tokens).
+    pub const fill_bound_ms = 1500.0;
 
     /// A prompt pass begins: the stream's slot bound and its sequence fresh; where the pass resumes (a kept state).
     pub fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
