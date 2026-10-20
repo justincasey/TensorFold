@@ -174,6 +174,18 @@ pub const File = struct {
         _ = linux.fadvise(self.file.handle, 0, 0, linux.POSIX_FADV.DONTNEED);
     }
 
+    /// The file byte range [lo, hi) holding every tensor named `prefix`*, or null (none, or a heap copy: no mmap).
+    pub fn span(self: *const File, prefix: []const u8) ?[2]u64 {
+        if (self.map.section == null) return null;
+        var lo: usize = std.math.maxInt(usize);
+        var hi: usize = 0;
+        for (self.names.keys(), self.names.values()) |name, e| if (std.mem.startsWith(u8, name, prefix)) {
+            lo = @min(lo, e.begin);
+            hi = @max(hi, e.end);
+        };
+        return if (hi <= lo) null else .{ self.data + lo, self.data + hi };
+    }
+
     pub fn get(self: *const File, name: []const u8) ?Tensor {
         const e = self.names.get(name) orelse return null;
         return .{ .dtype = e.dtype, .rank = e.rank, .shape = e.shape, .bytes = self.map.memory[self.data + e.begin .. self.data + e.end] };

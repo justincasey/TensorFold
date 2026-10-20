@@ -532,7 +532,13 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
     if (c.exl3_all) w.xl = try xlin.Runner.init(gpa, d);
     for (layers, w.layers) |i, *l| {
         if (i >= c.layers) return error.BadLayer;
-        l.* = try L.layer(i);
+        // the layer's bytes read by 8 threads while it loads (one fault window at a time is ~0.43 GB/s): boot ~3x faster
+        const pf = try ck.prefetch(gpa, try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.", .{i}));
+        l.* = L.layer(i) catch |err| {
+            if (pf) |p| p.join();
+            return err;
+        };
+        if (pf) |p| p.join(); // before release: no reader puts back pages it drops
         ck.release(); // a rank reads about half the checkpoint: its pages would crowd the GPU's allocations out
     }
     try L.whole(try L.get("embed_tokens.weight", .{}), .bf16);

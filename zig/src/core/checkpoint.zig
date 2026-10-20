@@ -3,9 +3,11 @@
 const std = @import("std");
 const Io = std.Io;
 const st = @import("safetensors.zig");
+const prefetch_mod = @import("prefetch.zig");
 
 pub const Tensor = st.Tensor;
 pub const DType = st.DType;
+pub const Prefetch = prefetch_mod.Prefetch;
 
 /// The checkpoint's shard paths in name order: model.safetensors.index.json's weight map, else every model*.safetensors.
 pub fn shardFiles(gpa: std.mem.Allocator, io: Io, dir: []const u8) ![][:0]u8 {
@@ -139,6 +141,15 @@ pub const Checkpoint = struct {
     /// Every file's pages out of the page cache (safetensors.File.release).
     pub fn release(self: *const Checkpoint) void {
         for (self.files.items) |*f| f.release();
+    }
+
+    /// Starts parallel read-ahead of every tensor named `prefix`*, in every mapped file (prefetch.zig); null: none.
+    /// The caller joins it before `release`, so no reader repopulates pages the release drops.
+    pub fn prefetch(self: *const Checkpoint, gpa: std.mem.Allocator, prefix: []const u8) !?*Prefetch {
+        var spans: std.ArrayList(prefetch_mod.Span) = .empty;
+        defer spans.deinit(gpa);
+        for (self.files.items) |*f| if (f.span(prefix)) |s| try spans.append(gpa, .{ .fd = f.file.handle, .lo = s[0], .hi = s[1] });
+        return Prefetch.start(gpa, spans.items, Prefetch.max_threads);
     }
 
     /// Names no `get` took (the loader refuses a checkpoint with leftovers).
