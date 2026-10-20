@@ -74,6 +74,11 @@ pub fn denseIndex(w: Weight) ?usize {
     return null;
 }
 
+/// mul1 calls past 16 rows take 32-row passes (each weight tile decoded once for 32 rows), at the prompt widths.
+pub fn wideIndex(w: Weight) ?usize {
+    return if (w.codebook == .mul1) denseIndex(w) else null;
+}
+
 /// 128-row blocks once they fill this many blocks (two a GB10 SM), else 64-row blocks; a row's bits are the same.
 const dense_wide_blocks = 96;
 
@@ -125,6 +130,7 @@ pub const Linear = struct {
     rot_in: Function,
     rot_rows: Function = undefined,
     dense_fns: [dense_halves.len][2]Function = undefined, // [width][64 or 128 rows]
+    wide_fns: [dense_halves.len][2]Function = undefined, // mul1's 32-row passes: [width][4 or 8 warps]
 
     pub fn load(d: *const Driver) !Linear {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -137,6 +143,9 @@ pub const Linear = struct {
         l.rot_rows = try l.mod.function("tf_exl3_rot_rows");
         inline for (dense_halves, 0..) |h, i| inline for (.{ 64, 128 }, 0..) |rows, j| {
             l.dense_fns[i][j] = try l.mod.function(std.fmt.comptimePrint("tf_exl3_dense_{d}_{d}", .{ h, rows }));
+        };
+        inline for (dense_halves, 0..) |h, i| inline for (.{ 4, 8 }, 0..) |warps, j| {
+            l.wide_fns[i][j] = try l.mod.function(std.fmt.comptimePrint("tf_exl3_linear32_{d}_{d}", .{ h, warps }));
         };
         return l;
     }
@@ -202,7 +211,8 @@ pub const Linear = struct {
         args.add(@as(i32, @intCast(p.sk)));
         args.add(@as(i32, @intCast(m)));
         args.add(@as(i32, @intCast(w.k)));
-        try launch_.launch(l.fns[idx], .{
+        const f = if (m > 16) (if (wideIndex(w)) |j| l.wide_fns[j][@intFromBool(p.wk == 8)] else l.fns[idx]) else l.fns[idx];
+        try launch_.launch(f, .{
             .grid = .{ .x = @intCast(w.n / 128 * p.sk), .y = 1, .z = 1 },
             .block = .{ .x = @intCast(p.wk * 32), .y = 1, .z = 1 },
             .shared = sharedBytes(w, m),

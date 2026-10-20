@@ -259,8 +259,9 @@ __device__ __forceinline__ void dense_body(const DenseArgs& a) {
 }
 
 
-// One program: (N / 128) * SK blocks, split-major like a (N / 128, SK) grid, WK warps each.
-template <int K2, int CB, int WK>
+// One program: (N / 128) * SK blocks, split-major like a (N / 128, SK) grid, WK warps each; MT 16-row m tiles a pass
+// (each weight tile decoded once a pass; a row's mma, warp order and split order are the same at either MT).
+template <int K2, int CB, int WK, int MT>
 __device__ __forceinline__ void linear_body(LinearArgs a) {
     constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();
     constexpr bool ST = TW % 8 == 0;                          // even widths: staged 16-byte loads, PD steps in flight
@@ -279,21 +280,28 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
     const uint32_t* tiles = a.t + nb * a.stride_nb;
     const int col0 = nb * 128;
 
-    for (int m0 = 0, pass = 0; m0 < M; m0 += 16, ++pass) {
-        const int R = imin(16, M - m0);
+    for (int m0 = 0, pass = 0; m0 < M; m0 += 16 * MT, ++pass) {
+        const int R = imin(16 * MT, M - m0);
 
-        float acc[8][2][4];
+        float acc[MT][8][2][4];
 #pragma unroll
-        for (int i = 0; i < 8; ++i)
+        for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
-            for (int h = 0; h < 2; ++h)
+            for (int i = 0; i < 8; ++i)
 #pragma unroll
-                for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
+                for (int h = 0; h < 2; ++h)
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) acc[mt][i][h][c] = 0.f;
 
         // the walk's rows for the mma, clamped so rows past the pass read inside the buffer (their outputs are dropped)
-        const int r0 = m0 + (g < R ? g : R - 1), r1 = m0 + (g + 8 < R ? g + 8 : R - 1);
-        const half* x0 = static_cast<const half*>(a.xh) + (size_t)r0 * K;
-        const half* x1 = static_cast<const half*>(a.xh) + (size_t)r1 * K;
+        const half* x0[MT];
+        const half* x1[MT];
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+            const int g0 = 16 * mt + g, g1 = 16 * mt + g + 8;
+            x0[mt] = static_cast<const half*>(a.xh) + (size_t)(m0 + (g0 < R ? g0 : R - 1)) * K;
+            x1[mt] = static_cast<const half*>(a.xh) + (size_t)(m0 + (g1 < R ? g1 : R - 1)) * K;
+        }
         const uint32_t* tile = tiles + (size_t)kt0 * a.stride_k;
         uint32_t cur[PF ? SR : 1], nxt[PF ? SR : 1];
         if constexpr (PF) load_step<K2>(tile, lane, cur);     // the weights do not wait for the previous kernel
@@ -308,12 +316,15 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
                         if (128 * v + 4 * lane < 8 * TW) rv[d][v] = ldg_nc_v4(tile + d * a.stride_k + 128 * v + 4 * lane);
         }
 
-        // x's fragments of k step kt: rows g (and g + 8): [0] [2] k 2t.., 2t + 8..; [1] [3] the same of row g + 8
-        auto load_x = [&](int kt, uint32_t (&u)[4]) {
-            u[0] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t));
-            u[2] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t + 8));
-            u[1] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t));
-            u[3] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t + 8));
+        // x's fragments of k step kt: rows g (and g + 8) of each m tile: [0] [2] k 2t.., 2t + 8..; [1] [3] row g + 8's
+        auto load_x = [&](int kt, uint32_t (&u)[MT][4]) {
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt) {
+                u[mt][0] = __ldg(reinterpret_cast<const uint32_t*>(x0[mt] + kt * 16 + 2 * t));
+                u[mt][2] = __ldg(reinterpret_cast<const uint32_t*>(x0[mt] + kt * 16 + 2 * t + 8));
+                u[mt][1] = __ldg(reinterpret_cast<const uint32_t*>(x1[mt] + kt * 16 + 2 * t));
+                u[mt][3] = __ldg(reinterpret_cast<const uint32_t*>(x1[mt] + kt * 16 + 2 * t + 8));
+            }
         };
         if constexpr (ST) {
             uint32_t* stage = reinterpret_cast<uint32_t*>(red) + warp * 8 * 64;   // a warp's step: 8 tiles, 64 words most
@@ -335,7 +346,7 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
                             if (128 * v + 4 * lane < 8 * TW)
                                 rv[d][v] = ldg_nc_v4(tile + (size_t)(i + PD) * a.stride_k + 128 * v + 4 * lane);
                     __syncwarp();   // the step is staged before any lane reads it
-                    uint32_t u[4];
+                    uint32_t u[MT][4];
                     load_x(kt0 + i, u);
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
@@ -344,15 +355,18 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
                         for (int q = 0; q < LW; ++q) w[q] = stage[j * TW + (word + q) % TW];
                         uint32_t b0[2], b1[2];
                         decode_lane<K2, CB>(w, lane, b0, b1);
-                        mma16816(acc[j][0], u, b0);
-                        mma16816(acc[j][1], u, b1);
+#pragma unroll
+                        for (int mt = 0; mt < MT; ++mt) {
+                            mma16816(acc[mt][j][0], u[mt], b0);
+                            mma16816(acc[mt][j][1], u[mt], b1);
+                        }
                     }
                 }
             }
         }
 #pragma unroll 1
         for (int i = 0; i < (ST ? 0 : per_warp); ++i) {
-            uint32_t u[4];
+            uint32_t u[MT][4];
             load_x(kt0 + i, u);
             if constexpr (PF) {
                 if (i + 1 < per_warp) load_step<K2>(tile + (size_t)(i + 1) * a.stride_k, lane, nxt);
@@ -364,8 +378,11 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
                 else ldg_lane_words<K2>(tile + (size_t)i * a.stride_k + j * TW, lane, w);
                 uint32_t b0[2], b1[2];
                 decode_lane<K2, CB>(w, lane, b0, b1);
-                mma16816(acc[j][0], u, b0);
-                mma16816(acc[j][1], u, b1);
+#pragma unroll
+                for (int mt = 0; mt < MT; ++mt) {
+                    mma16816(acc[mt][j][0], u[mt], b0);
+                    mma16816(acc[mt][j][1], u[mt], b1);
+                }
             }
             if constexpr (PF) {
 #pragma unroll
@@ -373,8 +390,11 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
             }
         }
 
-        // the warps' sums, added in warp order, rows 0-7 of the pass and then rows 8-15
-        for (int rlo = 0; rlo < R; rlo += 8) {
+        // the warps' sums, added in warp order, 8 rows of the pass at a time (an m tile's rows 0-7, then 8-15)
+#pragma unroll
+        for (int q = 0; q < 2 * MT; ++q) {
+            const int rlo = 8 * q;
+            if (rlo >= R) break;
             const int rn = imin(R - rlo, 8);
             __syncthreads();                         // red is reused by every half and pass
             if (g < RH) {
@@ -384,8 +404,8 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
                     for (int h = 0; h < 2; ++h) {
                         const int col = i * 16 + h * 8 + 2 * t;
                         *reinterpret_cast<float2*>(red + (warp * RH + g) * 128 + col) =
-                            rlo ? make_float2(acc[i][h][2], acc[i][h][3])
-                                : make_float2(acc[i][h][0], acc[i][h][1]);
+                            q & 1 ? make_float2(acc[q >> 1][i][h][2], acc[q >> 1][i][h][3])
+                                  : make_float2(acc[q >> 1][i][h][0], acc[q >> 1][i][h][1]);
                     }
             }
             __syncthreads();
@@ -445,7 +465,13 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
 #define TF_EXL3_LINEAR(K2, CB, WK)                                                       \
     extern "C" __global__ void __launch_bounds__((WK) * 32)                              \
         tf_exl3_linear_##K2##_##CB##_##WK(tf_exl3::LinearArgs a) {                       \
-        tf_exl3::linear_body<K2, CB, WK>(a);                                             \
+        tf_exl3::linear_body<K2, CB, WK, 1>(a);                                          \
+    }
+// mul1's 32-row passes (two m tiles: each weight tile decoded once for 32 rows)
+#define TF_EXL3_LINEAR32(K2, WK)                                                         \
+    extern "C" __global__ void __launch_bounds__((WK) * 32)                              \
+        tf_exl3_linear32_##K2##_##WK(tf_exl3::LinearArgs a) {                            \
+        tf_exl3::linear_body<K2, 2, WK, 2>(a);                                           \
     }
 
 // Every width the format serves (linear.cu TF_EXL3_ALL plus 4.5-6.5): whole bits, all codebooks; 7.5 is not a width.
@@ -460,6 +486,11 @@ TF_EXL3_CODEBOOK(1) // mcg
 TF_EXL3_CODEBOOK(0) // inst3
 #undef TF_EXL3_CODEBOOK
 #undef TF_EXL3_WIDTHS
+#define TF_EXL3_WIDTHS32(K2) TF_EXL3_LINEAR32(K2, 4) TF_EXL3_LINEAR32(K2, 8)
+TF_EXL3_WIDTHS32(2) TF_EXL3_WIDTHS32(3) TF_EXL3_WIDTHS32(4) TF_EXL3_WIDTHS32(5) TF_EXL3_WIDTHS32(6) TF_EXL3_WIDTHS32(7)
+TF_EXL3_WIDTHS32(8) TF_EXL3_WIDTHS32(9) TF_EXL3_WIDTHS32(10) TF_EXL3_WIDTHS32(11) TF_EXL3_WIDTHS32(12)
+TF_EXL3_WIDTHS32(13) TF_EXL3_WIDTHS32(14) TF_EXL3_WIDTHS32(16)
+#undef TF_EXL3_WIDTHS32
 
 // The prompt kernels: mul1, every width the decode kernels serve but 15 halves, 64- and 128-row blocks of 8 warps.
 #define TF_EXL3_DENSE(K2)                                                                                            \
