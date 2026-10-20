@@ -42,7 +42,6 @@ pub fn run(e: *Engine, part: []const u32, start: usize, len: usize, from: ?engin
         return null;
     }
     e.cur.layer = 0;
-    if (e.drafter) |dr| try dr.prompt(e, e.slot, start, rows, len, aside);
     const last = start + rows == len;
     var first: ?u32 = null;
     if (last) {
@@ -51,6 +50,7 @@ pub fn run(e: *Engine, part: []const u32, start: usize, len: usize, from: ?engin
         first = t[0];
     }
     if (f.prof) |p| p.mark(e.stream, .draw);
+    if (e.drafter) |dr| try dr.prompt(e, e.slot, start, rows, len, aside); // after the draw: the first token waits on none
     if (e.mtp and e.drafter == null) { // DFlash2 drafts without the MTP head: its rows are never read
         if (last) try e.copy(e.hold.ptr, b.fnormed + (rows - 1) * e.c.hidden * 2, e.c.hidden * 2);
         const nxt = as_i32[1..];

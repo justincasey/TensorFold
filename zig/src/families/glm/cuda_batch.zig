@@ -61,7 +61,6 @@ pub fn run(e: *Engine, segs: []Seg) !void {
         const n = g.ids.len;
         try e.bind(g.slot);
         const taps = if (e.drafter) |dr| dr.taps_prefill + row0 * dflash.TAP_ROW else 0;
-        if (e.drafter) |dr| try dr.promptTaps(e, g.slot, 0, n, n, taps);
         try b16.matmul(f.set(), f.stream, b.fnormed + (row0 + n - 1) * D * 2, D, e.w.head, b.logits, b.kda.mm_part, 1, e.w.share.vocab.len(), D, false);
         var t: [1]u32 = undefined;
         try e.draw(b.logits, 1, n, &t);
@@ -73,6 +72,11 @@ pub fn run(e: *Engine, segs: []Seg) !void {
         if (digest.on()) try digest.seq(e, &e.cur.st, g.ids, taps, b.logits, "batch", t[0]);
         row0 += n;
     }
+    row0 = 0;
+    if (e.drafter) |dr| for (segs) |g| { // after every draw: no first token waits on a context ingest
+        try dr.promptTaps(e, g.slot, 0, g.ids.len, g.ids.len, dr.taps_prefill + row0 * dflash.TAP_ROW);
+        row0 += g.ids.len;
+    };
 }
 
 /// Every layer over `R` rows in each prompt's own solo pieces (their fills, exchanges and glue), each mixer alone.
