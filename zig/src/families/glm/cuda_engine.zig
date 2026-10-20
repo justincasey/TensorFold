@@ -331,6 +331,8 @@ pub const Engine = struct {
 
     /// Layers lo..hi of a prompt chunk (cuda_chunk): other sequences' steps may run before its next group.
     pub const prefillLayers = @import("cuda_chunk.zig").run;
+    /// Several whole prompts in one prompt forward (cuda_batch), each on its slot's begun sequence.
+    pub const prefillBatch = @import("cuda_batch.zig").run;
 
     /// The chunk gate on every rank: a kept state at the mark, the heat wait, rank 0's cancel; the id exchanged first.
     pub fn gate(e: *Engine, cancel: ?Cancel) !void {

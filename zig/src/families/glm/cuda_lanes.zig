@@ -48,6 +48,7 @@ const Lane = struct {
     fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
     layer: usize = 0, // that chunk's next layer group (0: the chunk starts there)
     aside: bool = false, // that chunk's rows are in the aside prompt buffers (Engine.bq)
+    first: ?u64 = null, // a batched prompt pass's first token (its handle), until `first` reads it
 };
 
 pub const Lanes = struct {
@@ -55,6 +56,7 @@ pub const Lanes = struct {
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
     fill_layers: usize = 0, // a prompt chunk's layers a group with other streams held (TF_GLM_FILL_LAYERS; 0: whole)
     aside: bool = false, // a short chunk may start on Engine.bq while another holds Engine.bp (TF_GLM_FILL_ASIDE)
+    batch: bool = false, // fresh short prompts in one prompt pass (TF_GLM_BATCH_FILL=1, cuda_lanes_batch)
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
@@ -69,7 +71,7 @@ pub const Lanes = struct {
     pub fn backend(self: *Lanes) be.Backend {
         // the first token leaves before the first DFlash2 block (open_first): TTFT pays no draft pass
         const early = self.x.e.drafter != null and !std.mem.eql(u8, std.mem.span(std.c.getenv("TF_GLM_FIRST_EARLY") orelse "1"), "0");
-        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else &steps_vt, .first_before_draft = early };
+        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else if (self.batch) &batch_vt else &steps_vt, .first_before_draft = early };
     }
 
     const whole_vt: be.Backend.VTable = .{
@@ -88,6 +90,15 @@ pub const Lanes = struct {
         v.prefill_step = prefillStepFn;
         break :vt v;
     };
+    const batch_vt: be.Backend.VTable = vt: {
+        var v = steps_vt;
+        v.prefill_many = prefillManyFn;
+        break :vt v;
+    };
+
+    fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
+        return @import("cuda_lanes_batch.zig").prefillMany(of(ptr), ss);
+    }
 
     /// Round loop facts: copies up to max_rows, head chains to mtp_rows, shared windows unless TF_GLM_SHARED=0.
     pub fn facts(self: *const Lanes) lanes.Model {
@@ -117,7 +128,7 @@ pub const Lanes = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
-    fn take(self: *Lanes, token: u32) u64 {
+    pub fn take(self: *Lanes, token: u32) u64 {
         const h = self.next;
         self.drawn[h % ring] = token;
         self.next += 1;
@@ -240,7 +251,7 @@ pub const Lanes = struct {
     }
 
     /// A prompt pass begins: the stream's slot bound and its sequence fresh; where the pass resumes (a kept state).
-    fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
+    pub fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
         const ids = s.prompt();
         if (ids.len + s.max_new + max_rows >= self.x.e.capacity) return error.PromptTooLong;
         const l = try self.claim(s);
@@ -281,7 +292,7 @@ pub const Lanes = struct {
     }
 
     /// Where the stream's prompt pass would start: its kept state's position if it resumes there, else 0.
-    fn resumable(self: *const Lanes, s: *const lanes.Stream, len: usize) usize {
+    pub fn resumable(self: *const Lanes, s: *const lanes.Stream, len: usize) usize {
         const saved = s.reuse.saved orelse return 0;
         const k: *const engine.Kept = @ptrCast(@alignCast(saved));
         if (k.at != s.reuse.at or k.at == 0 or k.at >= len or k.at % fw.prefill_rows != 0 or !self.x.e.holds(k.id)) return 0;
@@ -297,6 +308,10 @@ pub const Lanes = struct {
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
         const self = of(ptr);
         if (position != s.prompt_len) return error.PositionMismatch;
+        if (self.lanes.getPtr(s)) |l| if (l.first) |h| {
+            l.first = null;
+            return h;
+        };
         return self.next - 1;
     }
 

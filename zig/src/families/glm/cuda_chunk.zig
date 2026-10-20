@@ -3,6 +3,7 @@
 const std = @import("std");
 const engine = @import("cuda_engine.zig");
 const fw = @import("cuda_forward.zig");
+const digest = @import("cuda_digest.zig");
 const Engine = engine.Engine;
 
 const labels = [_][]const u8{ "prompt chunk to 64 rows", "prompt chunk to 256 rows", "prompt chunk to 1024 rows", "prompt chunk to 2048 rows" };
@@ -63,5 +64,6 @@ pub fn run(e: *Engine, part: []const u32, start: usize, len: usize, from: ?engin
     if (f.prof) |p| p.mark(e.stream, .mtp);
     try f.commit(rows);
     if (f.prof) |p| p.mark(e.stream, .commit);
+    if (last and start == 0 and digest.on()) try digest.seq(e, st, part[0..rows], if (e.drafter) |dr| (if (aside) dr.taps_aside else dr.taps_prefill) else 0, b.logits, "solo", first.?);
     return first;
 }

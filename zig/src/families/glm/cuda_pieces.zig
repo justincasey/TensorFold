@@ -1,8 +1,8 @@
 //! A prompt chunk's pieced exchanges (the Python family's overlap.Overlap): a second stream and each piece's events.
 const cuda = @import("cuda");
 
-/// overlap.PIECES_MAX: at most 16 pieces.
-pub const max_pieces = 16;
+/// Pieces' events at most: a chunk's (overlap.PIECES_MAX, 16) or a batched pass's (each prompt's own pieces).
+pub const max_pieces = 32;
 
 /// The second stream and events; `count`: TF_GLM_OVERLAP_PIECES (3).
 pub const Pieces = struct {

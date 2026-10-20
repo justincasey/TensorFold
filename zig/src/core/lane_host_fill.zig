@@ -1,5 +1,8 @@
 //! Prefer foreground and short prompts, with bounded waiting for every admitted fill.
+const std = @import("std");
+const lanes = @import("lanes");
 const LaneHost = @import("lane_host.zig").LaneHost;
+const Job = LaneHost.Job;
 
 pub const preference_rounds = 8;
 
@@ -31,6 +34,7 @@ pub fn held(h: *const LaneHost) ?usize {
 /// The next filling job's next prompt step: the other streams' rounds run between steps, not after the prompt.
 pub fn one(h: *LaneHost) void {
     if (h.filling.items.len == 0) return;
+    if (together(h)) return;
     var at = next(h);
     var job = h.filling.items[at];
     var done = false;
@@ -60,6 +64,51 @@ pub fn one(h: *LaneHost) void {
     _ = h.filling.orderedRemove(at);
     h.prefilled(job, job.began);
     _ = h.deliver(job);
+}
+
+fn shorter(_: void, a: *Job, b: *Job) bool {
+    return a.stream.prompt_len < b.stream.prompt_len;
+}
+
+/// Fresh fills' prompts in one pass, shortest first, the longest left out until the backend takes them; false: none.
+fn together(h: *LaneHost) bool {
+    if (!h.core.batchesPrompts() or held(h) != null) return false;
+    var jobs: [lanes.Engine.max_together]*Job = undefined;
+    var n: usize = 0;
+    for (h.filling.items) |j| if (!j.fill_began and !j.request.background and n < jobs.len) {
+        jobs[n] = j;
+        n += 1;
+    };
+    std.mem.sort(*Job, jobs[0..n], {}, shorter);
+    var streams: [lanes.Engine.max_together]*lanes.Stream = undefined;
+    var hooks: [lanes.Engine.max_together]?lanes.backend.Committed = undefined;
+    var errs: [lanes.Engine.max_together]?anyerror = undefined;
+    while (n >= 2) : (n -= 1) {
+        for (jobs[0..n], 0..) |job, i| {
+            streams[i] = &job.stream;
+            hooks[i] = .{ .ptr = job, .call = LaneHost.firstCommitted };
+        }
+        const took = h.core.fillTogether(streams[0..n], hooks[0..n], errs[0..n]) catch |e| {
+            for (jobs[0..n]) |job| {
+                unfill(h, job);
+                _ = h.drop(job, h.words(e));
+            }
+            return true;
+        };
+        if (!took) continue;
+        for (jobs[0..n], errs[0..n]) |job, err| {
+            job.fill_began = true;
+            unfill(h, job);
+            if (err) |e| {
+                _ = h.failedPass(job, e);
+                continue;
+            }
+            h.prefilled(job, job.began);
+            _ = h.deliver(job);
+        }
+        return true;
+    }
+    return false;
 }
 
 /// Takes `job` off the filling list, wherever it is.

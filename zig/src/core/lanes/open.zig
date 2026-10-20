@@ -47,6 +47,20 @@ pub fn addStreams(e: *Engine, ss: []const *Stream, errs: []?anyerror) void {
     };
 }
 
+/// Fresh streams' prompt passes in one backend pass (prefill_many), each opened with its hook; false: none taken.
+pub fn fillTogether(e: *Engine, ss: []const *Stream, hooks: []const ?be.Committed, errs: []?anyerror) !bool {
+    for (errs) |*x| x.* = null;
+    const many = e.backend.vtable.prefill_many orelse return false;
+    if (ss.len < 2 or ss.len > max_together or hooks.len != ss.len or errs.len != ss.len) return false;
+    _ = e.arena.reset(.retain_capacity);
+    if (!try many(e.backend.ptr, ss)) return false;
+    for (ss) |s| try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
+    for (ss, hooks, errs) |s, hook, *x| openedCommitted(e, s, .rule, hook) catch |err| { // cancelled in the pass: no first token
+        x.* = err;
+    };
+    return true;
+}
+
 fn addEach(e: *Engine, ss: []const *Stream, errs: []?anyerror) void {
     for (ss, errs) |s, *x| add(e, s) catch |err| {
         x.* = err;

@@ -7,9 +7,10 @@ const images_mod = @import("cuda_images.zig");
 const vcfg = @import("vision_config.zig");
 const sampler = @import("cuda_sampler.zig");
 const dflash = @import("dflash.zig");
+const batch_mod = @import("cuda_batch.zig");
 const Engine = engine.Engine;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, idle };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, idle, batch };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -201,6 +202,24 @@ pub const Leader = struct {
         return x.e.prefillLayers(part, start, ids.len, from, cancel, marks, lo, hi, aside);
     }
 
+    /// Several whole prompts in one forward on every rank (Engine.prefillBatch): slots and lengths, then the ids.
+    pub fn batch(x: Leader, segs: []batch_mod.Seg) !void {
+        if (segs.len == 0 or segs.len > batch_mod.max_segs) return error.BadBatch;
+        try x.flush();
+        var n: usize = 2 * segs.len;
+        for (segs) |g| n += g.ids.len;
+        const buf = try x.e.gpa.alloc(u32, n);
+        defer x.e.gpa.free(buf);
+        var at: usize = 2 * segs.len;
+        for (segs, 0..) |g, i| {
+            buf[2 * i ..][0..2].* = .{ g.slot, @intCast(g.ids.len) };
+            @memcpy(buf[at..][0..g.ids.len], g.ids);
+            at += g.ids.len;
+        }
+        try x.send(.{ .kind = @backingInt(Kind.batch), .depth = @intCast(segs.len) }, buf);
+        try x.e.prefillBatch(segs);
+    }
+
     pub fn verify(x: Leader, ids: []const u32, out: []u32) !void {
         try x.flush();
         try x.send(.{ .kind = @backingInt(Kind.verify) }, ids);
@@ -270,7 +289,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
         const step = try link.receive();
         const h = step.h;
         const kind: Kind = @fromBackingInt(@intCast(h.kind));
-        if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .idle) try e.bind(h.slot);
+        if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .idle and kind != .batch) try e.bind(h.slot);
         switch (kind) {
             .begin => try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null),
             .prefill => {
@@ -309,6 +328,21 @@ pub fn follow(e: *Engine, link: *Link) !void {
                     row += n;
                 }
                 try e.verifyShared(parts[0..k]);
+            },
+            .batch => {
+                const k = h.depth;
+                if (k == 0 or k > batch_mod.max_segs or step.ids.len < 2 * k) return error.BadStep;
+                const ids = try e.gpa.dupe(u32, step.ids);
+                defer e.gpa.free(ids);
+                var segs: [batch_mod.max_segs]batch_mod.Seg = undefined;
+                var at: usize = 2 * k;
+                for (segs[0..k], 0..) |*g, i| {
+                    const n = ids[2 * i + 1];
+                    if (at + n > ids.len) return error.BadStep;
+                    g.* = .{ .slot = ids[2 * i], .ids = ids[at..][0..n] };
+                    at += n;
+                }
+                try e.prefillBatch(segs[0..k]);
             },
             .keep => try e.keep(@intCast(h.a)),
             .draft => {

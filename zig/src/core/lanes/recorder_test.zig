@@ -23,7 +23,7 @@ const Case = struct {
     restored: u32 = 0,
 };
 
-const Mode = struct { mtp: bool = true, pipelined: bool = false, shared: bool = true, chunks: usize = 0, planted: ?[2][]const u8 = null, batched: bool = false, memory_lanes: ?usize = null }; // chunks: prefill_step; planted: a link's target and name
+const Mode = struct { mtp: bool = true, pipelined: bool = false, shared: bool = true, chunks: usize = 0, planted: ?[2][]const u8 = null, batched: bool = false, together: bool = false, memory_lanes: ?usize = null }; // chunks: prefill_step; planted: a link's target and name; together: fillTogether
 
 var costs: [16]Cost = undefined;
 
@@ -101,7 +101,11 @@ fn run(cases: []const Case, mode: Mode, record: bool) ![][]u32 {
         const ss = try a.alloc(*sm.Stream, streams.len);
         for (streams, ss) |*s, *p| p.* = s;
         const errs = try a.alloc(?anyerror, streams.len);
-        engine.addStreams(ss, errs);
+        if (mode.together) { // a refused pass leaves every stream to fill alone
+            const hooks = try a.alloc(?@import("backend.zig").Committed, streams.len);
+            @memset(hooks, null);
+            if (!try engine.fillTogether(ss, hooks, errs)) for (ss) |s| try engine.addStream(s);
+        } else engine.addStreams(ss, errs);
         for (errs) |err| if (err) |e| return e;
         try std.testing.expectEqual(@as(usize, if (mode.memory_lanes == null) 1 else 0), target.many_passes);
     } else for (streams) |*s| if (mode.chunks > 0) {
@@ -177,6 +181,8 @@ test "shared rounds: each stream's files hold its own rows, batched or not" {
 test "batched prompts record each stream's own rows, also after a refused batch falls back to solo" {
     try expectSame(&.{ .{ .prompt = &p1 }, .{ .prompt = &p2, .sampling = sampled }, .{ .prompt = &long, .drafts = false } }, .{ .batched = true });
     try expectSame(&.{ .{ .prompt = &p1, .max_new = 1 }, .{ .prompt = &p2, .max_new = 1 } }, .{ .batched = true, .memory_lanes = 1 });
+    try expectSame(&.{ .{ .prompt = &p1 }, .{ .prompt = &p2, .sampling = sampled }, .{ .prompt = &long, .drafts = false } }, .{ .batched = true, .together = true });
+    try expectSame(&.{ .{ .prompt = &p1, .max_new = 1 }, .{ .prompt = &p2, .max_new = 1 } }, .{ .batched = true, .together = true, .memory_lanes = 1 });
 }
 
 test "a restored prompt's files start at the first row the pass computed" {

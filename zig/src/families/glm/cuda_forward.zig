@@ -109,7 +109,7 @@ pub const Modules = struct {
 
 /// overlap.ROW_STEP: piece boundaries on the BF16 prompt matmul's 128-row blocks.
 pub const row_step = 128;
-const max_pieces = pieces_mod.max_pieces;
+pub const max_pieces = pieces_mod.max_pieces;
 const Pieces = pieces_mod.Pieces;
 
 /// overlap.ranges: [lo, hi) row pieces of a chunk of `rows`, about equal on row_step boundaries (fewer when short).
@@ -167,7 +167,7 @@ pub const Forward = struct {
     }
 
     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
-    fn gather(f: *const Forward, rows: usize) !void {
+    pub fn gather(f: *const Forward, rows: usize) !void {
         const c = &f.ranks[0].w.config;
         const bytes = rows * c.hidden * 4;
         switch (f.exchange) {
@@ -185,24 +185,24 @@ pub const Forward = struct {
         }
     }
 
-    fn slot(r: Rank, rows: usize) u64 {
+    pub fn slot(r: Rank, rows: usize) u64 {
         return r.b.gathered + r.w.share.rank * rows * r.w.config.hidden * 4;
     }
 
     /// forward._pre: hc_pre of every row at a site into b.normed, xs, post and comb.
-    fn pre(f: *const Forward, r: Rank, hc: weights.Hc, norm: u64, rows: usize) !void {
+    pub fn pre(f: *const Forward, r: Rank, hc: weights.Hc, norm: u64, rows: usize) !void {
         const c = &r.w.config;
         const b = r.b;
         try glue.hcPre(f.set(), f.stream, b.x, hc.fn_w, hc.base, hc.scale, norm, b.normed, b.xs, b.post, b.comb, b.hcpart, c.eps, c.hc_eps, c.sinkhorn, rows, c.hidden, c.hc);
     }
 
-    fn post(f: *const Forward, r: Rank, rows: usize) !void {
+    pub fn post(f: *const Forward, r: Rank, rows: usize) !void {
         const c = &r.w.config;
         try glue.hcPost(f.set(), f.stream, r.b.x, r.b.x, r.b.gathered, r.b.post, r.b.comb, rows, c.hidden, c.hc, r.w.share.world);
     }
 
     /// forward._mixer: the layer's KDA or DSA block on b.normed; `li`/`di`: its index among loaded KDA / DSA layers.
-    fn mixer(f: *const Forward, r: Rank, l: weights.Layer, li: usize, di: usize, rows: usize, nch: usize, out: ?u64) !void {
+    pub fn mixer(f: *const Forward, r: Rank, l: weights.Layer, li: usize, di: usize, rows: usize, nch: usize, out: ?u64) !void {
         const c = &r.w.config;
         const b = r.b;
         const st = r.st;
@@ -232,7 +232,7 @@ pub const Forward = struct {
     }
 
     /// forward._ffn: the dense MLP or MoE block on b.normed into this rank's slot.
-    fn ffn(f: *const Forward, r: Rank, l: weights.Layer, rows: usize, out: ?u64) !void {
+    pub fn ffn(f: *const Forward, r: Rank, l: weights.Layer, rows: usize, out: ?u64) !void {
         const c = &r.w.config;
         const b = r.b;
         switch (l.ffn) {
@@ -255,7 +255,7 @@ pub const Forward = struct {
         return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof };
     }
 
-    const Site = enum { mixer, ffn };
+    pub const Site = enum { mixer, ffn };
 
     /// forward.out_proj's fill of rows lo..hi at a site of layer `l` into `out` (this rank's rows of a piece).
     fn fillRows(f: *const Forward, r: Rank, l: weights.Layer, site: Site, lo: usize, hi: usize, out: u64) !void {
@@ -288,14 +288,14 @@ pub const Forward = struct {
     }
 
     /// overlap.Overlap.partials: each piece filled on the main stream, exchanged on the second (gathered or split).
-    fn exchangePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut: []const [2]usize) !void {
+    pub fn exchangePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut: []const [2]usize, q0: usize, shift: usize) !void {
         const D = f.ranks[0].w.config.hidden;
         const world = f.ranks[0].w.share.world;
-        for (cut, 0..) |piece, q| {
+        for (cut, q0..) |piece, q| { // events from q0; a batched mixer's scratch rows start at the cut's row `shift`
             const lo = piece[0];
             const n = piece[1] - lo;
             const split = f.splits(n);
-            for (f.ranks) |r| try f.fillRows(r, r.w.layers[j], site, lo, piece[1], if (split) r.b.part + lo * D * 4 else room(r, lo) + r.w.share.rank * n * D * 4);
+            for (f.ranks) |r| try f.fillRows(r, r.w.layers[j], site, lo - shift, piece[1] - shift, if (split) r.b.part + lo * D * 4 else room(r, lo) + r.w.share.rank * n * D * 4);
             try p.filled[q].record(f.stream);
             try p.side.wait(p.filled[q]);
             const bytes = n * D * 4;
@@ -359,7 +359,7 @@ pub const Forward = struct {
     }
 
     /// overlap.Overlap.glue: each piece's glue once its exchange is in, its rows then shared on the second stream.
-    fn gluePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut: []const [2]usize) !void {
+    pub fn gluePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut: []const [2]usize) !void {
         const c = &f.ranks[0].w.config;
         const D: usize = c.hidden;
         const world = f.ranks[0].w.share.world;
@@ -409,10 +409,10 @@ pub const Forward = struct {
         var li, var di = mixersBefore(layers, lo);
         for (layers[lo..hi], lo..) |_, j| {
             for (f.ranks) |r| try f.mixer(r, r.w.layers[j], li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), null);
-            try f.exchangePieces(p, j, .mixer, cut);
+            try f.exchangePieces(p, j, .mixer, cut, 0, 0);
             try f.gluePieces(p, j, .mixer, cut);
             for (f.ranks) |r| try f.ffn(r, r.w.layers[j], R, null);
-            try f.exchangePieces(p, j, .ffn, cut);
+            try f.exchangePieces(p, j, .ffn, cut, 0, 0);
             try f.gluePieces(p, j, .ffn, cut);
             if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, R);
             switch (layers[j].mixer) {

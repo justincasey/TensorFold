@@ -212,11 +212,16 @@ pub const Drafter = struct {
 
     /// A prompt chunk on slot `i` (rows start.. of a `len`-id prompt): its rows within the last window into the ring.
     pub fn prompt(dr: *Drafter, e: anytype, i: u32, start: usize, rows: usize, len: usize, aside: bool) !void {
+        return dr.promptTaps(e, i, start, rows, len, if (aside) dr.taps_aside else dr.taps_prefill);
+    }
+
+    /// `prompt` with the chunk's tap rows at `taps` (a batched prompt pass's segment).
+    pub fn promptTaps(dr: *Drafter, e: anytype, i: u32, start: usize, rows: usize, len: usize, rows_at: u64) !void {
         const keep_from = @as(usize, @intCast(@max(0, @as(i64, @intCast(len)) - WIN)));
         if (start + rows <= keep_from) return;
         const lo = keep_from -| start;
         const s = try dr.slot(i);
-        const run: Run = .{ .ring = s.ring.?.ptr, .taps = (if (aside) dr.taps_aside else dr.taps_prefill) + lo * TAP_ROW, .n = rows - lo, .pos0 = @intCast(start + lo) };
+        const run: Run = .{ .ring = s.ring.?.ptr, .taps = rows_at + lo * TAP_ROW, .n = rows - lo, .pos0 = @intCast(start + lo) };
         try dr.ingest(e, &.{run});
     }
 
