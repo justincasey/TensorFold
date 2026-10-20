@@ -17,7 +17,7 @@ fn set(e: anytype) glue.Set {
     return .{ .glue = &e.m.glue, .mm = &e.m.mm };
 }
 
-/// out[m, n] = x[m, k] . w^T, bf16 out (`wide`: fp32, glm_mm only): 4 bits 16 rows a launch, or glm_mm.
+/// out[m, n] = x[m, k] . w^T, bf16 out (`wide`: fp32, glm_mm only): 4 bits q4.max_rows rows a launch, or glm_mm.
 fn lin(dr: *const Drafter, e: anytype, x: u64, w: df.Lin, out: u64, m: usize, wide: bool) !void {
     switch (w) {
         .bf16 => |t| try mm.matmul(&e.m.mm, e.stream, x, t.k, t, out, dr.part, m, wide),
@@ -30,8 +30,8 @@ fn lin(dr: *const Drafter, e: anytype, x: u64, w: df.Lin, out: u64, m: usize, wi
             a.add(dr.gs);
             try go(dr.k.gsum, .{ .x = @intCast(m) }, 128, e, &a);
             var r0: usize = 0;
-            while (r0 < m) : (r0 += 16) {
-                const rows = @min(16, m - r0);
+            while (r0 < m) : (r0 += q4.max_rows) {
+                const rows = @min(q4.max_rows, m - r0);
                 try q4.matmul(&e.m.q4, e.stream, x + r0 * q.k * 2, q.k, dr.gs + r0 * (q.k / 64) * 4, q, out + r0 * q.n * 2, rows);
             }
         },
@@ -159,11 +159,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
     // every row through the drafts' 4-bit head (this rank's vocabulary), its 16 best, gathered; rank 0's projections
     try glue.rmsnorm(set(e), e.stream, dr.x, D, dr.norm, dr.hn, D, dr.xs, df.EPS, M, D);
     const head = e.w.mtp.?.draft;
-    var r0: usize = 0;
-    while (r0 < M) : (r0 += 16) {
-        const rows = @min(16, M - r0);
-        try q4.matmul(&e.m.q4, e.stream, dr.hn + r0 * D * 2, D, dr.xs + r0 * (D / 64) * 4, head, dr.logits + r0 * head.n * 2, rows);
-    }
+    try q4.matmul(&e.m.q4, e.stream, dr.hn, D, dr.xs, head, dr.logits, M);
     const chunks = (head.n + 4095) / 4096;
     const nw = M * df.CW;
     {
