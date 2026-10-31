@@ -1,4 +1,5 @@
 //! Which queued request a lane host admits next: the head, or one behind a head that waits for pool room.
+const std = @import("std");
 const api = @import("engine_api.zig");
 const LaneHost = @import("lane_host.zig").LaneHost;
 const Job = LaneHost.Job;
@@ -13,6 +14,7 @@ pub fn pick(h: *LaneHost) ?usize {
     if (!h.stale) fetch.queue(h); // disk states read ahead for queued requests, a lane free or not
     // a stale device takes no reply: `learn.refuse` ends the queued ones instead
     if (h.stale or h.queued.items.len == 0 or h.admitted.items.len >= @min(h.info_.lanes, h.memory_lanes orelse h.info_.lanes)) return null;
+    if (gathers(h)) return null; // an idle engine's fresh short prompts wait for others sent with them
     prefix.release(h); // requests whose awaited cut is in (or will not come) go on first
     while (true) { // a request that waits for a cut another prompt is filling stays queued, passed over
         const at = choose(h) orelse return null;
@@ -23,6 +25,27 @@ pub fn pick(h: *LaneHost) ?usize {
 /// Whether queued `job` is passed over: it waits for another fill's cut or for its disk state's read.
 fn passed(h: *LaneHost, job: *const Job) bool {
     return prefix.waiting(job) or fetch.held(h, job);
+}
+
+/// A batching engine, idle, admits its queued short prompts once none arrived for this long (they go in one pass)
+pub const gather_quiet_ns: i96 = 10 * std.time.ns_per_ms;
+/// or the first waited this long.
+pub const gather_ns: i96 = 60 * std.time.ns_per_ms;
+
+/// Whether an idle engine's queued prompts wait for others sent with them (lock held): every one short, foreground.
+pub fn gathers(h: *LaneHost) bool {
+    const n = h.core.backend.vtable.many_rows;
+    if (n == 0 or !h.core.batchesPrompts() or h.core.activeCount() != 0 or h.admitted.items.len != 0) return false;
+    if (h.queued.items.len >= lanes.Engine.max_together) return false;
+    var first: i96 = std.math.maxInt(i96);
+    var last: i96 = 0;
+    for (h.queued.items) |j| {
+        if (j.request.background or j.request.prompt.len > n) return false;
+        first = @min(first, j.submitted);
+        last = @max(last, j.submitted);
+    }
+    const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+    return now - last < gather_quiet_ns and now - first < gather_ns;
 }
 
 /// Whether every queued request waits for a cut or a read: an idle engine sleeps until a read wakes it (lock held).
@@ -57,6 +80,7 @@ fn fits(a: api.Admit, job: *const Job) bool {
 pub fn batches(h: *LaneHost) bool {
     if (!h.core.batchesPrompts()) return false;
     if (h.core.fills() and h.core.backend.vtable.many_rows == 0) return false;
+    if (@import("lane_host_fill.zig").held(h) != null) return false; // a chunk between layer groups holds the prompt buffers
     h.lock();
     defer h.unlock();
     const lanes_now = @min(h.info_.lanes, h.memory_lanes orelse h.info_.lanes);

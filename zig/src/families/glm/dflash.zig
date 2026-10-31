@@ -138,6 +138,7 @@ pub const Drafter = struct {
     ckv: u64 = 0,
     taps_step: u64 = 0,
     taps_prefill: u64 = 0,
+    taps_aside: u64 = 0, // a short chunk's on the aside prompt buffers (Engine.bq)
     ids: u64 = 0,
     bpos: u64 = 0,
     rings: u64 = 0,
@@ -187,9 +188,13 @@ pub const Drafter = struct {
         return now;
     }
 
-    /// Where a forward's taps go: a prompt chunk's rows or a verify's.
-    pub fn taps(dr: *const Drafter, chunk: bool) taps_mod.Taps {
-        return .{ .f = dr.k.tap, .out = if (chunk) dr.taps_prefill else dr.taps_step };
+    /// Where a forward's taps go: a prompt chunk's rows (on bp, or bq aside) or a verify's.
+    pub fn taps(dr: *const Drafter, to: enum { prefill, aside, step }) taps_mod.Taps {
+        return .{ .f = dr.k.tap, .out = switch (to) {
+            .prefill => dr.taps_prefill,
+            .aside => dr.taps_aside,
+            .step => dr.taps_step,
+        } };
     }
 
     fn slot(dr: *Drafter, i: u32) !*Slot {
@@ -213,9 +218,11 @@ pub const Drafter = struct {
         s.* = .{ .ring = s.ring, .from = s.from, .v_step = dr.verifies, .v_row0 = row0, .v_rows = rows, .v_pos0 = @intCast(pos0) };
     }
 
-    /// A prompt chunk on slot `i` (rows start.. of a `len`-id prompt): its rows within the last window into the ring.
-    pub fn prompt(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize) !void {
-        return dr.promptSegment(e, i, start, rows, len, 0);
+    /// A prompt chunk on slot `i` (rows start.. of a `len`-id prompt; bq's taps `aside`): its last window's rows in.
+    pub fn prompt(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, aside: bool) !void {
+        const s = try dr.slot(i);
+        const run = (try promptRun(s.ring.?.ptr, if (aside) dr.taps_aside else dr.taps_prefill, start, rows, len, 0)) orelse return;
+        try dr.ingest(e, &.{run});
     }
 
     /// The same ordinary context ingest, with this prompt's rows at row0 in the batched tap buffer.

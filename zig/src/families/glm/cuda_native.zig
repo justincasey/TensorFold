@@ -303,7 +303,8 @@ fn finishRank(a: OpenArgs) !Loaded {
     }.get;
     own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
     // with DFlash2 the first token leaves before the first draft block (open_first): TTFT pays no draft pass
-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .first_early = own.e.drafter != null and !off("TF_GLM_FIRST_EARLY") };
+    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .first_early = own.e.drafter != null and !off("TF_GLM_FIRST_EARLY"), .aside = !off("TF_GLM_FILL_ASIDE") };
+    if (std.c.getenv("TF_GLM_FILL_LAYERS")) |v| own.lanes.fill_layers = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadFillLayers;
     const extra: u64 = (if (o.drafter != null) dflash.ring_bytes else 0) + if (own.e.images) |v| v.streamBytes() else @as(usize, 0);
     own.layout = if (set.pages) try pages_mod.layout(gpa, own.e, extra) else null;
     return .{
@@ -414,6 +415,7 @@ fn release(own: *Owned) void {
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.BadRoceCap => "TF_ROCE_MAX_KB: give an integer from 1 through 4194303 KiB, or unset it for 4096 KiB",
+        error.BadFillLayers => "TF_GLM_FILL_LAYERS: give a prompt chunk's layers a group as an integer (0: whole chunks), or unset it",
         error.NoRank => "GLM-5.3-Flash runs at TP over hosts: set TF_GLM_RANK and TF_GLM_WORLD on every host (WORLD 1: one GPU, with TF_GLM_LAYERS for a thin model)",
         error.NoCommId => "GLM-5.3-Flash's ranks meet over NCCL: with TF_GLM_WORLD 2 or more, set NCCL_COMM_ID to rank 0's address:port on every host",
         error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",

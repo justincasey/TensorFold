@@ -71,6 +71,7 @@ pub const Engine = struct {
     pieces: Pieces,
     w: weights.Weights,
     bp: fw.Buffers, // prompt chunks
+    bq: fw.Buffers, // a short prompt chunk's while bp holds another's between its layer groups (aside_rows)
     bd: fw.Buffers, // verify windows
     bm: fw.Buffers, // the MTP head's rows
     bs: ?fw.Buffers = null, // shared verify windows (with the MTP head, as the lane core shares only then)
@@ -146,7 +147,7 @@ pub const Engine = struct {
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp, .graphs = .{ .gpa = gpa, .on = decode.Graphs.wanted() } };
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bq = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp, .graphs = .{ .gpa = gpa, .on = decode.Graphs.wanted() } };
         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
         const Tile = struct {
@@ -180,6 +181,8 @@ pub const Engine = struct {
         }
         e.bp = try fw.Buffers.init(d, &e.w, fw.prefill_rows, true, o.capacity);
         errdefer e.bp.deinit();
+        e.bq = try fw.Buffers.aside(d, &e.w, &e.bp, @import("cuda_state.zig").aside_rows);
+        errdefer e.bq.deinit();
         e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bd.deinit();
         e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
@@ -231,6 +234,7 @@ pub const Engine = struct {
         if (e.bs) |*b| b.deinit();
         e.bm.deinit();
         e.bd.deinit();
+        e.bq.deinit();
         e.bp.deinit();
         if (e.pages) |p| p.deinit();
         for (0..e.seqs.items.len) |i| e.free(i);
@@ -251,10 +255,11 @@ pub const Engine = struct {
         return .{ .nccl = .{ .lib = e.lib, .comm = e.comm, .group = e.group } };
     }
 
-    fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
+    pub fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null };
+        const taps = if (e.drafter) |dr| dr.taps(if (b == &e.bp) .prefill else if (b == &e.bq) .aside else .step) else null;
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp or b == &e.bq) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = taps };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -320,6 +325,7 @@ pub const Engine = struct {
         e.cur.sampling = sampler.check(sampling);
         e.cur.in_head = 0;
         try e.cur.st.reset(e.stream);
+        e.cur.layer = 0;
         if (e.drafter) |dr| try dr.restart(e.slot, 0);
     }
 
@@ -332,7 +338,7 @@ pub const Engine = struct {
     }
 
     /// Where a prompt pass of `len` ids starts: 0, or `from`'s position with its kept state restored.
-    fn prefillStart(e: *Engine, len: usize, from: ?Resume) !usize {
+    pub fn prefillStart(e: *Engine, len: usize, from: ?Resume) !usize {
         if (len == 0 or len + fw.window_rows >= e.cur.st.capacity) return error.PromptTooLong;
         const r = from orelse return 0;
         if (r.at == 0 or r.at >= len or r.at % fw.prefill_rows != 0) return error.BadResume;
@@ -343,75 +349,11 @@ pub const Engine = struct {
 
     /// One chunk of a `len`-id prompt pass: `part` from `start` plus the next id; first token at the end, else null.
     pub fn prefillChunk(e: *Engine, part: []const u32, start: usize, len: usize, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !?u32 {
-        const split = e.index_split; // this step's alone
-        e.index_split = false;
-        if ((from != null or start == 0) and try e.prefillStart(len, from) != start) return error.BadChunk;
-        if (start >= len or start % fw.prefill_rows != 0) return error.BadChunk;
-        const rows = @min(len - start, fw.prefill_rows);
-        if (part.len != @min(len - start, rows + 1)) return error.BadChunk;
-        var one: [1]fw.Rank = undefined;
-        var f = e.view(&e.bp, &one);
-        f.index_split = split;
-        const as_i32: []const i32 = @ptrCast(part);
-        if (f.taps) |*t| t.keep = dflash.keepFrom(len) -| start; // a split piece's tap rows before it aren't swapped
-        if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
-        f.prof = e.prompt_profs[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3];
-        const labels = [_][]const u8{ "prompt chunk to 64 rows", "prompt chunk to 256 rows", "prompt chunk to 1024 rows", "prompt chunk to 2048 rows" };
-        if (f.prof) |p| try p.beginPrompt(e.stream, labels[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3], .{ .rank = e.share.rank, .slot = e.slot, .start = start, .rows = rows }, e.c.run, e.pieces.count);
-        if (f.prof) |p| e.profiling_prompt = p;
-        defer if (f.prof != null) {
-            e.profiling_prompt = null;
-        };
-        defer if (f.prof) |p| p.end();
-        errdefer if (f.prof) |p| {
-            p.prompt.?.invalid = true;
-        };
-        var stamp = prof_mod.span(f.prof, e.stream, .gate);
-        e.gate(cancel) catch |err| {
-            if (err == error.Cancelled) try snapshots.interrupted(e, marks, @intCast(start));
-            return err;
-        };
-        stamp.end();
-        if (f.prof) |p| p.mark(e.stream, .gate);
-        try f.run(as_i32[0..rows]);
-        e.index_splits += @intFromBool(split);
-        stamp = prof_mod.span(f.prof, e.stream, .prompt_score);
-        if (e.prompt_logprobs) |p| if (part.len > 1) try prompt_lp.run(e, p, part[1..]);
-        stamp.end();
-        stamp = prof_mod.span(f.prof, e.stream, .draw);
-        const last = start + rows == len;
-        var first: ?u32 = null;
-        if (last) {
-            var t: [1]u32 = undefined;
-            try e.draw(e.bp.logits, 1, len, 0, &t);
-            first = t[0];
-        }
-        stamp.end();
-        if (f.prof) |p| p.mark(e.stream, .draw);
-        stamp = prof_mod.span(f.prof, e.stream, .drafter);
-        if (e.drafter) |dr| try dr.prompt(e, e.slot, start, rows, len); // after the draw: no first token waits on it
-        stamp.end();
-        if (last) try e.holdPrompt(e.bp.fnormed + (rows - 1) * e.c.hidden * 2);
-        stamp = prof_mod.span(f.prof, e.stream, .mtp);
-        if (e.mtp and e.drafter == null) { // DFlash2 drafts without the MTP head: its rows are never read
-            const nxt = as_i32[1..];
-            if (nxt.len > 0) { // decode._absorb_rows
-                const mp = f.prof;
-                defer f.prof = mp;
-                f.prof = null; // the head's pass as one section
-                try f.mtp(nxt, &.{e.bp.fnormed});
-                f.prof = mp;
-                try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + nxt.len);
-            }
-        }
-        stamp.end();
-        if (f.prof) |p| p.mark(e.stream, .mtp);
-        stamp = prof_mod.span(f.prof, e.stream, .commit);
-        try f.commit(rows);
-        stamp.end();
-        if (f.prof) |p| p.mark(e.stream, .commit);
-        return first;
+        return e.prefillLayers(part, start, len, from, cancel, marks, 0, e.w.layers.len, false);
     }
+
+    /// Layers lo..hi of a prompt chunk (cuda_chunk): other sequences' steps may run before its next group.
+    pub const prefillLayers = @import("cuda_chunk.zig").run;
 
     /// The chunk gate on every rank: a kept state at the mark, the heat wait, rank 0's cancel; the id exchanged first.
     pub fn gate(e: *Engine, cancel: ?Cancel) !void {

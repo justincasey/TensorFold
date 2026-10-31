@@ -369,6 +369,10 @@ pub const LaneHost = struct {
         const first = !job.fill_began;
         job.fill_began = true;
         const done = h.core.fillStreamCommitted(&job.stream, first, .{ .ptr = job, .call = firstCommitted }) catch |e| {
+            if (e == error.FillBusy) if (fill.held(h)) |mid| if (mid != at) { // it could not start beside a held chunk
+                job.fill_began = !first;
+                return h.fillAt(mid);
+            };
             _ = switch (e) {
                 error.Cancelled => h.cancel(job),
                 error.LaneMemory => blk: {
@@ -569,8 +573,9 @@ pub const LaneHost = struct {
                     continue;
                 }
                 if (rows_host.idle(h)) continue;
-                if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes or admit.holds(h)))
-                    h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
+                const ms: i64 = if (admit.gathers(h)) 1 else 100; // a gather's end is looked for each ms
+                if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes or admit.holds(h) or ms == 1))
+                    h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } }) catch {};
                 h.unlock();
                 continue;
             }

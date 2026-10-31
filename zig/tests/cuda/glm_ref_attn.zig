@@ -168,12 +168,44 @@ pub fn dense(r: *Rig, set: glm.glue.Set, kv8: bool) !void {
     try ref.sameRows(r, "latent attention: a second call's bytes equal the first's", wide, try attend(r, set, dq, c, pos, rows, scale, latent.heads_tile_wide), rows * heads * lw * 2);
     const on_pages = try paged(r, set, c, pos + rows);
     try ref.sameRows(r, "latent attention: on pages (written through the table) equals the window", wide, try attend(r, set, dq, on_pages, pos, rows, scale, latent.heads_tile_wide), rows * heads * lw * 2);
+    try segments(r, set, dq, c, on_pages, scale);
     const all = try r.back(wide, rows * heads * lw * 2);
     for ([_]usize{ 0, 37, 69 }) |row| {
         const one = try attend(r, set, dq + row * heads * lw * 2, c, pos + row, 1, scale, latent.headBlock(1));
         try sameRow(r, try std.fmt.bufPrint(&name, "latent attention: row {d} alone equals its row in the {d}-row call", .{ row, rows }), all, one, row);
     }
     check.pass("latent attention{s} over {d} keys: within float64 tolerance, both head blocks, one-row windows, repeats and pages equal", .{ tag(kv8), pos + rows });
+}
+
+/// A shared window's dense pass: segments on their own caches and positions (one on pages), each as its call alone.
+fn segments(r: *Rig, set: glm.glue.Set, dq: u64, c: Cache, on_pages: Cache, scale: f32) !void {
+    const Seg = struct { c: Cache, pos: usize, rows: usize };
+    const segs = [_]Seg{ .{ .c = c, .pos = 1000, .rows = 1 }, .{ .c = on_pages, .pos = 1200, .rows = 3 }, .{ .c = c, .pos = 400, .rows = 4 } };
+    var s: latent.Segs = .{ .n = segs.len };
+    var rows: usize = 0;
+    var nch: usize = 0;
+    for (segs, 0..) |g, i| {
+        const p: i32 = @intCast(g.pos);
+        s.row0[i] = @intCast(rows);
+        s.pos[i] = try r.dev(std.mem.asBytes(&p));
+        s.lc[i] = g.c.dev;
+        s.ls[i] = g.c.scales;
+        s.pt[i] = g.c.t.pt;
+        if (g.c.t.pt != 0) s.pstep = @intCast(g.c.t.ps);
+        rows += g.rows;
+        nch = @max(nch, latent.chunksFor(g.pos + g.rows));
+    }
+    const out = try r.zeros(rows * heads * lw * 2);
+    try latent.attentionSegs(set, r.s, &s, c.scales != 0, dq, try partials(r, nch, rows), out, try r.zeros(4), rows, heads, lw, nch, scale);
+    const all = try r.back(out, rows * heads * lw * 2);
+    var name: [128]u8 = undefined;
+    var row0: usize = 0;
+    for (segs, 0..) |g, i| {
+        const n = g.rows * heads * lw * 2;
+        const alone = try attend(r, set, dq + row0 * heads * lw * 2, g.c, g.pos, g.rows, scale, latent.heads_tile);
+        try check.sameBytes(try std.fmt.bufPrint(&name, "latent attention: shared window segment {d} equals its call alone", .{i}), try r.back(alone, n), all[row0 * heads * lw * 2 ..][0..n]);
+        row0 += g.rows;
+    }
 }
 
 /// Sparse attention on indexer lists (<= 1,100 of 6,000 keys): 70 rows vs float64, 1-row windows, count 0 left alone.

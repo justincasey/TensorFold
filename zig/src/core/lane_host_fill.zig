@@ -9,8 +9,9 @@ pub fn next(h: *const LaneHost) usize {
     return took(h, pick(h, .all).?);
 }
 
-/// Fill `at` taken: its wait starts over, every other one's grows.
+/// Fill `at` taken: its wait starts over, every other one's grows (a chunk's next layer group is no new choice).
 fn took(h: *const LaneHost, at: usize) usize {
+    if (h.filling.items[at].stream.mid_chunk) return at;
     for (h.filling.items, 0..) |j, i| j.fill_wait = if (i == at) 0 else j.fill_wait +| 1;
     return at;
 }
@@ -20,6 +21,7 @@ fn pick(h: *const LaneHost, among: enum { all, short, long }) ?usize {
     var found: ?usize = null;
     for (h.filling.items, 0..) |j, i| {
         if (among != .all and short(j) != (among == .short)) continue;
+        if (j.stream.mid_chunk) return i; // the chunk between layer groups goes on: no other can start beside it
         const at = found orelse {
             found = i;
             continue;
@@ -44,6 +46,18 @@ fn remaining(h: *const LaneHost, j: *const LaneHost.Job) u64 {
     else
         j.stream.cached;
     return j.stream.prompt_len -| completed;
+}
+
+/// The filling job whose chunk stands between layer groups (a busy backend's error.FillBusy: it goes on first), if any.
+pub fn held(h: *const LaneHost) ?usize {
+    for (h.filling.items, 0..) |j, i| if (j.stream.mid_chunk) return i;
+    return null;
+}
+
+/// Whether `job` still fills, its chunk between layer groups (it may have left the list, finished or ended).
+fn stillHeld(h: *const LaneHost, job: *const LaneHost.Job) bool {
+    for (h.filling.items) |j| if (j == job) return j.stream.mid_chunk;
+    return false;
 }
 
 /// Takes `job` off the filling list, wherever it is.
@@ -117,9 +131,11 @@ pub fn run(h: *LaneHost) void {
             burst += 1;
         }
         const counted = budget > 0 and runnable(h) > 0; // a stream that opened earlier in this visit waits from here
+        const job = h.filling.items[at];
         const rows = step(h, at);
         if (counted) used +|= rows;
         between(h);
+        if (stillHeld(h, job)) return; // its chunk goes on after the decoders' round, the visit's one step
     }
     if (first != null or (budget > 0 and used >= budget)) return; // one long step a visit at most, as before
     const at = pick(h, .long) orelse return;
@@ -308,4 +324,44 @@ test "prefill service: aged long priority keeps the existing stable winner over 
     try std.testing.expectEqual(@as(u64, 0), b.stream.fill_at.load(.monotonic));
     run(&host);
     try std.testing.expectEqual(@as(u64, 512), b.stream.fill_at.load(.monotonic));
+}
+
+test "prefill service: a chunk held between layer groups takes the long step before an aged, shorter one" {
+    const lanes = @import("lanes");
+    const api = @import("engine_api.zig");
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 4 };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.stepped(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 4 });
+    defer {
+        @import("lane_host_end.zig").closeAll(&host);
+        host.stop();
+    }
+    const Sink = struct {
+        fn event(_: *anyopaque, _: api.Id, _: *const api.Event) void {}
+    };
+    const prompt: [2048]u32 = @splat(3);
+    const aged: api.Request = .{ .prompt = prompt[0..1024], .max_tokens = 8 };
+    const holding: api.Request = .{ .prompt = &prompt, .max_tokens = 8 };
+    try host.engine().submit(1, &aged, .{ .ctx = &host, .event = Sink.event });
+    try std.testing.expect(host.admitOne());
+    try host.engine().submit(2, &holding, .{ .ctx = &host, .event = Sink.event });
+    try std.testing.expect(host.admitOne());
+    const a = host.filling.items[0];
+    const b = host.filling.items[1];
+    a.fill_wait = preference_rounds;
+    b.stream.mid_chunk = true;
+    try std.testing.expectEqual(@as(?usize, 1), held(&host));
+    run(&host);
+    try std.testing.expectEqual(@as(usize, preference_rounds), a.fill_wait); // a held chunk's group is no choice
+    try std.testing.expectEqual(@as(u64, 0), a.stream.fill_at.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 512), b.stream.fill_at.load(.monotonic));
+    b.stream.mid_chunk = false;
+    run(&host);
+    try std.testing.expectEqual(@as(u64, 256), a.stream.fill_at.load(.monotonic));
 }

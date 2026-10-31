@@ -19,7 +19,7 @@ pub const Header = extern struct {
     kind: u32,
     n: u32 = 0, // ids that follow
     depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts
-    flags: u32 = 0, // begin: sampled; draft: from the prompt; prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2); verify, shared: whole rows
+    flags: u32 = 0, // begin: sampled; draft: from the prompt; prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2), aside (4), layers lo << 8 | hi << 20 (0: all); verify, shared: whole rows
     a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
     seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position
     temperature: f64 = 0,
@@ -216,15 +216,16 @@ pub const Leader = struct {
         return x.e.prefill(ids, from, cancel, marks);
     }
 
-    /// One chunk of a prompt pass on every rank (Engine.prefillChunk); the first token once the chunk ends the prompt.
-    pub fn chunk(x: Leader, ids: []const u32, start: usize, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !?u32 {
-        if (start >= ids.len) return error.BadChunk;
+    /// Layers lo..hi of a prompt chunk on every rank (Engine.prefillLayers); the first token if it ends the prompt.
+    pub fn chunk(x: Leader, ids: []const u32, start: usize, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks, lo: usize, hi: usize, aside: bool) !?u32 {
+        if (start >= ids.len or hi >= 1 << 12) return error.BadChunk;
         try x.flush();
         const part = ids[start..@min(ids.len, start + engine.prompt_rows + 1)];
         const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world);
-        try x.send(.{ .kind = @backingInt(Kind.chunk), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
+        const flags = x.rows() | @as(u32, @intFromBool(split)) << 1 | @as(u32, @intFromBool(aside)) << 2 | @as(u32, @intCast(lo)) << 8 | @as(u32, @intCast(hi)) << 20;
+        try x.send(.{ .kind = @backingInt(Kind.chunk), .flags = flags, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
         x.e.index_split = split;
-        return x.e.prefillChunk(part, start, ids.len, from, cancel, marks);
+        return x.e.prefillLayers(part, start, ids.len, from, cancel, marks, lo, hi, aside);
     }
 
     /// `bits`: the rows' grammar words (structured output, with Engine.structured), else 0.
@@ -356,7 +357,8 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 defer e.gpa.free(ids);
                 const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
                 e.index_split = indexSplit(h);
-                _ = e.prefillChunk(ids, h.depth, h.top_k, from, null, null) catch |err| switch (err) {
+                const hi = if (h.flags >> 20 == 0) e.w.layers.len else h.flags >> 20;
+                _ = e.prefillLayers(ids, h.depth, h.top_k, from, null, null, h.flags >> 8 & 0xfff, hi, h.flags & 4 != 0) catch |err| switch (err) {
                     error.Cancelled => {},
                     else => return err,
                 };

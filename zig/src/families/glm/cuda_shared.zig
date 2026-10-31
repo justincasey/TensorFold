@@ -32,8 +32,8 @@ pub fn begin(r: fw.Rank, rows: usize, stream: cuda.Stream) !void {
 pub fn heads(f: *const fw.Forward, r: fw.Rank) !void {
     const D = r.w.config.hidden;
     const b = r.b;
-    for (r.segs, 0..) |g, k| try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(b.normed + k * D * 2, b.fnormed + (g.row0 + g.rows - 1) * D * 2, D * 2, f.stream.handle), "cuMemcpyDtoDAsync");
-    try projection.matmul(f.set(), f.stream, r.w.head, b.normed, D, b.logits, b.kda.mm_part, r.segs.len, r.w.share.vocab.len(), D, false);
+    const V = r.w.share.vocab.len();
+    for (r.segs, 0..) |g, k| try projection.matmul(f.set(), f.stream, r.w.head, b.fnormed + (g.row0 + g.rows - 1) * D * 2, D, b.logits + k * V * 2, b.kda.mm_part, 1, V, D, false);
 }
 
 /// Forward.mixer on a shared window: all rows' projections, each segment's chain or attention, o_proj (null: pieced).
@@ -44,18 +44,17 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
         .kda => |k| {
             var s = b.kda;
             s.p = b.kproj;
-            try kda_block.project(f.set(), f.stream, k, s, b.normed, c.hidden, rows);
-            if (b.prefill) try promptChains(f, r, k, li, s) else if (f.kda_wide) try chainSegs(f, r, k, li, s, rows) else try chainEach(f, r, k, li, s);
+            if (b.prefill) try promptChains(f, r, k, li, s) else {
+                try kda_block.project(f.set(), f.stream, k, s, b.normed, c.hidden, rows);
+                if (f.kda_wide) try chainSegs(f, r, k, li, s, rows) else try chainEach(f, r, k, li, s);
+            }
             if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
         },
-        .mla => |a| {
+        .mla => |a| if (b.prefill) try promptAttend(f, r, a, di, out) else {
             var sparse_any = false;
             for (r.segs) |g| sparse_any = sparse_any or dsa_block.sparseRows(a, g.st.pos, g.rows);
             try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, sparse_any);
-            if (b.prefill) for (r.segs) |g| {
-                const nch = @min(latent.chunksFor(g.st.pos + g.rows), b.nch);
-                try dsa_block.attend(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);
-            } else try attendSegs(f, r, a, di, rows);
+            try attendSegs(f, r, a, di, rows);
             try latent.expandV(f.set(), f.stream, b.dsa.ol, a.wv, b.dsa.vn, rows, a.heads, a.dv, a.lw, a.wkt != 0);
             if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
         },
@@ -87,10 +86,27 @@ fn attendSegs(f: *const fw.Forward, r: fw.Rank, a: dsa_block.Layer, di: usize, r
     for (r.segs) |g| if (dsa_block.sparseRows(a, g.st.pos, g.rows)) try dsa_block.sparseAttend(k, f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, b.part_rows);
 }
 
-/// A prompt buffer's KDA chains: each whole prompt's rows in place, the layer committed now (as Forward.mixer).
+/// A prompt buffer's DSA layer: each whole prompt's projections, attention and value rows as its pass alone has them.
+fn promptAttend(f: *const fw.Forward, r: fw.Rank, a: dsa_block.Layer, di: usize, out: ?u64) !void {
+    const b = r.b;
+    const D = r.w.config.hidden;
+    const k: dsa_block.Kernels = .{ .set = f.set(), .ops = f.m.ops() };
+    for (r.segs) |g| {
+        const s = dsa_block.from(a, b.dsa, g.row0);
+        try dsa_block.prepare(k.set, f.stream, a, s, b.normed + g.row0 * D * 2, D, g.rows, dsa_block.sparseRows(a, g.st.pos, g.rows));
+        const nch = @min(latent.chunksFor(g.st.pos + g.rows), b.nch);
+        try dsa_block.attend(k, f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);
+        const vn = b.dsa.vn + g.row0 * a.heads * a.dv * 2;
+        try latent.expandV(k.set, f.stream, s.ol, a.wv, vn, g.rows, a.heads, a.dv, a.lw, a.wkt != 0);
+        if (out) |o| try projection.matmul(k.set, f.stream, a.o, vn, a.heads * a.dv, o + g.row0 * D * 4, b.dsa.mm_part, g.rows, a.dims, a.heads * a.dv, true);
+    }
+}
+
+/// A prompt buffer's KDA layer: each whole prompt projected and chained as its pass alone would, committed now.
 fn promptChains(f: *const fw.Forward, r: fw.Rank, k: kda_block.Layer, li: usize, s: kda_block.Scratch) !void {
     const n = k.heads * kda.dk;
     const w = k.width();
+    const D = r.w.config.hidden;
     for (r.segs) |g| {
         const st = g.st;
         const cur = st.cur[li];
@@ -101,7 +117,8 @@ fn promptChains(f: *const fw.Forward, r: fw.Rank, k: kda_block.Layer, li: usize,
         v.saves.state_out = st.recAt(1 - cur, li);
         const conv = st.conv + li * 3 * st.conv_c * 2;
         v.p = s.p + g.row0 * w * 2;
-        try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), false, false);
+        try kda_block.project(f.set(), f.stream, k, v, r.b.normed + g.row0 * D * 2, D, g.rows);
+        try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), false, true);
         try glue.convShift(f.set(), f.stream, conv, v.p, g.rows, g.rows * w, w, 1, 3 * n);
         st.cur[li] = 1 - cur;
     }

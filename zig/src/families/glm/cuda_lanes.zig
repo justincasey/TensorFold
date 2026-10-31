@@ -9,6 +9,7 @@ const dflash = @import("dflash.zig");
 const prompt_lp = @import("cuda_prompt_logprobs.zig");
 const cuda = @import("cuda");
 const prof_mod = @import("cuda_prof.zig");
+const fill = @import("cuda_lanes_fill.zig");
 
 const be = lanes.backend;
 
@@ -19,6 +20,9 @@ const ring = 1024;
 pub const max_rows = fw.window_rows;
 const mtp_rows = 1 + engine.max_drafts;
 const max_held = dflash.BLOCK - 1; // a DFlash2 block's drafts (the MTP head's chains stop at max_drafts)
+/// Fresh prompts of batch_min to batch_rows rows fill together beside chunked fills (same bits as alone from 64 rows).
+const batch_rows = 512;
+const batch_min = 64;
 
 /// With DFlash2: a window's ms by rows on two GB10s (EXL3, TF_GLM_PROF: 86 to 107 ms at 5 to 8), shared as glm_cuda's.
 const gb10_window_costs = costTable(max_rows, 52.0, 6.8);
@@ -47,12 +51,16 @@ const Lane = struct {
     held_n: usize = 0,
     first: ?u64 = null,
     fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
+    layer: usize = 0, // that chunk's next layer group (0: the chunk starts there)
+    aside: bool = false, // that chunk's rows are in the aside prompt buffers (Engine.bq)
 };
 
 pub const Lanes = struct {
     x: follow.Leader,
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
+    fill_layers: usize = fill.default_fill_layers, // a chunk's layers a group beside decoders (TF_GLM_FILL_LAYERS)
+    aside: bool = true, // a short chunk may run on Engine.bq while another holds Engine.bp (TF_GLM_FILL_ASIDE)
     first_early: bool = false, // the first token leaves before the first DFlash2 block (TF_GLM_FIRST_EARLY=0: after)
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
@@ -105,8 +113,7 @@ pub const Lanes = struct {
         var v = whole_vt;
         v.prefill_step = prefillStepFn;
         v.cancel_prefill = cancelPrefillFn;
-        v.prefill_many = null;
-        v.many_rows = 0;
+        v.many_rows = batch_rows; // fresh short prompts arriving together go in one pass beside chunked fills
         break :vt v;
     };
 
@@ -138,7 +145,7 @@ pub const Lanes = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
-    fn take(self: *Lanes, token: u32) u64 {
+    pub fn take(self: *Lanes, token: u32) u64 {
         const h = self.next;
         self.drawn[h % ring] = token;
         self.next += 1;
@@ -185,7 +192,7 @@ pub const Lanes = struct {
         return l;
     }
 
-    fn cancelled(ptr: ?*anyopaque) bool {
+    pub fn cancelled(ptr: ?*anyopaque) bool {
         return @as(*lanes.Stream, @ptrCast(@alignCast(ptr.?))).isCancelled();
     }
 
@@ -213,12 +220,17 @@ pub const Lanes = struct {
         var firsts: [engine.max_together]u32 = undefined;
         var lo: usize = 0;
         var rows: usize = 0;
+        var pieces: usize = 0; // each prompt's own pieces (fw.cuts)
         for (ss, 0..) |s, i| {
-            if (rows + s.prompt_len > engine.prompt_rows) { // this pass is full: run it, the next starts here
+            var cut: [fw.max_pieces][2]usize = undefined;
+            const k = fw.ranges(s.prompt_len, self.x.e.pieces.count, &cut);
+            if (rows + s.prompt_len > engine.prompt_rows or pieces + k > fw.max_pieces) { // full: run it, the next starts here
                 try self.many(ss[lo..i], parts[lo..i], firsts[lo..i]);
                 lo = i;
                 rows = 0;
+                pieces = 0;
             }
+            pieces += k;
             if (try self.opening(s) != null) return error.BadPrompts; // no kept state (checked above)
             opened += 1;
             parts[i] = .{ .slot = self.lanes.getPtr(s).?.slot, .ids = s.prompt() };
@@ -233,49 +245,16 @@ pub const Lanes = struct {
         for (ss, firsts) |s, t| self.lanes.getPtr(s).?.first = self.take(t);
     }
 
-    /// One chunk of the stream's prompt pass (other rounds run between); true once the first token is drawn.
     fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
-        const self = of(ptr);
-        const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
-        const from = if (going == null) try self.opening(s) else null;
-        if (going == null) try self.images(s, from);
-        const l = self.lanes.getPtr(s).?;
-        if (going != null) try self.x.bind(l.slot);
-        const at = going orelse if (from) |r| r.at else 0;
-        errdefer l.fill = null;
-        var sink: Sink = .{ .gpa = self.x.e.gpa, .s = s };
-        try sink.prepare();
-        self.x.e.prompt_logprobs = sink.want();
-        defer self.x.e.prompt_logprobs = null;
-        if (try self.x.chunk(s.prompt(), at, from, .{ .ptr = s, .check = cancelled }, marksOf(s))) |first| {
-            l.first = self.take(first);
-            l.fill = null;
-            return true;
-        }
-        l.fill = at + engine.prompt_rows;
-        if (s.settle_step) try self.x.e.stream.synchronize(); // its tail would land in the next decode round's time
-        return false;
+        return fill.step(of(ptr), s);
     }
 
     fn cancelPrefillFn(ptr: *anyopaque, s: *lanes.Stream) !void {
-        const self = of(ptr);
-        const l = self.lanes.getPtr(s) orelse return;
-        const at = l.fill orelse return;
-        if (at <= s.cached or s.reuse.hook == null) return;
-        try self.x.bind(l.slot);
-        _ = self.x.chunk(s.prompt(), at, null, .{ .ptr = null, .check = cancelNow }, marksOf(s)) catch |err| {
-            if (err == error.Cancelled) return;
-            return err;
-        };
-        return error.CancellationIgnored;
-    }
-
-    fn cancelNow(_: ?*anyopaque) bool {
-        return true;
+        return fill.cancel(of(ptr), s);
     }
 
     /// A prompt pass begins: the stream's slot bound and its sequence fresh; where the pass resumes (a kept state).
-    fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
+    pub fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
         const ids = s.prompt();
         if (ids.len + s.max_new + max_rows >= self.x.e.capacity) return error.PromptTooLong;
         const pages = try self.seat(s, ids.len, s.max_new);
@@ -321,15 +300,15 @@ pub const Lanes = struct {
     }
 
     /// A prompt pass with images: rank 0's tower encodes those past `from`, then every rank holds their rows.
-    fn images(self: *Lanes, s: *lanes.Stream, from: ?engine.Resume) !void {
+    pub fn images(self: *Lanes, s: *lanes.Stream, from: ?engine.Resume) !void {
         if (s.images.len == 0) return;
         const v = self.x.e.images orelse return error.NoVision;
         try v.begin(self.x.e.slot, s.images, if (from) |r| r.at else 0); // a refusal here leaves every rank as it was
         try self.x.images(v);
     }
-    const Sink = @import("cuda_prompt_sink.zig").Sink;
+    pub const Sink = @import("cuda_prompt_sink.zig").Sink;
 
-    fn marksOf(s: *lanes.Stream) ?engine.Marks {
+    pub fn marksOf(s: *lanes.Stream) ?engine.Marks {
         return if (s.reuse.hook == null) null else .{
             .at = s.reuse.marks,
             .ctx = s,
@@ -342,7 +321,7 @@ pub const Lanes = struct {
     fn resumeFrom(self: *Lanes, s: *lanes.Stream, len: usize) ?engine.Resume {
         const saved = s.reuse.saved orelse return null;
         const k: *const engine.Kept = @ptrCast(@alignCast(saved));
-        if (k.at != s.reuse.at or k.at == 0 or k.at >= len or k.at % fw.prefill_rows != 0 or !self.x.e.holds(k.id)) {
+        if (fill.resumable(self, s, len) == 0) {
             s.reuse_failed = true;
             s.reuse_error = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at or k.at % fw.prefill_rows != 0) error.SnapshotOutOfStep else error.SnapshotStale;
             return null;
@@ -612,5 +591,5 @@ test "a failed lane insertion leaves no entry, and a retry takes slot zero" {
 
 /// Eligibility for the maintained fresh-prompt batching path.
 pub fn canBatch(s: anytype) bool {
-    return s.prompt_logprobs == null and s.images.len == 0 and s.reuse.saved == null and s.prompt_len <= engine.prompt_rows;
+    return s.prompt_logprobs == null and s.images.len == 0 and s.reuse.saved == null and s.prompt_len >= batch_min and s.prompt_len <= engine.prompt_rows;
 }

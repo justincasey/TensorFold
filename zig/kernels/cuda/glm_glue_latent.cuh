@@ -1,6 +1,8 @@
 // latent.py's BF16 absorb, expand and cache write by hand (the MLA layers' 512-wide latent, 256-wide heads).
 #pragma once
 
+#include <cuda_fp8.h>
+
 #include "glm_triton.cuh"
 
 using namespace glm_triton;
@@ -103,8 +105,8 @@ extern "C" __global__ void __launch_bounds__(128)
   amax = fmaxf(fmaxf(wmax[0], wmax[2]), fmaxf(wmax[1], wmax[3]));
   const float s = amax > 0.0f ? glm_triton::div_full(amax, 448.0f) : 1.0f;
   if (t == 0) scales[sat] = s;
-  unsigned short c0, c1;
-  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(c0) : "f"(glm_triton::div_full(lo.y, s)), "f"(glm_triton::div_full(lo.x, s)));
-  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(c1) : "f"(glm_triton::div_full(hi.y, s)), "f"(glm_triton::div_full(hi.x, s)));
-  *reinterpret_cast<unsigned*>(cache + at + 4 * t) = (unsigned)c0 | ((unsigned)c1 << 16);
+  // e4m3x2 round-to-nearest, saturating: the cvt instruction from sm_89, cuda_fp8.h's same rounding before it
+  const unsigned c0 = __nv_cvt_float2_to_fp8x2(make_float2(glm_triton::div_full(lo.x, s), glm_triton::div_full(lo.y, s)), __NV_SATFINITE, __NV_E4M3);
+  const unsigned c1 = __nv_cvt_float2_to_fp8x2(make_float2(glm_triton::div_full(hi.x, s), glm_triton::div_full(hi.y, s)), __NV_SATFINITE, __NV_E4M3);
+  *reinterpret_cast<unsigned*>(cache + at + 4 * t) = c0 | (c1 << 16);
 }

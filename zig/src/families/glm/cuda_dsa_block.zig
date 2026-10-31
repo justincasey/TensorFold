@@ -139,7 +139,7 @@ pub fn scaleOf(l: Layer) f32 {
 }
 
 /// The scratch from row r0 (the rows of one sequence in a shared window).
-fn from(l: Layer, s: Scratch, r0: usize) Scratch {
+pub fn from(l: Layer, s: Scratch, r0: usize) Scratch {
     const ix = l.index;
     var v = s;
     v.lat += r0 * l.lw * 2;
