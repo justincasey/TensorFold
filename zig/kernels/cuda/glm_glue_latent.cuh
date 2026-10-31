@@ -83,13 +83,28 @@ extern "C" __global__ void tf_glm_lat_write(const __nv_bfloat16* lat, int64_t la
   for (int64_t k = threadIdx.x; k < lw; k += blockDim.x) cache[at + k] = lat[r * lat_stride + k];
 }
 
-#include "kv_fp8.cuh"
-
-// One 512-wide latent row as E4M3 and its FP32 scale, with the same row-wise rounding as other FP8 caches.
-extern "C" __global__ void __launch_bounds__(512)
-    tf_glm_lat_write_fp8(const __nv_bfloat16* lat, int64_t stride, unsigned char* cache, float* scales, const int* pos) {
-  const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
-  const int d = threadIdx.x;
-  __shared__ float red[16];
-  tf_kv_fp8::quant_row<512, true>(__bfloat162float(lat[r * stride + d]), d, cache + at * 512, scales + at, red);
+// The fp8 latent cache's write (--kv-cache fp8), 128 threads of 4 values (lw 512): e4m3 codes of x / s, s = amax / 448.
+// Slot p's codes and scale: row p of the window, or row p % 512 of page pt[p / 512] (codes ps bytes, scales ps / 4 apart).
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_lat_write8(const __nv_bfloat16* lat, int64_t lat_stride, uint8_t* cache, float* scales, const int* pos,
+                      const int* pt, int64_t ps) {
+  constexpr int LW = 512;
+  __shared__ float wmax[4];
+  const int t = threadIdx.x;
+  const int64_t r = blockIdx.x, p = (int64_t)pos[0] + r;
+  const int64_t at = glm_pages::at<512>(pt, ps, p, LW), sat = glm_pages::at<512>(pt, ps / 4, p, 1);
+  const uint2 raw = *reinterpret_cast<const uint2*>(lat + r * lat_stride + 4 * t);
+  const float2 lo = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
+  const float2 hi = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
+  float amax = fmaxf(fmaxf(fabsf(lo.x), fabsf(lo.y)), fmaxf(fabsf(hi.x), fabsf(hi.y)));
+  for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+  if ((t & 31) == 0) wmax[t >> 5] = amax;
+  __syncthreads();
+  amax = fmaxf(fmaxf(wmax[0], wmax[2]), fmaxf(wmax[1], wmax[3]));
+  const float s = amax > 0.0f ? glm_triton::div_full(amax, 448.0f) : 1.0f;
+  if (t == 0) scales[sat] = s;
+  unsigned short c0, c1;
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(c0) : "f"(glm_triton::div_full(lo.y, s)), "f"(glm_triton::div_full(lo.x, s)));
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(c1) : "f"(glm_triton::div_full(hi.y, s)), "f"(glm_triton::div_full(hi.x, s)));
+  *reinterpret_cast<unsigned*>(cache + at + 4 * t) = (unsigned)c0 | ((unsigned)c1 << 16);
 }

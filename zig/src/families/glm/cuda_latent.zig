@@ -65,17 +65,16 @@ pub fn cacheBytes(capacity: usize, lw: usize, kv8: bool) !usize {
     return std.math.mul(usize, capacity, row);
 }
 
-/// On pages: the stream's table (i32 page ids) and the step from page to page in bytes and latent rows; 0: in order.
+/// On pages: the stream's i32 page table, the page step in bytes and in cache rows (ps / (lw * 2), fp8 ps / lw).
 pub const Table = struct { pt: u64 = 0, ps: u64 = 0, page_rows: u64 = 0 };
 
-/// BF16 rows through `t`, or E4M3 rows and their scales (scales nonzero), which take no pages.
+/// BF16 rows through `t`, or E4M3 codes and their row scales (scales nonzero: our tf_glm_lat_write8), windows or pages.
 pub fn latentWriteFormat(set: glue.Set, stream: cuda.Stream, lat: u64, lat_stride: usize, cache: u64, scales: u64, t: Table, pos: u64, rows: usize, lw: usize) !void {
     if (scales == 0) return latentWrite(set, stream, lat, lat_stride, cache, t, pos, rows, lw);
-    if (lw != 512) return error.LatentShape;
-    if (t.pt != 0) return error.Fp8OnPages;
+    if (lw != 512 or lat_stride % 4 != 0 or lat % 8 != 0 or t.ps % 4 != 0) return error.LatentShape;
     var a: cuda.Args = .{};
-    inline for (.{ lat, @as(i64, @intCast(lat_stride)), cache, scales, pos }) |v| a.add(v);
-    try cuda.launch.launch(set.glue.lat_write_fp8, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 512 } }, stream, &a);
+    inline for (.{ lat, @as(i64, @intCast(lat_stride)), cache, scales, pos, t.pt, @as(i64, @intCast(t.ps)) }) |v| a.add(v);
+    try cuda.launch.launch(set.glue.lat_write8, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 } }, stream, &a);
 }
 
 /// latent.latent_write: rows of `lat` (stride `lat_stride`) into slots pos .. pos + rows - 1 (pos an i32 on device).
@@ -101,22 +100,22 @@ pub fn attentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, 
 /// latent._dense_chunks (sparse false: keys through pos + r) and _sparse_chunks (row r's `counts` tokens of `tokens`).
 fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, pos: u64, tokens: u64, counts: u64, p: Partials, rows: usize, heads: usize, lw: usize, nch: usize, w: usize, scale: f32, hb: usize, sparse: bool) !void {
     if (lw != 512) return error.LatentShape;
-    if (scales != 0 and t.pt != 0) return error.Fp8OnPages;
+    const fp8 = scales != 0;
     const f = switch (hb) {
-        heads_tile => if (scales == 0) set.glue.chunks_16 else set.glue.chunks_16_fp8,
-        heads_tile_wide => if (scales == 0) set.glue.chunks_32 else set.glue.chunks_32_fp8,
+        heads_tile => if (fp8) set.glue.chunks8_16 else set.glue.chunks_16,
+        heads_tile_wide => if (fp8) set.glue.chunks8_32 else set.glue.chunks_32,
         else => return error.HeadBlock,
     };
     var a: cuda.Args = .{};
-    a.add(qa);
-    a.add(cache);
-    if (scales != 0) a.add(scales);
-    inline for (.{ pos, tokens, counts, p.po, p.pm, p.pl, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(w)), scale, @as(c_int, @intFromBool(sparse)) }) |v| a.add(v);
-    if (scales == 0) {
-        a.add(t.pt);
-        a.add(@as(i64, @intCast(t.ps)));
-    }
-    const shared = if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
+    inline for (.{ qa, cache, pos, tokens, counts, p.po, p.pm, p.pl, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(w)), scale, @as(c_int, @intFromBool(sparse)) }) |v| a.add(v);
+    if (fp8) a.add(scales);
+    a.add(t.pt);
+    a.add(@as(i64, @intCast(t.ps)));
+    if (fp8) a.add(@as(i64, @intCast(t.page_rows)));
+    const shared = switch (hb) {
+        heads_tile_wide => if (fp8) glue.chunksSmem8(heads_tile_wide) else glue.chunksSmem(heads_tile_wide),
+        else => if (fp8) glue.chunksSmem8(heads_tile) else glue.chunksSmem(heads_tile),
+    };
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = 256 }, .shared = shared }, stream, &a);
 }
 

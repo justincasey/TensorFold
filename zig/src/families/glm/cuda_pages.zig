@@ -15,7 +15,7 @@ pub fn tableLen(capacity: usize) usize {
 /// What a stream of engine `e` holds: its fixed part and table (and `extra`, its other buffers), 13,056 bytes a token.
 pub fn layout(gpa: std.mem.Allocator, e: *const Engine, extra: u64) !kv.Layout {
     const fixed = try state.State.pagedBytes(gpa, &e.w, e.capacity, tableLen(e.capacity));
-    const page = state.pageBytes(&e.w);
+    const page = state.pageBytes(&e.w, e.settings.kv8);
     return .{ .fixed_bytes = fixed + extra, .token_bytes = page / state.page_rows, .page_tokens = state.page_rows, .snap_bytes = 0 };
 }
 
@@ -30,15 +30,15 @@ pub fn ownSequence(e: *Engine) !void {
     if (e.seqs.items[0] != null) return error.SlotTaken;
     const q = try e.gpa.create(types.Seq);
     errdefer e.gpa.destroy(q);
-    q.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, on(e, 0, state.pageBytes(&e.w))) };
+    q.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, on(e, 0, state.pageBytes(&e.w, e.settings.kv8))) };
     e.seqs.items[0] = q;
     e.cur = q;
     e.slot = 0;
 }
 
-/// A sequence's place on the pages at `kv`: a table as long as a stream's window.
+/// A sequence's place on the pages at `kv`: a table as long as a stream's window, rows in the engine's cache format.
 fn on(e: *const Engine, kv_at: u64, page: u64) state.Paged {
-    return .{ .kv = kv_at, .pages = tableLen(e.capacity), .page_bytes = page };
+    return .{ .kv = kv_at, .pages = tableLen(e.capacity), .page_bytes = page, .kv8 = e.settings.kv8 };
 }
 
 pub const Pages = struct {

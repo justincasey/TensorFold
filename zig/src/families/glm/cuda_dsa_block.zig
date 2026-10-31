@@ -134,8 +134,9 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
     v.qa += r0 * l.heads * l.lw * 2;
     v.ol += r0 * l.heads * l.lw * 2;
     v.qi += r0 * ix.heads * ix.d * 2;
-    if (c.ps % (l.lw * 2) != 0) return error.LatentShape; // pages whole latent rows apart (the token lists' unit)
-    const t: latent.Table = .{ .pt = c.pt, .ps = c.ps, .page_rows = c.ps / (l.lw * 2) };
+    const row_bytes: u64 = if (c.ls != 0) l.lw else l.lw * 2; // an fp8 row: lw e4m3 codes (its scale beside, a float)
+    if (c.ps % row_bytes != 0) return error.LatentShape; // pages whole cache rows apart (the token lists' unit)
+    const t: latent.Table = .{ .pt = c.pt, .ps = c.ps, .page_rows = c.ps / row_bytes };
     var stamp = prof.span(k.prof, stream, .cache_write);
     try latent.latentWriteFormat(set, stream, v.lat, l.lw, c.lc, c.ls, t, pos, rows, l.lw);
     stamp.end();

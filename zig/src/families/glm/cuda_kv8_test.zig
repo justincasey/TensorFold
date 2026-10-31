@@ -80,14 +80,17 @@ const Launch = struct {
     var ids: [16]usize = undefined;
     var blocks: [16]u32 = undefined;
     var scales: [16]u64 = undefined;
+    var tables: [16]u64 = undefined;
+    fn arg(args: ?[*]?*anyopaque, i: usize) u64 {
+        return @as(*const u64, @ptrCast(@alignCast(args.?[i].?))).*;
+    }
     fn run(f: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, bx: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) c_int {
         const id = @intFromPtr(f);
         ids[n] = id;
         blocks[n] = bx;
-        scales[n] = if (id == 2) @as(*const u64, @ptrCast(@alignCast(args.?[3].?))).* else if (id == 4 or id == 6)
-            @as(*const u64, @ptrCast(@alignCast(args.?[2].?))).*
-        else
-            0;
+        // tf_glm_lat_write8 (lat, stride, cache, scales, pos, pt, ps); tf_glm_chunks8_* (.., sparse, ls, pt, ps, rows)
+        scales[n] = if (id == 2) arg(args, 3) else if (id == 4 or id == 6) arg(args, 13) else 0;
+        tables[n] = if (id == 2) arg(args, 5) else if (id == 4 or id == 6) arg(args, 14) else 0;
         n += 1;
         return 0;
     }
@@ -100,19 +103,19 @@ test "GLM FP8 KV: real launchers preserve BF16 ABI and pass FP8 scale pointers f
     d.api.cuLaunchKernel = Launch.run;
     var ks: glue.Kernels = undefined;
     ks.lat_write = .{ .d = &d, .handle = @ptrFromInt(1) };
-    ks.lat_write_fp8 = .{ .d = &d, .handle = @ptrFromInt(2) };
+    ks.lat_write8 = .{ .d = &d, .handle = @ptrFromInt(2) };
     ks.chunks_16 = .{ .d = &d, .handle = @ptrFromInt(3) };
-    ks.chunks_16_fp8 = .{ .d = &d, .handle = @ptrFromInt(4) };
+    ks.chunks8_16 = .{ .d = &d, .handle = @ptrFromInt(4) };
     ks.chunks_32 = .{ .d = &d, .handle = @ptrFromInt(5) };
-    ks.chunks_32_fp8 = .{ .d = &d, .handle = @ptrFromInt(6) };
+    ks.chunks8_32 = .{ .d = &d, .handle = @ptrFromInt(6) };
     ks.merge = .{ .d = &d, .handle = @ptrFromInt(7) };
     const set: glue.Set = .{ .glue = &ks };
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
     Launch.n = 0;
     try latent.latentWriteFormat(set, stream, 100, 512, 200, 0, .{}, 300, 3, 512);
-    try latent.latentWriteFormat(set, stream, 100, 512, 200, 400, .{}, 300, 3, 512);
+    try latent.latentWriteFormat(set, stream, 128, 512, 200, 400, .{}, 300, 3, 512);
     try t.expectEqualSlices(usize, &.{ 1, 2 }, Launch.ids[0..2]);
-    try t.expectEqualSlices(u32, &.{ 128, 512 }, Launch.blocks[0..2]);
+    try t.expectEqualSlices(u32, &.{ 128, 128 }, Launch.blocks[0..2]);
     try t.expectEqual(@as(u64, 400), Launch.scales[1]);
     const p: latent.Partials = .{ .po = 1000, .pm = 2000, .pl = 3000 };
     for ([_]usize{ 16, 32 }) |hb| for ([_]u64{ 0, 400 }) |scale| {
@@ -128,22 +131,28 @@ test "GLM FP8 KV: real launchers preserve BF16 ABI and pass FP8 scale pointers f
     try t.expectEqual(@as(u64, 400), Launch.scales[0]);
 }
 
-test "GLM FP8 KV: an FP8 cache takes no page table, so its writes and reads refuse one before they launch" {
+test "GLM FP8 KV: an FP8 cache on pages passes its table to the write and to dense and sparse reads" {
     const glue = @import("cuda_glue.zig");
     const latent = @import("cuda_latent.zig");
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernel = Launch.run;
     var ks: glue.Kernels = undefined;
     inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) };
+    ks.lat_write8.handle = @ptrFromInt(2);
+    ks.chunks8_16.handle = @ptrFromInt(4);
     const set: glue.Set = .{ .glue = &ks };
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
-    const paged: latent.Table = .{ .pt = 900, .ps = 6_684_672, .page_rows = 6_528 };
+    const paged: latent.Table = .{ .pt = 900, .ps = 3_563_520, .page_rows = 6_960 };
     const p: latent.Partials = .{ .po = 1000, .pm = 2000, .pl = 3000 };
     Launch.n = 0;
-    try t.expectError(error.Fp8OnPages, latent.latentWriteFormat(set, stream, 100, 512, 200, 400, paged, 300, 3, 512));
-    try t.expectError(error.Fp8OnPages, latent.attentionFormat(set, stream, 100, 200, 400, paged, 300, p, 500, 600, 3, 32, 512, 1, 0.125, 16));
-    try t.expectError(error.Fp8OnPages, latent.sparseAttentionFormat(set, stream, 100, 200, 400, paged, 500, 600, 2051, p, 700, 3, 32, 512, 0.125));
-    try t.expectEqual(@as(usize, 0), Launch.n);
+    try latent.latentWriteFormat(set, stream, 128, 512, 200, 400, paged, 300, 3, 512);
+    try latent.attentionFormat(set, stream, 100, 200, 400, paged, 300, p, 500, 600, 3, 32, 512, 1, 0.125, 16);
+    try latent.sparseAttentionFormat(set, stream, 100, 200, 400, paged, 500, 600, 2051, p, 700, 3, 32, 512, 0.125);
+    try t.expectEqualSlices(usize, &.{ 2, 4, 10, 4, 10 }, Launch.ids[0..5]);
+    for ([_]usize{ 0, 1, 3 }) |i| {
+        try t.expectEqual(@as(u64, 400), Launch.scales[i]);
+        try t.expectEqual(@as(u64, 900), Launch.tables[i]);
+    }
 }
 
 const Ops = struct {
@@ -172,8 +181,8 @@ test "GLM FP8 KV: actual DSA dense and sparse passes retain the sequence-owned s
     d.api.cuModuleGetFunction = Ops.function;
     var ks: glue.Kernels = undefined;
     inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) };
-    ks.lat_write_fp8.handle = @ptrFromInt(2);
-    ks.chunks_16_fp8.handle = @ptrFromInt(4);
+    ks.lat_write8.handle = @ptrFromInt(2);
+    ks.chunks8_16.handle = @ptrFromInt(4);
     ks.merge.handle = @ptrFromInt(7);
     const k: dsa.Kernels = .{ .set = .{ .glue = &ks }, .ops = .{ .d = &d, .handle = null } };
     const stream: cuda.Stream = .{ .d = &d, .handle = null };

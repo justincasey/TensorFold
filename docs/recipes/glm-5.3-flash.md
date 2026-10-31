@@ -123,6 +123,14 @@ chunk can see, rounded up to a power of two. Every kernel computes a row alone i
 position, so a decode window's rows keep the serial steps' bits; prompt chunks give the same bits for any
 chunking. The memory estimate sizes the latent cache (`mla_geometry(latent=True)`).
 
+`--kv-cache fp8` keeps the latent cache (every DSA layer's and the MTP layer's) as e4m3 codes with an fp32 scale a
+token (`amax / 448`), about half the bytes; the index keys and DFlash2's caches stay bf16. The attention kernels copy
+the codes at half the bytes, widen them to bf16 exactly and apply the scale to the scores and the probabilities, so
+replies differ from the bf16 cache's (an e4m3 rounding of every latent), and the ranks must agree on the flag. On
+two DGX Sparks (RED-SNOW EXL3, `--context 65536`) a stream's state goes from 1.01 to 0.64 GiB, a kept prompt state
+from 996 to 615 MiB, a 2,048-row chunk's sparse attention at 32K from 14.3 to 9.4 ms a layer, and prefill at 32K
+from 1,442 to 1,471 tok/s; needles at 30K and 59K tokens are found either way.
+
 Measured on two DGX Sparks (GB10, 128 GB each) with the MLX 4-bit checkpoint, MTP drafts only,
 `--context 262144`, a synthetic codebase with one hidden fact, cold prompts:
 

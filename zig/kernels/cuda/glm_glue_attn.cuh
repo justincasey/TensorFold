@@ -1,8 +1,9 @@
 // latent.py's MLA attention and sparse.py's index scores by hand: the chunk kernels' online softmax, the chunk merge.
 #pragma once
 
+#include <cuda_fp16.h>
+
 #include "glm_glue_router.cuh"
-#include <cuda_fp8.h>
 
 namespace glm_attn {
 
@@ -46,15 +47,36 @@ __device__ __forceinline__ int wide(int row, int u) { return row * LW + ((u ^ (r
 __device__ __forceinline__ int narrow(int row, int u) { return row * KT + ((u ^ ((row >> 1) & 3)) << 3); }
 
 // latent._dense_chunks/_sparse_chunks (sparse 0/1), block (row, HB heads, chunk), 8 warps: online softmax by 32 keys.
-template <int HB>
+// FP8 (--kv-cache fp8): the cache holds e4m3 codes [cap][LW] and an fp32 scale a row (ls). Two staging buffers take a
+// tile's codes and scales by cp.async (half the bytes); each tile's codes become bf16 (exact) in one key buffer, the
+// scores take the row's scale (dot . s . scale) and p its scale before the p . v product (sum p unscaled).
+template <int HB, bool FP8 = false>
 constexpr int wide_smem() {
-  return (HB * LW + 2 * KT * LW + HB * KT) * 2 + (HB * 4 + 2 * HB) * 4;
+  return (HB * LW + 2 * KT * LW + HB * KT) * 2 + (HB * 4 + 2 * HB) * 4 + (FP8 ? 2 * KT * 4 : 0);
 }
 
-template <int HB, bool FP8 = false>
-__device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
+__device__ __forceinline__ void cp4(void* dst, const void* src, bool ok) {
+  const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(d), "l"(src), "r"(ok ? 4 : 0));
+}
+
+// Codes `sel` picks of c (byte_perm selector 0x4140: bytes 0, 1; 0x4342: bytes 2, 3) as a bf16 pair, exactly: a code's
+// exponent and mantissa bits under bf16's are its value times 2^-120 (subnormals too), so one bf16 multiply by 2^120.
+__device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint32_t c, uint32_t sel) {
+  const uint32_t p = __byte_perm(c, 0, sel);
+  const uint32_t v = ((p << 4) & 0x07f007f0u) | ((p << 8) & 0x80008000u);
+  const __nv_bfloat162 x = *reinterpret_cast<const __nv_bfloat162*>(&v);
+  const __nv_bfloat162 b = __hmul2(x, __nv_bfloat162(__ushort_as_bfloat16(0x7b80), __ushort_as_bfloat16(0x7b80)));
+  return *reinterpret_cast<const uint32_t*>(&b);
+}
+
+// Row r (qa, tokens, partials) of `rows`; a dense row sees keys through `limit`; `live` false: an empty chunk.
+// On pages (pt): dense chunk c is page pt[c], pstep bytes apart; sparse tokens come mapped, prows (fp8) rows a page.
+template <int HB, bool FP8>
+__device__ void chunks_wide(const __nv_bfloat16* qa, const void* cache, int64_t limit, const int* tok,
                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
-                            float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr) {
+                            float scale, int sparse, const float* ls, int64_t r, bool on, const int* pt, int64_t pstep,
+                            int64_t prows) {
   constexpr int MT = HB / 16;
   extern __shared__ __align__(16) unsigned char smem[];
   __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(smem);
@@ -62,35 +84,65 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   __nv_bfloat16* ps = kvs + 2 * KT * LW;
   float* red = reinterpret_cast<float*>(ps + HB * KT);
   float* stat = red + HB * 4;
+  uint8_t* stage = reinterpret_cast<uint8_t*>(kvs + KT * LW);  // FP8: [2][KT][LW] codes after the one key buffer
+  float* sst = stat + 2 * HB;                                   // FP8: [2][KT] scales
+  const __nv_bfloat16* lc = static_cast<const __nv_bfloat16*>(cache);
+  const uint8_t* lc8 = static_cast<const uint8_t*>(cache);
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, q = lane & 3;
   const int kg = warp & 3, hh = warp >> 2;
-  const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
-  const int64_t n = sparse ? cnt[r] : 0, limit = sparse ? 0 : (int64_t)pos[0] + r, start = c * CH;
-  const bool live = sparse ? start < n : start <= limit;
-  // a dense chunk's 512 keys are one page, its rows from that page's; a sparse key's row comes as the token list has it
-  const __nv_bfloat16* keys_at = !FP8 && pt && !sparse && live ? lc + ((int64_t)pt[c] * (pstep / 2) - start * LW) : lc;
+  const int64_t h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
+  const int64_t n = sparse ? cnt[r] : 0, start = c * CH;
+  const bool live = on && (sparse ? start < n : start <= limit);
+  const bool paged = pt && !sparse && live;
+  const __nv_bfloat16* keys_at = paged ? lc + ((int64_t)pt[c] * (pstep / 2) - start * LW) : lc;
+  const uint8_t* codes_at = FP8 && paged ? lc8 + ((int64_t)pt[c] * pstep - start * LW) : lc8;
+  const float* scales_at = FP8 && paged ? ls + ((int64_t)pt[c] * (pstep / 4) - start) : ls;
+  // a scale's float: a mapped sparse token's page and row on pages, else the row (dense: from its page's base)
+  auto scale_of = [&](int64_t src) { return sparse && prows ? src / prows * (pstep / 4) + src % prows : src; };
   auto load_kv = [&](int tile) {
-    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
     const int64_t first = start + tile * KT;
+    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
     for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
       const int key = idx / (LW / 8), u = idx % (LW / 8);
       const int64_t ki = first + key;
       const bool ok = sparse ? ki < n : ki <= limit;
       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
-      if constexpr (FP8) {
-        const unsigned char* codes = reinterpret_cast<const unsigned char*>(lc);
-        const float row_scale = ok ? scales[src] : 1.0f;
-#pragma unroll
-        for (int j = 0; j < 8; j += 2) {
-          const uint16_t bits = ok ? (uint16_t)codes[src * LW + u * 8 + j] |
-                                        ((uint16_t)codes[src * LW + u * 8 + j + 1] << 8) : 0;
-          const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
-          dst[wide(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, row_scale));
-          dst[wide(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, row_scale));
-        }
-      } else {
-        cp16(dst + wide(key, u), keys_at + src * LW + u * 8, ok);
-      }
+      cp16(dst + wide(key, u), keys_at + src * LW + u * 8, ok);
+    }
+  };
+  // FP8 (256 threads): a thread's keys of a tile are t / 32 + 8 i (i < 4), its 16-byte unit t % 32. Their cache rows
+  // (-1: none) are read a tile before their copies start, so the token list's latency is off the tile's path.
+  auto rows_of = [&](int tile, int* s) {
+    const int64_t first = start + tile * KT + (t >> 5);
+    for (int i = 0; i < 4; ++i) {
+      const int64_t ki = first + 8 * i;
+      const bool ok = sparse ? ki < n : ki <= limit;
+      s[i] = ok ? (sparse ? tok[r * w + ki] : (int)ki) : -1;
+    }
+  };
+  auto load8 = [&](int tile, const int* s) {
+    uint8_t* dst = stage + (tile & 1) * KT * LW;
+    const int u = t & 31;
+    for (int i = 0; i < 4; ++i) {
+      const int key = (t >> 5) + 8 * i;
+      const bool ok = s[i] >= 0;
+      const int64_t src = ok ? s[i] : 0;
+      cp16(dst + key * LW + u * 16, codes_at + src * LW + u * 16, ok);
+      if (u == 0) cp4(sst + (tile & 1) * KT + key, scales_at + scale_of(src), ok);
+    }
+  };
+  int ahead[4];  // FP8: the cache rows of the next tile to copy
+  // FP8: tile `tile`'s staged codes as bf16 into the key buffer, 16 codes a thread at a time.
+  auto widen = [&](int tile) {
+    const uint8_t* src = stage + (tile & 1) * KT * LW;
+    for (int idx = t; idx < KT * (LW / 16); idx += blockDim.x) {
+      const int key = idx / (LW / 16), u = idx % (LW / 16);
+      const uint4 v = *reinterpret_cast<const uint4*>(src + key * LW + u * 16);
+      const uint32_t in[4] = {v.x, v.y, v.z, v.w};
+      uint32_t out[8];
+      for (int j = 0; j < 4; ++j) out[2 * j] = e4m3x2_bf16x2(in[j], 0x4140), out[2 * j + 1] = e4m3x2_bf16x2(in[j], 0x4342);
+      *reinterpret_cast<uint4*>(kvs + wide(key, 2 * u)) = make_uint4(out[0], out[1], out[2], out[3]);
+      *reinterpret_cast<uint4*>(kvs + wide(key, 2 * u + 1)) = make_uint4(out[4], out[5], out[6], out[7]);
     }
   };
   float m[MT][2], l[MT][2], o[MT][8][4];
@@ -106,22 +158,33 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       const bool ok = h0 + hd < heads;
       cp16(qs + wide(hd, u), qa + (r * heads + (ok ? h0 + hd : 0)) * LW + u * 8, ok);
     }
-    load_kv(0);
-    commit();
-    load_kv(1);
-    commit();
+    if constexpr (FP8) {
+      rows_of(0, ahead);
+      load8(0, ahead);
+      commit();
+      rows_of(1, ahead);
+      load8(1, ahead);
+      commit();
+      rows_of(2, ahead);
+    } else {
+      load_kv(0);
+      commit();
+      load_kv(1);
+      commit();
+    }
   }
   for (int tile = 0; live && tile < tiles; ++tile) {
-    if constexpr (FP8) {
+    if (tile + 1 < tiles)
+      wait<1>();
+    else
       wait<0>();
-    } else {
-      if (tile + 1 < tiles)
-        wait<1>();
-      else
-        wait<0>();
-    }
     __syncthreads();
-    const __nv_bfloat16* kv = kvs + (tile & 1) * KT * LW;
+    if constexpr (FP8) {
+      widen(tile);
+      __syncthreads();
+    }
+    const __nv_bfloat16* kv = FP8 ? kvs : kvs + (tile & 1) * KT * LW;
+    const float* ks = sst + (tile & 1) * KT;  // FP8: the tile's row scales
     const int64_t first = start + tile * KT;
     float sc[4];
     if (hh < MT) {
@@ -138,8 +201,14 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       for (int e = 0; e < 2; ++e) {
         const int64_t ki = first + kg * 8 + q * 2 + e;
         const bool ok = sparse ? ki < n : ki <= limit;
-        sc[e] = ok ? __fmul_rn(acc[e], scale) : -INFINITY;
-        sc[e + 2] = ok ? __fmul_rn(acc[e + 2], scale) : -INFINITY;
+        if constexpr (FP8) {
+          const float s = ks[kg * 8 + q * 2 + e];
+          sc[e] = ok ? __fmul_rn(__fmul_rn(acc[e], s), scale) : -INFINITY;
+          sc[e + 2] = ok ? __fmul_rn(__fmul_rn(acc[e + 2], s), scale) : -INFINITY;
+        } else {
+          sc[e] = ok ? __fmul_rn(acc[e], scale) : -INFINITY;
+          sc[e + 2] = ok ? __fmul_rn(acc[e + 2], scale) : -INFINITY;
+        }
       }
       for (int hf = 0; hf < 2; ++hf) {
         const float mx = quad_max(fmaxf(sc[hf * 2], sc[hf * 2 + 1]));
@@ -169,7 +238,11 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
             p[e] = active && ok ? glm_triton::exp_approx(sc[hf * 2 + e] - nm) : 0.0f;
           }
           const int hr = i * 16 + hf * 8 + g, col = kg * 8 + q * 2;
-          *reinterpret_cast<__nv_bfloat162*>(ps + narrow(hr, col >> 3) + (col & 7)) = __floats2bfloat162_rn(p[0], p[1]);
+          if constexpr (FP8)
+            *reinterpret_cast<__nv_bfloat162*>(ps + narrow(hr, col >> 3) + (col & 7)) =
+                __floats2bfloat162_rn(__fmul_rn(p[0], ks[col]), __fmul_rn(p[1], ks[col + 1]));
+          else
+            *reinterpret_cast<__nv_bfloat162*>(ps + narrow(hr, col >> 3) + (col & 7)) = __floats2bfloat162_rn(p[0], p[1]);
           const float s = quad_sum(p[0] + p[1]);
           if (q == 0) red[hr * 4 + kg] = s;
         }
@@ -202,8 +275,14 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
     __syncthreads();
     for (int i = 0; i < MT; ++i)
       for (int hf = 0; hf < 2; ++hf) l[i][hf] = __fmaf_rn(l[i][hf], alpha[i][hf], stat[HB + i * 16 + hf * 8 + g]);
-    if (tile + 2 < tiles) load_kv(tile + 2);
-    commit();
+    if constexpr (FP8) {
+      if (tile + 2 < tiles) load8(tile + 2, ahead);
+      commit();
+      if (tile + 3 < tiles) rows_of(tile + 3, ahead);
+    } else {
+      if (tile + 2 < tiles) load_kv(tile + 2);
+      commit();
+    }
   }
   for (int i = 0; i < MT; ++i)
     for (int e = 0; e < 4; ++e) {
@@ -225,30 +304,67 @@ extern "C" __global__ void __launch_bounds__(256)
     tf_glm_chunks_16(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse,
                      const int* pt, int64_t pstep) {
-  glm_attn::chunks_wide<16>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, pt, pstep);
+  glm_attn::chunks_wide<16, false>(qa, lc, sparse ? 0 : (int64_t)pos[0] + blockIdx.x, tok, cnt, po, pm, pl, rows, heads,
+                                   w, scale, sparse, nullptr, blockIdx.x, true, pt, pstep, 0);
 }
 
 extern "C" __global__ void __launch_bounds__(256)
     tf_glm_chunks_32(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse,
                      const int* pt, int64_t pstep) {
-  glm_attn::chunks_wide<32>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, pt, pstep);
+  glm_attn::chunks_wide<32, false>(qa, lc, sparse ? 0 : (int64_t)pos[0] + blockIdx.x, tok, cnt, po, pm, pl, rows, heads,
+                                   w, scale, sparse, nullptr, blockIdx.x, true, pt, pstep, 0);
 }
 
-// E4M3 cache variants reconstruct the existing BF16 shared tile before the unchanged attention math.
+// The fp8 cache's forms (--kv-cache fp8): e4m3 codes `lc` [cap][512] and their row scales `ls`, wide_smem<HB, true>().
 extern "C" __global__ void __launch_bounds__(256)
-    tf_glm_chunks_16_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
-                         const int* tok, const int* cnt, float* po, float* pm, float* pl,
-                         int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
-  glm_attn::chunks_wide<16, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
-                                 po, pm, pl, rows, heads, w, scale, sparse, nullptr, 0, scales);
+    tf_glm_chunks8_16(const __nv_bfloat16* qa, const uint8_t* lc, const int* pos, const int* tok, const int* cnt,
+                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse,
+                      const float* ls, const int* pt, int64_t pstep, int64_t prows) {
+  glm_attn::chunks_wide<16, true>(qa, lc, sparse ? 0 : (int64_t)pos[0] + blockIdx.x, tok, cnt, po, pm, pl, rows, heads,
+                                  w, scale, sparse, ls, blockIdx.x, true, pt, pstep, prows);
 }
+
 extern "C" __global__ void __launch_bounds__(256)
-    tf_glm_chunks_32_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
-                         const int* tok, const int* cnt, float* po, float* pm, float* pl,
-                         int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
-  glm_attn::chunks_wide<32, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
-                                 po, pm, pl, rows, heads, w, scale, sparse, nullptr, 0, scales);
+    tf_glm_chunks8_32(const __nv_bfloat16* qa, const uint8_t* lc, const int* pos, const int* tok, const int* cnt,
+                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse,
+                      const float* ls, const int* pt, int64_t pstep, int64_t prows) {
+  glm_attn::chunks_wide<32, true>(qa, lc, sparse ? 0 : (int64_t)pos[0] + blockIdx.x, tok, cnt, po, pm, pl, rows, heads,
+                                  w, scale, sparse, ls, blockIdx.x, true, pt, pstep, prows);
+}
+
+// A shared window's dense attention: each segment's rows (row0..) on its own cache, position and pages; lc 0: skipped.
+struct GlmAttnSegs {
+  int n, row0[16];
+  const int* pos[16];
+  const void* lc[16];
+  const float* ls[16];
+  const int* pt[16];
+  int64_t pstep;
+};
+
+template <bool FP8>
+__device__ __forceinline__ void chunks_segs(const GlmAttnSegs& s, const __nv_bfloat16* qa, float* po, float* pm,
+                                            float* pl, int64_t rows, int64_t heads, float scale) {
+  const int r = blockIdx.x;
+  int i = 0;
+  while (i + 1 < s.n && r >= s.row0[i + 1]) ++i;
+  const bool on = s.lc[i] != nullptr;
+  const int64_t limit = on ? (int64_t)s.pos[i][0] + (r - s.row0[i]) : 0;
+  glm_attn::chunks_wide<16, FP8>(qa, s.lc[i], limit, nullptr, nullptr, po, pm, pl, rows, heads, 0, scale, 0, s.ls[i], r,
+                                 on, s.pt[i], s.pstep, 0);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks_16s(GlmAttnSegs s, const __nv_bfloat16* qa, float* po, float* pm, float* pl, int64_t rows,
+                      int64_t heads, float scale) {
+  chunks_segs<false>(s, qa, po, pm, pl, rows, heads, scale);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks8_16s(GlmAttnSegs s, const __nv_bfloat16* qa, float* po, float* pm, float* pl, int64_t rows,
+                       int64_t heads, float scale) {
+  chunks_segs<true>(s, qa, po, pm, pl, rows, heads, scale);
 }
 
 // latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.

@@ -54,7 +54,7 @@ fn arena(d: *const cuda.Driver, sizes: []const usize, out: []u64) !Arena {
 pub const page_rows = latent.chunk;
 
 /// Where a paged sequence's caches are: the pool's pages at `kv`, `page_bytes` apart, through a table of `pages`.
-pub const Paged = struct { kv: u64, pages: usize, page_bytes: u64 };
+pub const Paged = struct { kv: u64, pages: usize, page_bytes: u64, kv8: bool = false };
 
 /// The DSA (MLA) layers among the loaded ones; the MTP layer's caches come after theirs.
 pub fn mlaLayers(w: *const weights.Weights) usize {
@@ -63,20 +63,22 @@ pub fn mlaLayers(w: *const weights.Weights) usize {
     return nd;
 }
 
-/// One cache's part of a page: its latent rows, then their pools' keys.
-fn pageCacheBytes(c: anytype) usize {
-    return page_rows * c.kv_lora * 2 + page_rows / sparse.pool * c.i_dim * 2;
+/// One cache's part of a page: its latent rows (bf16, or e4m3 codes then their fp32 scales), then their pools' keys.
+fn pageCacheBytes(c: anytype, kv8: bool) usize {
+    const rows = if (kv8) page_rows * (c.kv_lora + 4) else page_rows * c.kv_lora * 2;
+    return rows + page_rows / sparse.pool * c.i_dim * 2;
 }
 
-/// A page's bytes: every DSA layer's part, then the MTP layer's (13,056 a row on GLM-5.3-Flash).
-pub fn pageBytes(w: *const weights.Weights) u64 {
-    return (mlaLayers(w) + 1) * pageCacheBytes(&w.config);
+/// A page's bytes: every DSA layer's part, then the MTP layer's (13,056 a row on GLM-5.3-Flash, 6,960 with fp8).
+pub fn pageBytes(w: *const weights.Weights, kv8: bool) u64 {
+    return (mlaLayers(w) + 1) * pageCacheBytes(&w.config, kv8);
 }
 
 /// Cache `j`'s rows on pages: its part of page 0 at `p.kv`, the others through the table.
 fn onPages(x: *dsa_block.Caches, c: anytype, p: Paged, table: u64, j: usize) void {
-    x.lc = p.kv + j * pageCacheBytes(c);
-    x.pk = x.lc + page_rows * c.kv_lora * 2;
+    x.lc = p.kv + j * pageCacheBytes(c, p.kv8);
+    x.ls = if (p.kv8) x.lc + page_rows * c.kv_lora else 0;
+    x.pk = if (p.kv8) x.ls + page_rows * 4 else x.lc + page_rows * c.kv_lora * 2;
     x.pt = table;
     x.ps = p.page_bytes;
 }
@@ -349,7 +351,7 @@ pub const State = struct {
 
     /// A sequence whose latent rows and pooled keys are pages of `p`; it holds no rows until a stream maps some.
     pub fn initPaged(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, p: Paged) !State {
-        return make(gpa, d, w, capacity, false, p);
+        return make(gpa, d, w, capacity, p.kv8, p);
     }
 
     /// Bytes a sequence on pages allocates at any length (its fixed part, as `arena` rounds it), a table of `pages`.
