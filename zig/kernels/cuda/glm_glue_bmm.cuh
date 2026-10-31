@@ -305,8 +305,7 @@ extern "C" __global__ void __launch_bounds__(256, 2)
   glm_bmm::bmm_tiles<128, 128, 32, 3, 2, 4, false>(x, w, out, m, x_stride, n, k, sk, f32);
 }
 
-// One small bf16 matmul per head (blockIdx.z): out_h [m][n] (row stride ldo) = x_h [m][k] (stride x_stride) . w_h [n][k];
-// heads xh, wh, oh elements apart. The latent absorb and expand of prompt rows (tf_glm_bmm_tile1's tiles).
+// Per-head bf16 matmul (blockIdx.z): out_h [m][n] = x_h [m][k] . w_h [n][k]; prompt rows' latent absorb/expand.
 extern "C" __global__ void __launch_bounds__(256, 2)
     tf_glm_bmm_heads(const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* out, int64_t m, int64_t x_stride,
                      int64_t n, int64_t k, int64_t xh, int64_t wh, int64_t oh, int64_t ldo) {

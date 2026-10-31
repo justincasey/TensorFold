@@ -259,8 +259,7 @@ __device__ __forceinline__ void dense_body(const DenseArgs& a) {
 }
 
 
-// One program: (N / 128) * SK blocks, split-major like a (N / 128, SK) grid, WK warps each; MT 16-row m tiles a pass
-// (each weight tile decoded once a pass; a row's mma, warp order and split order are the same at either MT).
+// (N / 128) * SK split-major blocks, WK warps, MT 16-row m tiles a pass; a row's bits are the same at either MT.
 template <int K2, int CB, int WK, int MT>
 __device__ __forceinline__ void linear_body(LinearArgs a) {
     constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();

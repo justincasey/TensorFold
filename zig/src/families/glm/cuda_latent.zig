@@ -26,8 +26,7 @@ fn cdiv(a: usize, b: usize) u32 {
     return @intCast((a + b - 1) / b);
 }
 
-/// latent.absorb_q (BF16 kv_b): out [rows][heads][lw] bf16 = q [rows][heads][d] . wk [heads][d][lw], fp32 sums.
-/// Prompt rows (prompt_rows on, never a decode window's 32) take tensor-core tiles on `wkt` [heads][lw][d] when given.
+/// out [rows][heads][lw] = q . wk [heads][d][lw], fp32 sums; prompt rows take tensor-core tiles on `wkt` if given.
 pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, wkt: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
     if (d != 256 or lw != 512) return error.LatentShape;
     if (wkt != 0 and rows >= prompt_rows) return bmmHeads(set, stream, q, heads * d, wkt, out, heads * lw, rows, lw, d, heads);
@@ -50,8 +49,7 @@ fn rowBlocks(f: cuda.Function, stream: cuda.Stream, in: u64, w: u64, out: u64, r
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(heads), .y = @intCast(cols), .z = cdiv(rows, rb) }, .block = .{ .x = 128 } }, stream, &a);
 }
 
-/// latent.expand_v (BF16 kv_b): out [rows][heads][dv] bf16 = o_lat [rows][heads][lw] . wv [heads][dv][lw].
-/// Prompt rows take tensor-core tiles with `tiles` (wv is already [heads][n][k]).
+/// out [rows][heads][dv] = o_lat . wv [heads][dv][lw]; prompt rows take tensor-core tiles with `tiles`.
 pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize, tiles: bool) !void {
     if (dv != 256 or lw != 512) return error.LatentShape;
     if (tiles and rows >= prompt_rows) return bmmHeads(set, stream, ol, heads * lw, wv, out, heads * dv, rows, dv, lw, heads);

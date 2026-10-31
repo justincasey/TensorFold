@@ -1,5 +1,4 @@
-//! GLM's sparse latent attention (chunks and merge) on one GPU, bf16 cache against --kv-cache fp8's: a 2,048-row prompt
-//! chunk and a 4-row decode window, each row on 2,048 random keys of a 32K cache, 32 heads (a rank at TP=2).
+//! GLM sparse latent attention on one GPU, bf16 vs fp8 cache: 2,048-row prompt chunk and 4-row decode window.
 const std = @import("std");
 const cuda = @import("cuda");
 const glm = @import("glm_cuda");

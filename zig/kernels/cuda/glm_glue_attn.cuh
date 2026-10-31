@@ -46,10 +46,7 @@ __device__ __forceinline__ int wide(int row, int u) { return row * LW + ((u ^ (r
 // p's [32][32] rows (64 bytes): unit u of row r.
 __device__ __forceinline__ int narrow(int row, int u) { return row * KT + ((u ^ ((row >> 1) & 3)) << 3); }
 
-// latent._dense_chunks/_sparse_chunks (sparse 0/1), block (row, HB heads, chunk), 8 warps: online softmax by 32 keys.
-// FP8 (--kv-cache fp8): the cache holds e4m3 codes [cap][LW] and an fp32 scale a row (ls). Two staging buffers take a
-// tile's codes and scales by cp.async (half the bytes); each tile's codes become bf16 (exact) in one key buffer, the
-// scores take the row's scale (dot . s . scale) and p its scale before the p . v product (sum p unscaled).
+// latent chunks (sparse 0/1), block (row, HB heads, chunk), 8 warps; FP8: e4m3 codes + fp32 row scale, staged bf16.
 template <int HB, bool FP8 = false>
 constexpr int wide_smem() {
   return (HB * LW + 2 * KT * LW + HB * KT) * 2 + (HB * 4 + 2 * HB) * 4 + (FP8 ? 2 * KT * 4 : 0);
@@ -60,8 +57,7 @@ __device__ __forceinline__ void cp4(void* dst, const void* src, bool ok) {
   asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(d), "l"(src), "r"(ok ? 4 : 0));
 }
 
-// Codes `sel` picks of c (byte_perm selector 0x4140: bytes 0, 1; 0x4342: bytes 2, 3) as a bf16 pair, exactly: a code's
-// exponent and mantissa bits under bf16's are its value times 2^-120 (subnormals too), so one bf16 multiply by 2^120.
+// Codes `sel` picks of c as an exact bf16 pair: e4m3 bits under bf16's are value * 2^-120, so one multiply by 2^120.
 __device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint32_t c, uint32_t sel) {
   const uint32_t p = __byte_perm(c, 0, sel);
   const uint32_t v = ((p << 4) & 0x07f007f0u) | ((p << 8) & 0x80008000u);
@@ -70,8 +66,7 @@ __device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint32_t c, uint32_t sel) {
   return *reinterpret_cast<const uint32_t*>(&b);
 }
 
-// Row r (qa, tokens, partials) of `rows`; a dense row sees keys through `limit`; `live` false: an empty chunk.
-// On pages (pt): dense chunk c is page pt[c], pstep bytes apart; sparse tokens come mapped, prows (fp8) rows a page.
+// Row r of `rows`; dense sees keys through `limit`; `live` false: empty chunk; pt: dense chunk c on page pt[c].
 template <int HB, bool FP8>
 __device__ void chunks_wide(const __nv_bfloat16* qa, const void* cache, int64_t limit, const int* tok,
                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
@@ -110,8 +105,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const void* cache, int64_t 
       cp16(dst + wide(key, u), keys_at + src * LW + u * 8, ok);
     }
   };
-  // FP8 (256 threads): a thread's keys of a tile are t / 32 + 8 i (i < 4), its 16-byte unit t % 32. Their cache rows
-  // (-1: none) are read a tile before their copies start, so the token list's latency is off the tile's path.
+  // FP8: thread t's keys of a tile are t / 32 + 8 i (i < 4); their cache rows are read a tile ahead of the copies.
   auto rows_of = [&](int tile, int* s) {
     const int64_t first = start + tile * KT + (t >> 5);
     for (int i = 0; i < 4; ++i) {

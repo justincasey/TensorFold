@@ -1,7 +1,4 @@
-//! Parallel read-ahead of file byte spans into the page cache (Linux only; elsewhere a no-op).
-//! A loader that page-faults a mapped checkpoint reads one fault-readahead window (read_ahead_kb, 128 KiB on DGX OS)
-//! at a time, ~0.43 GB/s on a GB10's NVMe; several threads' preads keep the drive's queue full instead. Only a hint:
-//! the bytes the loader reads come from the mapping either way.
+//! Parallel read-ahead of file spans into the page cache (Linux only): keeps NVMe's queue full where faults can't.
 
 const std = @import("std");
 const builtin = @import("builtin");

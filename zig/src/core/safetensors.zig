@@ -254,8 +254,7 @@ pub const File = struct {
         _ = linux.fadvise(self.file.handle, 0, 0, linux.POSIX_FADV.DONTNEED);
     }
 
-    /// Bytes [lo, hi) of the file out of the mapping and the page cache (as `release`, for one span; pages that
-    /// straddle its ends go too and refault if read again).
+    /// Drops bytes [lo, hi) from the mapping and page cache (`release` for one span; straddling pages go too).
     pub fn releaseSpan(self: *const File, lo: u64, hi: u64) void {
         if (@import("builtin").os.tag != .linux or self.map.section == null or hi <= lo) return;
         const linux = std.os.linux;

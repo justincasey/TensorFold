@@ -156,8 +156,7 @@ pub const Checkpoint = struct {
         for (self.files.items) |*f| if (f.span(prefix)) |s| f.releaseSpan(s[0], s[1]);
     }
 
-    /// Starts parallel read-ahead of every tensor named `prefix`*, in every mapped file (prefetch.zig); null: none.
-    /// The caller joins it before `release`, so no reader repopulates pages the release drops.
+    /// Starts parallel read-ahead of every tensor named `prefix`*; null: none. Join it before `release`.
     pub fn prefetch(self: *const Checkpoint, gpa: std.mem.Allocator, prefix: []const u8) !?*Prefetch {
         var spans: std.ArrayList(prefetch_mod.Span) = .empty;
         defer spans.deinit(gpa);

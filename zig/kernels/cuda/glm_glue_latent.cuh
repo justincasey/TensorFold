@@ -85,8 +85,7 @@ extern "C" __global__ void tf_glm_lat_write(const __nv_bfloat16* lat, int64_t la
   for (int64_t k = threadIdx.x; k < lw; k += blockDim.x) cache[at + k] = lat[r * lat_stride + k];
 }
 
-// The fp8 latent cache's write (--kv-cache fp8), 128 threads of 4 values (lw 512): e4m3 codes of x / s, s = amax / 448.
-// Slot p's codes and scale: row p of the window, or row p % 512 of page pt[p / 512] (codes ps bytes, scales ps / 4 apart).
+// fp8 latent cache write: e4m3 codes of x / s, s = amax / 448; slot p in the window or page pt[p / 512].
 extern "C" __global__ void __launch_bounds__(128)
     tf_glm_lat_write8(const __nv_bfloat16* lat, int64_t lat_stride, uint8_t* cache, float* scales, const int* pos,
                       const int* pt, int64_t ps) {

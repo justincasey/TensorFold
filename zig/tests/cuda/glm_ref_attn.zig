@@ -65,8 +65,7 @@ fn reference(r: *Rig, q: []const u16, cd: []const f64, keys: []const []const u32
     return .{ .want = want, .tol = tol };
 }
 
-/// A latent cache on the device: bf16 rows, or (kv8) e4m3 codes with fp32 row scales; f64s the values the kernels see.
-/// `src` the bf16 rows it was written from; `t` its page table when on pages (in order otherwise).
+/// A device latent cache: bf16 rows or e4m3 codes + fp32 scales; f64s, `src` bf16 rows, `t` its page table.
 const Cache = struct { dev: u64, scales: u64, f64s: []f64, src: u64, t: latent.Table = .{} };
 
 /// e4m3 (fn) code b's value: subnormals m 2^-9, normals (1 + m / 8) 2^(e - 7); 0x7f / 0xff (NaN) never written.
@@ -77,8 +76,7 @@ fn e4m3(b: u8) f64 {
     return if (b & 0x80 != 0) -v else v;
 }
 
-/// `keys` random bf16 rows, each scaled by 2^(key % 7 - 3) so the fp8 rows' scales differ; kv8: written by the
-/// fp8 cache write, whose codes and scales are checked here (s = amax / 448, |x - code s| within half an e4m3 step).
+/// `keys` random bf16 rows scaled by 2^(key % 7 - 3); kv8: written and checked by the fp8 cache write.
 fn cacheOf(r: *Rig, set: glm.glue.Set, keys: usize, kv8: bool) !Cache {
     const c = try r.bfs(keys * lw, 1.0);
     for (c, 0..) |*v, i| {
@@ -111,8 +109,7 @@ fn cacheOf(r: *Rig, set: glm.glue.Set, keys: usize, kv8: bool) !Cache {
     return .{ .dev = codes, .scales = scales, .f64s = cd, .src = rows };
 }
 
-/// The same rows written on pages (as a stream's: 512 rows a page, codes then scales), the pages in reverse order and
-/// 3 KiB apart beyond their rows, so a kernel that reads them in order or past a page's rows reads the wrong bytes.
+/// The same rows on pages in reverse order, 3 KiB apart beyond their rows, to catch in-order or overrun reads.
 fn paged(r: *Rig, set: glm.glue.Set, c: Cache, keys: usize) !Cache {
     const kv8 = c.scales != 0;
     const row: usize = if (kv8) lw else lw * 2;
@@ -144,8 +141,7 @@ fn sameRow(r: *Rig, name: []const u8, wide: []const u8, one: u64, row: usize) !v
     try check.sameBytes(name, try r.back(one, n), wide[row * n ..][0..n]);
 }
 
-/// Dense causal attention on 1,500 keys: 70 rows at 1,430 vs float64 (32-head), 16-head blocks' bytes, one-row windows;
-/// kv8: on the fp8 cache (float64 on its codes times scales), and a second call's bytes the same.
+/// Dense causal attention on 1,500 keys vs float64, 16-head blocks, one-row windows; kv8 on the fp8 cache.
 pub fn dense(r: *Rig, set: glm.glue.Set, kv8: bool) !void {
     const pos = 1430;
     const rows = 70;

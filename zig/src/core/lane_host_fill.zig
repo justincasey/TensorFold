@@ -73,6 +73,7 @@ pub const Share = struct {
     p: f64 = 1,
     debt_ns: i64 = 0, // decode time owed before the next step of a long prompt
     rows: u64 = 0, // prompt rows a visit fills beside decoders before their round (TENSORFOLD_PREFILL_BUDGET; 0: none)
+    put_off: bool = false, // a short chunk held between halves ended the last visit before its long step
 
     pub const short_rows = 512;
     pub const min_share = 0.01; // below it a step's debt is minutes of decoding, and is no share
@@ -135,7 +136,14 @@ pub fn run(h: *LaneHost) void {
         const rows = step(h, at);
         if (counted) used +|= rows;
         between(h);
-        if (stillHeld(h, job)) return; // its chunk goes on after the decoders' round, the visit's one step
+        if (stillHeld(h, job)) { // its chunk goes on after the decoders' round, the visit's one step
+            if (!h.share.put_off) {
+                h.share.put_off = true;
+                return;
+            }
+            break; // the long step waited a visit already: it runs now, so steady short arrivals cannot starve it
+        }
+        if (rows == std.math.maxInt(u64) and held(h) != null) return; // refused busy: the held chunk ran in its place
     }
     if (first != null or (budget > 0 and used >= budget)) return; // one long step a visit at most, as before
     const at = pick(h, .long) orelse return;
@@ -170,6 +178,7 @@ fn step(h: *LaneHost, at: usize) u64 {
 
 /// A long prompt's step, timed while its share owes decoders a part of it; its rows as `step` counts them.
 fn longStep(h: *LaneHost, at: usize) u64 {
+    h.share.put_off = false;
     const decoding = runnable(h) > 0;
     // timed on the host, so a step owed to decoders ends on the GPU; at p = 1 none is owed, and no earlier mark stays
     h.filling.items[at].stream.settle_step = decoding and h.share.p < 1;

@@ -505,7 +505,7 @@ pub const Lanes = struct {
             held[i] = l;
         }
         try self.x.block(reqs[0..requests.len], keeps[0..requests.len]);
-        const cut = confidence();
+        const cut = confidence(requests.len);
         for (requests, held[0..requests.len]) |r, l| {
             l.held_n = @min(r.depth, max_held);
             var chain: f64 = 1; // glm_cuda's rule: past the first, a chain stops where its product falls under the cut
@@ -517,10 +517,15 @@ pub const Lanes = struct {
         }
     }
 
-    /// TF_GLM_DRAFT_CONFIDENCE: where a DFlash2 chain's chance product stops it (0.6; glm_cuda's 0.7).
-    fn confidence() f64 {
-        const v = std.c.getenv("TF_GLM_DRAFT_CONFIDENCE") orelse return 0.6;
-        return std.fmt.parseFloat(f64, std.mem.span(v)) catch 0.6;
+    /// A stream's rows in a shared window at the deeper cut (its pending token and up to four drafts).
+    const deep_rows = 5;
+
+    /// DFlash2's chain cut: 0.4 while every drafting stream's 6 rows fit a window, 0.5 at 5 rows, else 0.6 (env: one).
+    fn confidence(streams: usize) f64 {
+        const fixed: f64 = if (std.c.getenv("TF_GLM_DRAFT_CONFIDENCE")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch 0.6 else 0;
+        if (fixed > 0) return fixed;
+        if (streams * (deep_rows + 1) <= engine.shared_rows) return 0.4; // deeper chains while the window has room
+        return if (streams * deep_rows <= engine.shared_rows) 0.5 else 0.6;
     }
 
     /// DFlash2's chance for each held draft (the MTP head gives none: the lane core's per-depth rates stand).

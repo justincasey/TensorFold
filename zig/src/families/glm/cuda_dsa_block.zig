@@ -180,8 +180,7 @@ pub fn sparseAttend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scr
     try sparse.selectTokensProfile(k.set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, t, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.split, k.prof);
     const stamp = prof.span(k.prof, stream, .mla);
     defer stamp.end();
-    // part_rows-row calls (a prompt chunk's partials stay 512 rows deep); each row's sums are its own and every
-    // call keeps the whole call's head block, so the bits are those of one call over all rows
+    // part_rows-row calls keeping the whole call's head block: bits match one call over all rows
     const hb = latent.headBlock(rows);
     var r: usize = 0;
     while (r < rows) : (r += part_rows) {

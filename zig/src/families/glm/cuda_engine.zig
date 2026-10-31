@@ -62,7 +62,7 @@ pub const Engine = struct {
     drafter: ?*dflash.Drafter = null, // --drafter: DFlash2 (every rank runs its passes; rank 0 selects the drafts)
     profs: [fw.window_rows]?*prof_mod.Prof = @splat(null), // TF_GLM_PROF=1: verify sections' GPU time, by rows
     profiling_prompt: ?*prof_mod.Prof = null,
-    prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024, 2048 rows
+    prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024, 4096 rows
     shared_profs: [shared_verify.prof_buckets]?*prof_mod.Prof = @splat(null), // and shared windows', by streams
     checkpoint_digest: [32]u8,
     settings: ranks.Settings,
@@ -329,7 +329,7 @@ pub const Engine = struct {
         if (e.drafter) |dr| try dr.restart(e.slot, 0);
     }
 
-    /// decode.prefill: `ids` in 2,048-row chunks, then the first token from the last row; `from` restores a kept state.
+    /// decode.prefill: `ids` in 4,096-row chunks, then the first token from the last row; `from` restores a kept state.
     pub fn prefill(e: *Engine, ids: []const u32, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !u32 {
         var start = try e.prefillStart(ids.len, from);
         while (true) : (start += fw.prefill_rows) {

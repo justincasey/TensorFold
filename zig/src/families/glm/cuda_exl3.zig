@@ -1,4 +1,4 @@
-//! GLM-5.3-Flash's EXL3 routed experts on CUDA: Mia-AiLab's (4-bit mcg, the rest bf16) or RED-SNOW's (mul1, per-expert widths).
+//! GLM-5.3-Flash's EXL3 routed experts on CUDA: Mia-AiLab's (4-bit mcg) or RED-SNOW's (mul1, per-expert widths).
 
 const std = @import("std");
 const modelopt = @import("core").modelopt;
@@ -23,8 +23,7 @@ pub fn isExl3(gpa: std.mem.Allocator, config_json: []const u8) bool {
     return m == .string and std.mem.eql(u8, m.string, "exl3");
 }
 
-/// The EXL3 checkpoints the kernels read: 4-bit routed experts on "mcg" (everything else bf16), or "mul1" at any
-/// width per expert and projection with every other linear EXL3 too (RED-SNOW's SAGE packs).
+/// Admits EXL3: 4-bit routed experts on "mcg", or "mul1" at any width with every linear EXL3 (RED-SNOW).
 pub fn admit(gpa: std.mem.Allocator, config_json: []const u8, why: *modelopt.Why) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, config_json, .{});
     defer parsed.deinit();
@@ -166,8 +165,7 @@ pub const Kernels = cuda.exl3_experts.Experts;
 const common = cuda.exl3_experts;
 pub const Scratch = struct { picks: u64, xg: u64, xu: u64, z: u64 };
 pub const top_k = 8;
-/// Rows a call to the common experts takes: each call reads every expert's weights, so a prompt pass needs few calls.
-/// A whole prompt chunk is one call (each weight read once a chunk).
+/// Rows a common-experts call takes: a whole prompt chunk, so each weight is read once a chunk.
 pub const chunk_rows = @import("cuda_state.zig").prefill_rows;
 fn layer(w: Experts, count: usize, dims: usize, width: usize, limit: f32) common.Layer {
     return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.gk2, .up_k2 = w.uk2, .down_k2 = w.dk2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = w.book, .limit = limit, .act_mode = 0, .uniform_k2 = w.uniform, .max_k2 = w.widest, .shared_input = w.shx };

@@ -41,8 +41,8 @@ left after a 12.2 GiB reserve` and a 5.8 GiB prompt cache
   ([video](../vision.md#video-on-the-native-server)).
 - Nonstreaming `/v1/completions` requests return `prompt_logprobs`, structured output follows its schema with drafts
   on, and required and named tool calls use the model's tool markup ([1.1.1](../../CHANGELOG.md#111): #1016 to #1018).
-- `--kv-cache fp8` is an opt-in FP8 latent cache. BF16 remains the default, and its native quality and device
-  qualification are pending ([1.1.2](../../CHANGELOG.md#112)).
+- `--kv-cache fp8` is an opt-in FP8 latent cache (e4m3 codes, an fp32 scale a token). On this fork it runs on windows
+  and on KV pages (`TF_KV_PAGES`, `auto` pages from two ranks) with the same bits; see [RED-SNOW](#red-snow-exl3-mul1).
 
 ## More ranks
 
@@ -51,6 +51,35 @@ left after a 12.2 GiB reserve` and a 5.8 GiB prompt cache
 ([#1067](https://github.com/ashhart/TensorFold/issues/1067)). How a prompt's rows reach the other ranks
 (`TF_GLM_PREFILL_REDUCE`) and the two-rank RoCE gathers (`TF_ROCE`) are in
 [placement](../multi-rank-receipts.md#the-settings-the-ranks-agreed-on).
+
+## RED-SNOW (EXL3 mul1)
+
+This fork (`justincasey/TensorFold`, branch `redsnow-native-1.1.9`) serves Blackfrost-AI's RED-SNOW-5.3-Flash from
+vcruz305's EXL3 SAGE 4.91 bpw pack (mul1 codebook, per-expert widths) at TP=2 with the DFlash2 drafter, as the
+[RED-SNOW recipe](https://github.com/justincasey/RED-SNOW-5.3-Flash-2x-DGX-Spark) runs it. Beyond 1.1.9 it adds:
+
+- **Loading:** every linear of the pack natively (EXL3 attention, dense, shared and routed experts and head behind the
+  bf16 handles), each layer's bytes read ahead by 8 threads while the previous layer loads (about 100 s to serve).
+- **Prefill:** 4,096-row chunks with fused mul1 routed experts (each expert's weights read once a chunk), a dense EXL3
+  GEMM for 64+ rows, chunked (WY) KDA, latent absorb and expand on tensor-core tiles, exchanges in
+  `TF_GLM_OVERLAP_PIECES` row pieces (4).
+- **Decode:** verify windows replay CUDA graphs; the shared expert and KDA's bf16 projections run on a side stream
+  (`TF_GLM_SIDE=0`: one stream); the first token leaves before the first DFlash2 block (`TF_GLM_FIRST_EARLY=0`);
+  several streams' windows share one forward with their KDA chains and dense attention in one pass each.
+- **Drafting:** DFlash2's chain stops where its chance product falls under a cut that follows the shared window's
+  room: 0.4 while every drafting stream's six rows fit its 32 rows, 0.5 at five rows, else 0.6
+  (`TF_GLM_DRAFT_CONFIDENCE` pins one cut).
+- **Scheduling** (on 1.1.9's fill service): a 4,096-row chunk beside decoding streams runs `TF_GLM_FILL_LAYERS`
+  layers a step (1; 0: whole chunks), a short chunk runs beside it on its own buffers (`TF_GLM_FILL_ASIDE=0`: off),
+  and fresh prompts of 64 to 512 tokens that arrive together fill in one pass, each as it would alone.
+- **FP8 latent cache** on windows and pages, 6,960 bytes a token on pages against 13,056 for bf16.
+
+Every change keeps a drafted reply equal to its `"draft": false` one and a concurrent reply equal to its solo one;
+`tf-cuda-test glm-ref` and `glm-shared-check` cover the kernels and the shared windows. On two GB10s at 8 streams ×
+65,536 (fp8 pages): decode 45 tok/s alone and 98 tok/s across 8 chats, cold prefill 1,513 / 1,660 tok/s at 8K / 32K,
+and the needle exact at 244K tokens at 2 × 274,432. A long prompt beside decoding streams takes longer to its own
+first token with `TF_GLM_FILL_LAYERS=1` (a cold 32K beside 4 chats: about 52 s, 46 s at 2) while the chats keep
+their pace; raise it to favor the long prompt.
 
 ## Long runs on GB10
 

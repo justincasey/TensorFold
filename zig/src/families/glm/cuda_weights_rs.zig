@@ -1,6 +1,4 @@
-//! RED-SNOW's (codebook "mul1") non-expert weights on a TP rank: every attention, dense, shared-expert, head and
-//! eh_proj linear is an EXL3 group (weights.py's Exl3Linear, split.py's EXL3 cuts), the small projections fp16.
-//! Each EXL3 linear goes into the rank's `xlin.Runner` and the block keeps its handle where a bf16 matrix would be.
+//! RED-SNOW's (mul1) non-expert weights on a TP rank: each EXL3 linear goes into `xlin.Runner`, kept by handle.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -114,8 +112,7 @@ fn heads(s: Span, per: usize) Span {
     return .{ .lo = s.lo * per, .hi = s.hi * per };
 }
 
-/// weights.load's kda(i): [q | k | v] (EXL3) beside [f_a | g_a | b] (fp16 -> bf16) as one handle, f_b/g_b by heads,
-/// the fused q|k|v conv's rank rows, o by input rows.
+/// kda(i): [q | k | v] (EXL3) beside [f_a | g_a | b] (fp16) as one handle, f_b/g_b by heads, conv rows, o by input.
 pub fn kda(L: anytype, i: u32) !kda_block.Layer {
     const c = &L.w.config;
     const h = L.w.share.kda;
@@ -214,7 +211,7 @@ pub fn dsa(L: anytype, i: u32) !dsa_block.Layer {
     };
 }
 
-/// [gate | up] by the span's output columns as one handle, down by its input rows: a dense MLP's or the shared expert's.
+/// [gate | up] by output columns as one handle, down by input rows: a dense MLP's or the shared expert's.
 pub fn swiglu(L: anytype, i: u32, comptime base: []const u8, s: Span) !struct { gu: u64, down: u64 } {
     const g = try layerGroup(L, i, base ++ ".gate_proj", .{ .out = s });
     const u = try layerGroup(L, i, base ++ ".up_proj", .{ .out = s });
@@ -245,8 +242,7 @@ fn noBf16(_: *const anyopaque, _: cuda.Stream, _: u64, _: usize, _: u64, _: u64,
     return error.UnexpectedBf16Part;
 }
 
-/// The head's rank rows as bf16 [n][k] for the 4-bit draft head: the identity's rows through the EXL3 linear
-/// (fp32 W[k][n] in 32-row passes), transposed and rounded on the host. The caller frees the buffer.
+/// The head's rank rows as bf16 [n][k] (identity through the EXL3 linear, host transpose); caller frees it.
 pub fn headBf16(L: anytype, id: u64, n: usize, k: usize) !cuda.DeviceBuffer {
     const r = L.w.xl.?;
     const l = r.find(id) orelse return error.Exl3LinearMissing;

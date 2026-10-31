@@ -1,6 +1,4 @@
-//! RED-SNOW's EXL3 linears behind b16.matmul's weight handle. A handle names one linear [n][k] made of up to three
-//! parts written side by side in its output columns (KDA's [q|k|v | f_a|g_a|b], DSA's [q_a | kv_a], [gate | up]):
-//! an EXL3 group (exl3.Linear: the rows-invariant decode kernel, or prompt rows' dense kernel) or a bf16 matrix.
+//! RED-SNOW's EXL3 linears behind b16.matmul's handle: up to three side-by-side parts, EXL3 groups or bf16.
 const std = @import("std");
 const cuda = @import("cuda");
 const exl3 = cuda.exl3;

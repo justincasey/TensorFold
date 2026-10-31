@@ -4,7 +4,7 @@ const cuda = @import("cuda");
 /// overlap.PIECES_MAX: at most 16 pieces.
 pub const max_pieces = 16;
 
-/// The second stream and events; `count`: TF_GLM_OVERLAP_PIECES (3).
+/// The second stream and events; `count`: TF_GLM_OVERLAP_PIECES (4).
 pub const Pieces = struct {
     count: usize = 4,
     side: cuda.Stream,

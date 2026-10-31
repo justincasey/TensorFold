@@ -28,9 +28,7 @@ pub const Kernels = struct {
     }
 };
 
-/// glm_kda_chunk.cu: a prompt chunk's KDA in chunked (WY) form, one 256-thread block a head, 32-row sub-chunks in
-/// order on the state in registers. Prompt chunks start on multiples of 32 (the 2,048-row grid), so a row's bits
-/// depend only on its sub-chunk and the entering state, never on where its prompt chunk started.
+/// glm_kda_chunk.cu: a prompt chunk's chunked KDA, a block a head, 32-row sub-chunks; bits independent of chunk start.
 pub const Chunk = struct {
     mod: cuda.Module,
     f: cuda.Function,
@@ -55,7 +53,7 @@ pub const Chunk = struct {
         c.mod.unload();
     }
 
-    /// `rows` prompt rows of chain `c` from state_in into s.out and s.state_out (no replay saves: a chunk commits whole).
+    /// `rows` prompt rows of chain `c` from state_in into s.out and s.state_out (no replay saves).
     pub fn run(k: *const Chunk, stream: cuda.Stream, c: Chain, rows: usize, s: Saves) !void {
         var a: cuda.Args = .{};
         a.add(@as(c_int, @intCast(c.heads)));

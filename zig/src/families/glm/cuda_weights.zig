@@ -110,7 +110,7 @@ const Loader = struct {
     }
 
     /// The projection `fmt` (a module under the prefix) is stored as `want`, or it is refused by name (formats.of).
-    fn format(L: *Loader, comptime fmt: []const u8, args: anytype, want: formats.Format) !void {
+    pub fn format(L: *Loader, comptime fmt: []const u8, args: anytype, want: formats.Format) !void {
         var buf: [192]u8 = undefined;
         return L.formatIn(L.ck, try std.fmt.bufPrint(&buf, prefix ++ fmt, args), want);
     }
@@ -372,67 +372,6 @@ const Loader = struct {
         return cuda.DeviceBuffer.alloc(L.d, n);
     }
 
-    /// moe_nvfp4 of the MTP layer: BF16 experts cut to the rank, GPU-quantized 8 at a time, scale as weight_scale_2.
-    fn quantizedExperts(L: *Loader, i: u32, up: []u32, down: []u32, up_scale: []f32, down_scale: []f32) !void {
-        const qk = L.tools.quant orelse return error.NoQuantizer;
-        const c = &L.w.config;
-        const d: usize = c.hidden;
-        const cut = L.w.share.moe;
-        const ni = cut.len();
-        const up_len = X.bytes(1, ni, d, 2) / 4;
-        const down_len = X.bytes(1, d, ni, 1) / 4;
-        const chunk = 8;
-        var wb = try L.scratch(chunk * ni * d * 2);
-        defer wb.free();
-        var cb = try L.scratch(chunk * ni * d / 2);
-        defer cb.free();
-        var sb = try L.scratch(chunk * ni * d / 16);
-        defer sb.free();
-        var gb = try L.scratch(chunk * 4);
-        defer gb.free();
-        const codes = try L.gpa.alloc(u8, 3 * chunk * ni * d / 2); // gate, up and down apart: packGateUp takes both
-        defer L.gpa.free(codes);
-        const scales = try L.gpa.alloc(u8, 3 * chunk * ni * d / 16);
-        defer L.gpa.free(scales);
-        var g: [3][chunk]f32 = undefined;
-        var e0: usize = 0;
-        while (e0 < c.experts) : (e0 += chunk) {
-            const ec = @min(chunk, c.experts - e0);
-            inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, m| {
-                const n = if (m < 2) ni else d; // gate and up: the rank's rows; down: every row, the rank's columns
-                const k = if (m < 2) d else ni;
-                for (e0..e0 + ec) |e| {
-                    try L.format("layers.{d}.mlp.experts.{d}." ++ proj, .{ i, e }, .bf16);
-                    const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".weight", .{ i, e });
-                    if (m < 2) try L.rows(t, cut.lo, cut.hi, c.moe_inter, .bf16) else try L.cols(t, cut.lo, cut.hi, .bf16);
-                }
-                try wb.upload(0, L.host.items);
-                L.host.clearRetainingCapacity();
-                try quant.nvfp4(qk, L.stream, wb.ptr, ec, n, k, cb.ptr, sb.ptr, gb.ptr);
-                try L.stream.synchronize();
-                try cb.download(0, codes[m * chunk * n * k / 2 ..][0 .. ec * n * k / 2]);
-                try sb.download(0, scales[m * chunk * n * k / 16 ..][0 .. ec * n * k / 16]);
-                try gb.download(0, std.mem.sliceAsBytes(g[m][0..ec]));
-            }
-            const mc = chunk * ni * d / 2; // one matrix's codes for the chunk; scales an eighth of that
-            for (0..ec) |j| {
-                const e = e0 + j;
-                const one = ni * d;
-                var cs: [3][]const u8 = undefined;
-                var ss: [3][]const u8 = undefined;
-                for (0..3) |m| {
-                    cs[m] = codes[m * mc + j * one / 2 ..][0 .. one / 2];
-                    ss[m] = scales[m * mc / 8 + j * one / 16 ..][0 .. one / 16];
-                }
-                X.packGateUp(up[e * up_len ..][0..up_len], .{ cs[0], ss[0] }, .{ cs[1], ss[1] }, ni, d);
-                X.packOne(down[e * down_len ..][0..down_len], cs[2], ss[2], d, ni);
-                up_scale[e * 2] = g[0][j];
-                up_scale[e * 2 + 1] = g[1][j];
-                down_scale[e] = g[2][j];
-            }
-        }
-    }
-
     /// weights.load's moe(i) on NVFP4: router and bias, routed experts as Experts4, the BF16 shared expert's share.
     pub fn moeLayer(L: *Loader, i: u32) !moe.Layer {
         const c = &L.w.config;
@@ -506,7 +445,7 @@ const Loader = struct {
         defer L.gpa.free(decoded);
         // the MTP layer's experts: bf16 (nvidia's), quantized here, or W4A16_NVFP4 (FP4-Local's), read as stored
         const bf16 = i == c.layers and (try L.get("layers.{d}.mlp.experts.0.gate_proj.weight", .{i})).dtype == .bf16;
-        if (bf16) try L.quantizedExperts(i, up, down, up_scale, down_scale) else for (0..count) |e| {
+        if (bf16) try @import("cuda_weights_quant.zig").quantizedExperts(L, i, up, down, up_scale, down_scale) else for (0..count) |e| {
             var ls: [3]core.nvfp4.Linear = undefined;
             inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, m| {
                 const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.mlp.experts.{d}." ++ proj, .{ i, e });
@@ -572,8 +511,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
     if (recipes) |*r| L.recipes = recipeTable(r);
     w.layers = try gpa.alloc(Layer, layers.len);
     if (c.exl3_all) w.xl = try xlin.Runner.init(gpa, d);
-    // Layer k+1's bytes are read by 8 threads while layer k loads (page faults alone read one 128 KiB window at a
-    // time, ~0.43 GB/s); after a layer, only its own pages leave the page cache, so at most two layers' stay.
+    // 8 threads read layer k+1 while layer k loads; each layer's pages leave the cache after it, so two stay.
     var names: [2][96]u8 = undefined;
     const layerPrefix = struct {
         fn of(buf: *[96]u8, i: u32) ![]const u8 {

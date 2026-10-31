@@ -54,8 +54,7 @@ pub fn partBytes(m: usize, n: usize, k: usize) usize {
     return if (m >= rows_from or sk == 1) 0 else sk * m * n * 4;
 }
 
-/// qmm.matmul for a B16 weight: out [m][n] bf16 (fp32 with `wide`) = x . w; 128+ rows sum in registers, else `part`.
-/// A handle in the set's EXL3 table (RED-SNOW) runs its EXL3 and bf16 parts instead.
+/// out [m][n] bf16 (fp32 with `wide`) = x . w; a handle in the set's EXL3 table (RED-SNOW) runs its EXL3 parts.
 pub fn matmul(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
     if (set.xl) |r| if (r.find(w)) |l| {
         const plain: glue.Set = .{ .glue = set.glue };
