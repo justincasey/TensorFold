@@ -17,6 +17,8 @@ const mm_mod = @import("cuda_mm.zig");
 pub const formats = @import("cuda_formats.zig");
 const projection = @import("cuda_proj.zig");
 const glue = @import("cuda_glue.zig");
+const xlin = @import("cuda_xlin.zig");
+const rs = @import("cuda_weights_rs.zig");
 const Tensor = core.checkpoint.Tensor;
 const prefix = "model.language_model.";
 /// A hyper-connection site: fn bf16 [s (s + 2)][s d], base and scale widened to fp32.
@@ -44,10 +46,14 @@ pub const Weights = struct {
     head: projection.Proj = .{ .bf16 = 0 }, // [share.vocab][dims]: bf16, or MXFP8 for the lane
     mtp: ?Mtp = null,
     exl3_shx: bool = true, // EXL3: every layer's gate and up share one input rotation (a prompt rotates each row once)
+    exl3_book: cuda.exl3.Codebook = .mcg, // the routed experts' codebook (every layer's)
+    exl3_uniform: u32 = 8, // their one half-bit width, 0 when it varies (RED-SNOW)
+    xl: ?*xlin.Runner = null, // RED-SNOW: the EXL3 linears behind b16.matmul's handles
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     named: std.ArrayList(Named) = .empty,
 
     pub fn deinit(w: *Weights) void {
+        if (w.xl) |r| r.deinit();
         for (w.buffers.items) |*b| b.free();
         for (w.named.items) |n| w.gpa.free(n.name);
         w.buffers.deinit(w.gpa);
@@ -149,7 +155,7 @@ const Loader = struct {
         return ptr;
     }
 
-    /// Elements [lo, hi) of `t` flat as `to` (bf16 or fp32 from a bf16 or fp32 tensor; other dtypes only as stored).
+    /// Elements [lo, hi) of `t` flat as `to` (bf16 or fp32 from a bf16, fp16 or fp32 tensor; others only as stored).
     fn add(L: *Loader, t: Tensor, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
         if (t.dtype == to) {
             const size = t.bytes.len / t.numel();
@@ -158,6 +164,7 @@ const Loader = struct {
         for (lo..hi) |i| {
             const v: f32 = switch (t.dtype) {
                 .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16),
+                .f16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)))),
                 .f32 => std.mem.bytesToValue(f32, t.bytes[4 * i ..][0..4]),
                 else => return error.UnexpectedTensor,
             };
@@ -330,6 +337,7 @@ const Loader = struct {
 
     /// weights.load's mlp for a dense layer: gate and up by the rank's rows, down by its columns (NVFP4 or MXFP8).
     fn dense(L: *Loader, i: u32) !mlp.Layer {
+        if (L.w.config.exl3_all) return rs.dense(L, i);
         const c = &L.w.config;
         const s = L.w.share.dense;
         const d = c.hidden;
@@ -441,12 +449,22 @@ const Loader = struct {
         if (c.exl3) { // the MTP layer's experts too
             x3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
             if (!x3.?.shx) L.w.exl3_shx = false;
+            L.w.exl3_book = x3.?.book;
+            if (x3.?.uniform != L.w.exl3_uniform) L.w.exl3_uniform = 0;
         } else routed = try L.nvfp4Experts(i);
         const sh = L.w.share.shared;
-        const sw: []const formats.Format = if (i == c.layers) &.{ .bf16, .fp8_pb, .mxfp8 } else &.{ .bf16, .fp8_pb }; // MTP's MXFP8
-        const gu_parts = [_]formats.Part{ .{ .rel = "mlp.shared_experts.gate_proj", .rows = .{ sh.lo, sh.hi } }, .{ .rel = "mlp.shared_experts.up_proj", .rows = .{ sh.lo, sh.hi } } };
-        const gu = try formats.cutProj(L, prefix, i, &gu_parts, sw, "layers.{d}.moe.shared.gu");
-        const sd = try formats.cutProj(L, prefix, i, &.{.{ .rel = "mlp.shared_experts.down_proj", .cols = .{ sh.lo, sh.hi } }}, sw, "layers.{d}.moe.shared.down");
+        var gu: projection.Proj = undefined;
+        var sd: projection.Proj = undefined;
+        if (c.exl3_all) {
+            const s = try rs.swiglu(L, i, "mlp.shared_experts", sh);
+            gu = .{ .bf16 = s.gu };
+            sd = .{ .bf16 = s.down };
+        } else {
+            const sw: []const formats.Format = if (i == c.layers) &.{ .bf16, .fp8_pb, .mxfp8 } else &.{ .bf16, .fp8_pb }; // MTP's MXFP8
+            const gu_parts = [_]formats.Part{ .{ .rel = "mlp.shared_experts.gate_proj", .rows = .{ sh.lo, sh.hi } }, .{ .rel = "mlp.shared_experts.up_proj", .rows = .{ sh.lo, sh.hi } } };
+            gu = try formats.cutProj(L, prefix, i, &gu_parts, sw, "layers.{d}.moe.shared.gu");
+            sd = try formats.cutProj(L, prefix, i, &.{.{ .rel = "mlp.shared_experts.down_proj", .cols = .{ sh.lo, sh.hi } }}, sw, "layers.{d}.moe.shared.down");
+        }
         return .{
             .router = router,
             .bias = bias,
@@ -516,6 +534,7 @@ const Loader = struct {
         return .{ .format = .nvfp4, .up = ptrs[0], .down = ptrs[1], .up_scale = ptrs[2], .down_scale = ptrs[3], .width = ni, .dims = d, .experts = count, .limit = c.swiglu_limit };
     }
 
+
     fn layer(L: *Loader, i: u32) !Layer {
         const c = &L.w.config;
         const in_norm = try L.norm("layers.{d}.input_layernorm.weight", .{i}, "layers.{d}.in_norm");
@@ -527,8 +546,8 @@ const Loader = struct {
             .in_norm = in_norm,
             .post_norm = post_norm,
             .mixer = switch (c.kind(i)) {
-                .kda => .{ .kda = try L.kda(i) },
-                .mla => .{ .mla = try L.dsa(i) },
+                .kda => .{ .kda = if (c.exl3_all) try rs.kda(L, i) else try L.kda(i) },
+                .mla => .{ .mla = if (c.exl3_all) try rs.dsa(L, i) else try L.dsa(i) },
             },
             .ffn = if (c.isMoe(i)) .{ .moe = try L.moeLayer(i) } else .{ .dense = try L.dense(i) },
         };
@@ -553,6 +572,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
     defer if (recipes) |*r| r.deinit();
     if (recipes) |*r| L.recipes = recipeTable(r);
     w.layers = try gpa.alloc(Layer, layers.len);
+    if (c.exl3_all) w.xl = try xlin.Runner.init(gpa, d);
     for (layers, w.layers) |i, *l| {
         if (i >= c.layers) return error.BadLayer;
         l.* = try L.layer(i);
@@ -561,9 +581,12 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
     try L.whole(try L.get("embed_tokens.weight", .{}), .bf16);
     w.embed = try L.put("embed", .{});
     w.norm = try L.norm("norm.weight", .{}, "norm");
-    const vocab: formats.Part = .{ .rel = "lm_head", .rows = .{ share.vocab.lo, share.vocab.hi } };
-    w.head = try formats.cut(&L, &head_ck, &.{"lm_head"}, &.{vocab}, &.{ .bf16, .mxfp8 }, "head", .{});
+    if (c.exl3_all) w.head = .{ .bf16 = try rs.lmHead(&L, &head_ck) } else {
+        const vocab: formats.Part = .{ .rel = "lm_head", .rows = .{ share.vocab.lo, share.vocab.hi } };
+        w.head = try formats.cut(&L, &head_ck, &.{"lm_head"}, &.{vocab}, &.{ .bf16, .mxfp8 }, "head", .{});
+    }
     if (with_mtp and c.mtp > 0) w.mtp = try @import("cuda_mtp_load.zig").load(&L, &head_ck);
+    if (w.xl) |r| try r.seal();
     return w;
 }
 

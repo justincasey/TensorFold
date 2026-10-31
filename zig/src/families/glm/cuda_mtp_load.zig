@@ -6,6 +6,7 @@ const formats = @import("cuda_formats.zig");
 const weights = @import("cuda_weights.zig");
 const quant = @import("cuda_quant.zig");
 const q4 = @import("cuda_q4.zig");
+const rs = @import("cuda_weights_rs.zig");
 
 const prefix = "model.language_model.";
 
@@ -16,10 +17,15 @@ pub fn load(L: anytype, head_ck: *core.Checkpoint) !weights.Mtp {
     const in_norm = try L.norm("layers.{d}.input_layernorm.weight", .{i}, "layers.{d}.in_norm");
     const post_norm = try L.norm("layers.{d}.post_attention_layernorm.weight", .{i}, "layers.{d}.post_norm");
     const none: weights.Hc = .{ .fn_w = 0, .base = 0, .scale = 0 };
-    const layer_w: weights.Layer = .{ .index = i, .attn_hc = none, .ffn_hc = none, .in_norm = in_norm, .post_norm = post_norm, .mixer = .{ .mla = try L.dsa(i) }, .ffn = .{ .moe = try L.moeLayer(i) } };
+    const mla = if (c.exl3_all) try rs.dsa(L, i) else try L.dsa(i);
+    const layer_w: weights.Layer = .{ .index = i, .attn_hc = none, .ffn_hc = none, .in_norm = in_norm, .post_norm = post_norm, .mixer = .{ .mla = mla }, .ffn = .{ .moe = try L.moeLayer(i) } };
     L.ck.release();
     var out: [4]u64 = undefined;
     for (&out, [_][]const u8{ "enorm.weight", "hnorm.weight", "eh_proj.weight", "shared_head.norm.weight" }, [_][]const u8{ "enorm", "hnorm", "eh", "norm" }) |*p, name, what| {
+        if (c.exl3_all and std.mem.eql(u8, what, "eh")) { // RED-SNOW's eh_proj is an EXL3 group
+            p.* = try rs.eh(L);
+            continue;
+        }
         try L.whole(try L.get("layers.{d}.{s}", .{ i, name }), .bf16);
         p.* = try L.put("mtp.{s}", .{what});
     }
@@ -45,7 +51,10 @@ pub fn draft(L: anytype, head_ck: *core.Checkpoint) !q4.Q4 {
     defer if (wide) |*b| b.free();
     errdefer cuda.completion.drain(L.d, L.stream, "a GLM draft head load did not drain");
     const rows: u64 = switch (L.w.head) {
-        .bf16 => |p| p,
+        .bf16 => |p| if (c.exl3_all) r: { // RED-SNOW: an EXL3 handle, its rows widened through the linear
+            wide = try rs.headBf16(L, p, n, k);
+            break :r wide.?.ptr;
+        } else p,
         .mxfp8 => r: {
             wide = try formats.mxfp8.wideRows(L.d, L.gpa, head_ck, "lm_head", L.w.share.vocab.lo, L.w.share.vocab.hi);
             break :r wide.?.ptr;

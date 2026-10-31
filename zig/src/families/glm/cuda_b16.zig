@@ -54,7 +54,12 @@ pub fn partBytes(m: usize, n: usize, k: usize) usize {
 }
 
 /// qmm.matmul for a B16 weight: out [m][n] bf16 (fp32 with `wide`) = x . w; 128+ rows sum in registers, else `part`.
+/// A handle in the set's EXL3 table (RED-SNOW) runs its EXL3 and bf16 parts instead.
 pub fn matmul(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
+    if (set.xl) |r| if (r.find(w)) |l| {
+        const plain: glue.Set = .{ .glue = set.glue };
+        return r.run(plainMatmul, &plain, stream, l, x, x_stride, out, part, m, n, k, wide);
+    };
     if (k % bk != 0) return error.KNotMultipleOf64;
     if (set.mm) |mk| { // tiled weights, packed or bf16
         const t: mm.Tiled = if (set.packs) |p| p.tiled(w, n, k) else .{ .w = w, .n = n, .k = k };
@@ -93,6 +98,12 @@ pub fn matmul(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u6
     }
     try cuda.launch.launch(set.glue.bmm_decode, .{ .grid = .{ .x = @intCast(cdiv(m, 16)), .y = @intCast(cdiv(n, 64)), .z = @intCast(sk) }, .block = .{ .x = 128 } }, stream, &a);
     if (sk > 1) try glue.sliceSum(set, stream, part, out, m * n, sk, wide);
+}
+
+/// An EXL3 linear's bf16 part: untiled, through the set the caller made (no table, no tiles).
+fn plainMatmul(ctx: *const anyopaque, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) anyerror!void {
+    const set: *const glue.Set = @ptrCast(@alignCast(ctx));
+    return matmul(set.*, stream, x, x_stride, w, out, part, m, n, k, wide);
 }
 
 /// qmm.group_sums: (m, k) bf16 rows (stride `x_stride`) -> (m, k / 64) fp32 sums of each 64 inputs.

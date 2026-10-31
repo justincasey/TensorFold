@@ -14,7 +14,8 @@ pub const Config = struct {
     run: u32 = 45, // backbone layers loaded and run: all, or the first few for a check that must fit (GLM_LAYERS)
     vocab: u32 = 154880,
     head_unit: u32 = 64, // the vocabulary's TP cut in whole units: 128 for EXL3, whose matrices split at 128 columns
-    exl3: bool = false, // routed experts in EXL3 (quant_method "exl3", Mia-AiLab's checkpoint), the rest bf16
+    exl3: bool = false, // routed experts in EXL3 (quant_method "exl3"): Mia-AiLab's (the rest bf16) or RED-SNOW's
+    exl3_all: bool = false, // codebook "mul1" (RED-SNOW): attention, dense, shared and head in EXL3 too, small ones f16
     eps: f32 = 1e-5,
     dense_layers: u32 = 3,
     dense_inter: u32 = 12288, // this Mac's dense MLP rows: all, or its half in TP2
@@ -153,6 +154,7 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
     if (root.get("quantization_config")) |q| if (q == .object) if (q.object.get("quant_method")) |m| if (m == .string and std.mem.eql(u8, m.string, "exl3")) {
         c.head_unit = 128;
         c.exl3 = true;
+        if (q.object.get("codebook")) |b| c.exl3_all = b == .string and std.mem.eql(u8, b.string, "mul1");
     };
     c.eps = @floatCast(try float(t, "rms_norm_eps"));
     c.dense_layers = @intCast(try int(t, "first_k_dense_replace"));
