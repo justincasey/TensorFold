@@ -254,6 +254,30 @@ pub const File = struct {
         _ = linux.fadvise(self.file.handle, 0, 0, linux.POSIX_FADV.DONTNEED);
     }
 
+    /// Bytes [lo, hi) of the file out of the mapping and the page cache (as `release`, for one span; pages that
+    /// straddle its ends go too and refault if read again).
+    pub fn releaseSpan(self: *const File, lo: u64, hi: u64) void {
+        if (@import("builtin").os.tag != .linux or self.map.section == null or hi <= lo) return;
+        const linux = std.os.linux;
+        const page = std.heap.pageSize();
+        const at = std.mem.alignBackward(usize, @intCast(lo), page);
+        const end = @min(self.map.memory.len, std.mem.alignForward(usize, @intCast(hi), page));
+        _ = linux.madvise(@alignCast(self.map.memory.ptr + at), end - at, linux.MADV.DONTNEED);
+        _ = linux.fadvise(self.file.handle, @intCast(at), @intCast(end - at), linux.POSIX_FADV.DONTNEED);
+    }
+
+    /// The file byte range [lo, hi) holding every tensor named `prefix`*, or null (none, or a heap copy: no mmap).
+    pub fn span(self: *const File, prefix: []const u8) ?[2]u64 {
+        if (self.map.section == null) return null;
+        var lo: usize = std.math.maxInt(usize);
+        var hi: usize = 0;
+        for (self.names.keys(), self.names.values()) |name, e| if (std.mem.startsWith(u8, name, prefix)) {
+            lo = @min(lo, e.begin);
+            hi = @max(hi, e.end);
+        };
+        return if (hi <= lo) null else .{ self.data + lo, self.data + hi };
+    }
+
     pub fn get(self: *const File, name: []const u8) ?Tensor {
         const e = self.names.get(name) orelse return null;
         return .{ .dtype = e.dtype, .rank = e.rank, .shape = e.shape, .bytes = self.map.memory[self.data + e.begin .. self.data + e.end] };
