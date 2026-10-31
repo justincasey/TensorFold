@@ -69,7 +69,7 @@ pub fn bodyProfile(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l
     if (prompt) try glue.convShift(set, stream, conv_state, s.p, rows, rows * l.width(), l.width(), 1, 3 * l.heads * kda.dk);
 }
 
-/// The projections of `rows` rows into s.p, s.ka (decay) and s.kg (gate), row by row so segments share one call.
+/// The projections of `rows` rows into s.p, s.ka and s.kg; with a side stream its bf16 part, f_b and g_b run there.
 pub fn project(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize) !void {
     var selected = set;
     if (!l.tiledInput()) selected.mm = null;
@@ -77,7 +77,21 @@ pub fn project(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
     const w = l.width();
     const fa = 3 * n;
     switch (l.proj) {
-        .bf16 => |p| try b16.matmul(selected, stream, x, x_stride, p, s.p, s.mm_part, rows, w, l.dims, false),
+        .bf16 => |p| { // RED-SNOW's mixed EXL3 table: its bf16 part, f_b and g_b on the side stream when given
+            const side = if (set.side) |sd| (if (b16.mixed(set, p)) sd else null) else null;
+            const ps = if (side) |sd| sd.s else stream;
+            if (side) |sd| {
+                try sd.fork(stream);
+                try b16.matmulPart(set, ps, .b, x, x_stride, p, s.p, s.mm_part, rows, w, l.dims, false);
+            } else try b16.matmul(selected, stream, x, x_stride, p, s.p, s.mm_part, rows, w, l.dims, false);
+            try b16.matmul(selected, ps, s.p + fa * 2, w, l.fb, s.ka, s.mm_part, rows, n, kda.dk, false);
+            try b16.matmul(selected, ps, s.p + (fa + kda.dk) * 2, w, l.gb, s.kg, s.mm_part, rows, n, kda.dk, false);
+            if (side) |sd| {
+                try b16.matmulPart(set, stream, .q, x, x_stride, p, s.p, s.mm_part, rows, w, l.dims, false);
+                try sd.join(stream);
+            }
+            return;
+        },
         .split => |sp| { // each part on its own kernel into its columns of s.p: one row straight there, more through tmp
             // cc-defer: two row copies a window; an output row stride on the lane and glm_mm if a profile flags them
             const one = rows == 1;
@@ -107,11 +121,19 @@ fn columns(set: glue.Set, stream: cuda.Stream, src: u64, cols: usize, dst: u64, 
 
 /// The chain over `rows` projected rows (s.p, s.ka, s.kg) on one sequence's conv window and recurrent state.
 pub fn chainRows(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt: bool) !void {
-    const n = l.heads * kda.dk;
-    const fa = 3 * n;
-    const c: kda.Chain = .{ .p = s.p, .p_stride = l.width(), .b_off = fa + 2 * kda.dk, .a = s.ka, .a_stride = n, .g = s.kg, .g_stride = n, .conv_state = conv_state, .conv_w = l.conv_w, .state_in = state_in, .a_log = l.a_log, .dt_bias = l.dt_bias, .norm_w = l.norm_w, .eps = l.eps, .lower = l.lower, .heads = l.heads };
+    const c = chainOf(l, s, conv_state, state_in);
     if (prompt) if (ks.chunk) |*ck| return ck.run(stream, c, rows, s.saves); // a prompt chunk commits whole: no saves
     try kda.chain(ks, stream, c, rows, s.saves, if (wide or rows >= kda.wide_rows) s.wide else null);
+}
+
+/// The three-kernel chain over a shared window's `rows` rows (s.p, s.ka, s.kg, s.saves.out by row), on `segs`.
+pub fn chainSegs(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, segs: *const kda.Segs, rows: usize) !void {
+    try kda.chainSegs(ks, stream, chainOf(l, s, 0, 0), segs, rows, s.saves.out, s.wide);
+}
+
+fn chainOf(l: Layer, s: Scratch, conv_state: u64, state_in: u64) kda.Chain {
+    const fa = 3 * l.heads * kda.dk;
+    return .{ .p = s.p, .p_stride = l.width(), .b_off = fa + 2 * kda.dk, .a = s.ka, .a_stride = l.heads * kda.dk, .g = s.kg, .g_stride = l.heads * kda.dk, .conv_state = conv_state, .conv_w = l.conv_w, .state_in = state_in, .a_log = l.a_log, .dt_bias = l.dt_bias, .norm_w = l.norm_w, .eps = l.eps, .lower = l.lower, .heads = l.heads };
 }
 
 test {

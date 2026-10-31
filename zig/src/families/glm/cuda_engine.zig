@@ -6,6 +6,7 @@ const config = @import("config.zig");
 const shard = @import("cuda_shard.zig");
 const weights = @import("cuda_weights.zig");
 const fw = @import("cuda_forward.zig");
+const Pieces = @import("cuda_pieces.zig").Pieces;
 const ranks = @import("cuda_ranks.zig");
 const sampler = @import("cuda_sampler.zig");
 const prompt_lp = @import("cuda_prompt_logprobs.zig");
@@ -18,6 +19,8 @@ const mm_mod = @import("cuda_mm.zig");
 const dflash = @import("dflash.zig");
 const prof_mod = @import("cuda_prof.zig");
 const pages_mod = @import("cuda_pages.zig");
+const decode = @import("cuda_decode.zig");
+const shared_verify = @import("cuda_verify_shared.zig");
 pub const Options = @import("cuda_engine_types.zig").Options;
 
 /// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
@@ -25,8 +28,6 @@ pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) boo
 
 /// The most drafts a chain holds (decode.DepthPolicy's top depth).
 pub const max_drafts = 3;
-/// A greedy pick as it crosses ranks: (value, id) and padding, so the RoCE gather (16-byte packs) can carry it.
-const pair_bytes = 16;
 
 /// A prompt pass's chunk rows (decode.prefill's).
 pub const prompt_rows = fw.prefill_rows;
@@ -62,11 +63,12 @@ pub const Engine = struct {
     profs: [fw.window_rows]?*prof_mod.Prof = @splat(null), // TF_GLM_PROF=1: verify sections' GPU time, by rows
     profiling_prompt: ?*prof_mod.Prof = null,
     prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024, 2048 rows
+    shared_profs: [shared_verify.prof_buckets]?*prof_mod.Prof = @splat(null), // and shared windows', by streams
     checkpoint_digest: [32]u8,
     settings: ranks.Settings,
     m: fw.Modules,
     stream: cuda.Stream,
-    pieces: fw.Pieces,
+    pieces: Pieces,
     w: weights.Weights,
     bp: fw.Buffers, // prompt chunks
     bd: fw.Buffers, // verify windows
@@ -95,6 +97,7 @@ pub const Engine = struct {
     pages: ?*pages_mod.Pages = null, // the other streams' KV pages and sequences (cuda_pages), once the server attached them
     index_split: bool = false, // the next prompt step's indexer rows split across the ranks: rank 0's choice, the chunk's flag 2
     index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
+    graphs: decode.Graphs, // verify windows replayed as CUDA graphs (TF_GLM_GRAPHS=0: eager)
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
@@ -138,12 +141,12 @@ pub const Engine = struct {
         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
         var m = try fw.Modules.load(d, ctx);
         errdefer m.deinit();
-        var pieces = try fw.Pieces.init(d, o.settings.pieces);
+        var pieces = try Pieces.init(d, o.settings.pieces);
         errdefer pieces.deinit();
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp };
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp, .graphs = .{ .gpa = gpa, .on = decode.Graphs.wanted() } };
         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
         const Tile = struct {
@@ -183,9 +186,9 @@ pub const Engine = struct {
         errdefer e.bm.deinit();
         if (o.mtp) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
-        e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world);
+        e.pairs = try cuda.DeviceBuffer.alloc(d, decode.pair_bytes * world * fw.window_rows);
         errdefer e.pairs.free();
-        try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * world), "cuMemsetD8"); // each pair's padding stays zero
+        try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, decode.pair_bytes * world * fw.window_rows), "cuMemsetD8"); // each pair's padding stays zero
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
         errdefer e.smp.deinit();
         errdefer e.freeProfs();
@@ -198,6 +201,10 @@ pub const Engine = struct {
         };
         e.prompt_out = try prompt_lp.Output.init(d);
         errdefer e.prompt_out.free();
+        if (prof_mod.Prof.wanted()) for (&e.shared_profs) |*p| {
+            p.* = try prof_mod.Prof.init(d, io);
+            if (shared_verify.profByRows()) p.*.?.every = 16; // 32 widths share the calls
+        };
         e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
         errdefer e.shared_buf.free();
         errdefer @import("cuda_load_owner.zig").drain(stream, d);
@@ -228,6 +235,7 @@ pub const Engine = struct {
         if (e.pages) |p| p.deinit();
         for (0..e.seqs.items.len) |i| e.free(i);
         e.seqs.deinit(e.gpa);
+        e.graphs.deinit(); // after the sequences: freeing one clears the graphs
         e.w.deinit();
         e.pieces.deinit();
         e.m.deinit();
@@ -285,6 +293,7 @@ pub const Engine = struct {
     fn free(e: *Engine, slot: usize) void {
         const q = e.seqs.items[slot] orelse return;
         cuda.completion.drain(e.d, e.stream, "GLM sequence release did not drain");
+        e.graphs.clear(); // a graph of this sequence holds its caches' addresses
         q.st.deinit();
         e.gpa.destroy(q);
         e.seqs.items[slot] = null;
@@ -476,7 +485,7 @@ pub const Engine = struct {
         const at = e.cur.st.pos;
         f.prof = e.profs[ids.len - 1];
         if (f.prof) |p| try p.begin(e.stream, verifyLabel(ids.len));
-        try f.run(@ptrCast(ids));
+        try e.graphs.run(&f, @ptrCast(ids));
         if (e.drafter) |dr| try dr.noteVerify(e.slot, 0, ids.len, at, true);
         e.cur.rows_at = e.bd.fnormed;
         try e.draw(e.bd.logits, ids.len, at + 1, bits, out);
@@ -485,31 +494,8 @@ pub const Engine = struct {
 
     const verifyLabel = @import("cuda_engine_prof.zig").verifyLabel;
 
-    /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
-    pub fn verifyShared(e: *Engine, parts: []const Part) !void {
-        const b = if (e.bs) |*x| x else return error.NoSharedWindows;
-        if (parts.len == 0 or parts.len > max_shared) return error.WindowTooWide;
-        var segs: [max_shared]fw.Seg = undefined;
-        var ids: [shared_rows]u32 = undefined;
-        var rows: usize = 0;
-        for (parts, 0..) |p, i| {
-            if (p.ids.len == 0 or p.ids.len > fw.window_rows or rows + p.ids.len > shared_rows) return error.WindowTooWide;
-            for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
-            try e.bind(p.slot);
-            segs[i] = .{ .st = &e.cur.st, .row0 = rows, .rows = p.ids.len };
-            @memcpy(ids[rows..][0..p.ids.len], p.ids);
-            rows += p.ids.len;
-        }
-        var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null };
-        try f.run(@ptrCast(ids[0..rows]));
-        if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
-        for (parts, segs[0..parts.len]) |p, g| {
-            try e.bind(p.slot);
-            e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
-            try e.draw(b.logits + g.row0 * e.share.vocab.len() * 2, g.rows, g.st.pos + 1, p.bits, p.out);
-        }
-    }
+    /// Several streams' windows in one forward (cuda_verify_shared).
+    pub const verifyShared = shared_verify.verifyShared;
 
     /// DFlash2's round (every rank, the same `reqs`): each stream's kept rows into its context, then the block pass.
     pub fn draftBlock(e: *Engine, reqs: []dflash.Req) !void {
@@ -562,14 +548,12 @@ pub const Engine = struct {
             try e.smp.draw(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, sampler.rule(s), out);
             return e.checkGathers(); // the draw read rows the forward's gathers made
         }
-        for (0..rows) |r| out[r] = try e.greedy(logits + r * e.share.vocab.len() * 2);
+        try decode.greedy(e, logits, rows, out);
     }
 
     pub const promptHead = @import("cuda_structured.zig").promptHead;
     pub const drawWhole = @import("cuda_structured.zig").drawWhole;
     pub const redrawFirst = @import("cuda_structured.zig").redrawFirst;
-    /// decode.sample_rows' greedy pick: per-rank top-1 (tf_glm_top1), all-gathered, largest value then lowest id.
-    const greedy = @import("cuda_engine_pick.zig").greedy;
 
     /// A failed RoCE gather's error, after a synchronize whose result read gathered rows (they hold nothing then).
     pub fn checkGathers(e: *const Engine) !void {

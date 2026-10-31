@@ -76,9 +76,12 @@ pub fn pack(ks: *const Kernels, stream: cuda.Stream, words: u64, scales: u64, bi
     }
 }
 
-/// qmm.matmul of a Q4 (tile 2, up to 16 rows): x bf16 (`ldx` apart), group sums xs fp32 [rows][k/64] -> out bf16.
+/// The rows one call takes: 16-row tiles, a column tile's row tiles adjacent blocks (its weights mostly read once).
+pub const max_rows = 128;
+
+/// qmm.matmul of a Q4 (tile 2): x bf16 (`ldx` apart), group sums xs fp32 [rows][k/64] -> out bf16; same bits a row.
 pub fn matmul(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize) !void {
-    if (rows == 0 or rows > 16) return error.WindowTooWide;
+    if (rows == 0 or rows > max_rows) return error.WindowTooWide;
     const sk = splitK(q.n, q.k);
     const tiles = (q.n + 63) / 64;
     var parts: Parts = std.mem.zeroes(Parts);

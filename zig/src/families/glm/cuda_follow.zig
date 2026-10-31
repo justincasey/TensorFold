@@ -37,6 +37,9 @@ pub const Header = extern struct {
 pub const Words = extern struct { w: [96]u32 };
 pub const put_ids = 96 - 16;
 
+/// Every step's first broadcast: its header and room for `put_ids` ids, so a short step crosses in one.
+const first_bytes = 64 + put_ids * 4;
+
 /// The most ids one step carries (a prompt at the engine's capacity).
 pub const Link = struct {
     d: *const cuda.Driver,
@@ -51,7 +54,7 @@ pub const Link = struct {
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, asked_ids: usize) !Link {
         const max_ids = @max(asked_ids, prompt_wire.words);
-        const buf = try cuda.DeviceBuffer.alloc(d, 64 + max_ids * 4);
+        const buf = try cuda.DeviceBuffer.alloc(d, 64 + @max(max_ids, put_ids) * 4);
         errdefer {
             var owned = buf;
             owned.free();
@@ -74,7 +77,7 @@ pub const Link = struct {
         try l.lib.check(l.lib.api.ncclBroadcast(l.buf.ptr, l.buf.ptr, bytes, .u8, 0, l.comm, l.stream.handle), "ncclBroadcast");
     }
 
-    /// Rank 0: the step and ids to every rank; up to `put_ids` ids go by `put` unwaited, longer ones upload and wait.
+    /// Rank 0: the step to every rank in one broadcast with up to `put_ids` ids (put unwaited); longer: the ids again.
     pub fn send(l: *Link, put: cuda.Function, h: Header, ids: []const u32) !void {
         if (ids.len > l.ids.len) return error.TooManyIds;
         var hh = h;
@@ -88,16 +91,12 @@ pub const Link = struct {
             a.add(@as(u32, @intCast(16 + ids.len)));
             a.add(w);
             try cuda.launch.launch(put, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, l.stream, &a);
-            try l.post(64);
-            if (ids.len > 0) try l.post(64 + ids.len * 4);
-            return;
+            return l.post(first_bytes);
         }
         try l.buf.uploadAsync(0, std.mem.asBytes(&hh), l.stream.handle);
-        try l.bcast(64);
-        if (ids.len > 0) {
-            try l.buf.uploadAsync(64, std.mem.sliceAsBytes(ids), l.stream.handle);
-            try l.bcast(64 + ids.len * 4);
-        }
+        if (ids.len > 0) try l.buf.uploadAsync(64, std.mem.sliceAsBytes(ids), l.stream.handle);
+        try l.bcast(first_bytes);
+        if (ids.len > put_ids) try l.bcast(64 + ids.len * 4);
     }
 
     /// `bytes` at `ptr` from rank 0 into every rank's `ptr` (image rows: the follower's buffer is the same size).
@@ -108,14 +107,12 @@ pub const Link = struct {
 
     /// Other ranks: the next step and its ids (valid until the next receive).
     pub fn receive(l: *Link) !struct { h: Header, ids: []const u32 } {
-        try l.bcast(64);
+        try l.bcast(first_bytes);
         var h: Header = undefined;
         try l.buf.download(0, std.mem.asBytes(&h));
         if (h.n > l.ids.len) return error.TooManyIds;
-        if (h.n > 0) {
-            try l.bcast(64 + h.n * 4);
-            try l.buf.download(64, std.mem.sliceAsBytes(l.ids[0..h.n]));
-        }
+        if (h.n > put_ids) try l.bcast(64 + h.n * 4);
+        if (h.n > 0) try l.buf.download(64, std.mem.sliceAsBytes(l.ids[0..h.n]));
         return .{ .h = h, .ids = l.ids[0..h.n] };
     }
 };
@@ -281,14 +278,14 @@ pub const Leader = struct {
         try x.e.draft(from_prompt, follow_ids, depth, out);
     }
 
-    /// DFlash2's round on every rank (Engine.draftBlock): each stream's slot, kept rows and anchor.
-    pub fn block(x: Leader, reqs: []dflash.Req) !void {
-        if (reqs.len == 0 or reqs.len > dflash.MAX_S) return error.TooManyStreams;
+    /// DFlash2's round on every rank (Engine.draftBlock), each stream's last verify committed first (`keeps`, 0: none).
+    pub fn block(x: Leader, reqs: []dflash.Req, keeps: []const u32) !void {
+        if (reqs.len == 0 or reqs.len > dflash.MAX_S or keeps.len != reqs.len) return error.TooManyStreams;
         try x.flush();
-        var buf: [3 * dflash.MAX_S]u32 = undefined;
-        for (reqs, 0..) |q, i| buf[3 * i ..][0..3].* = .{ q.slot, @intCast(q.n), q.anchor };
-        try x.send(.{ .kind = @backingInt(Kind.block), .depth = @intCast(reqs.len) }, buf[0 .. 3 * reqs.len]);
-        try x.e.draftBlock(reqs);
+        var buf: [4 * dflash.MAX_S]u32 = undefined;
+        for (reqs, keeps, 0..) |q, n, i| buf[4 * i ..][0..4].* = .{ q.slot, @intCast(q.n), q.anchor, n };
+        try x.send(.{ .kind = @backingInt(Kind.block), .depth = @intCast(reqs.len) }, buf[0 .. 4 * reqs.len]);
+        try keepThen(x.e, reqs, keeps);
     }
 
     /// The other ranks leave their loops.
@@ -313,6 +310,15 @@ fn indexSplit(h: Header) bool {
 fn structuredStep(h: Header) bool {
     const kind: Kind = @fromBackingInt(@intCast(h.kind));
     return (kind == .verify or kind == .shared) and h.flags & 1 != 0;
+}
+
+/// Each stream's last verify committed (its `keeps` rows), then the block round (every rank alike).
+fn keepThen(e: *Engine, reqs: []dflash.Req, keeps: []const u32) !void {
+    for (reqs, keeps) |q, n| if (n > 0) {
+        try e.bind(q.slot);
+        try e.keep(n);
+    };
+    try e.draftBlock(reqs);
 }
 
 /// A rank other than 0 runs rank 0's steps until it ends; a cancelled prefill is error.Cancelled and the loop goes on.
@@ -387,10 +393,14 @@ pub fn follow(e: *Engine, link: *Link) !void {
             },
             .block => {
                 const k = h.depth;
-                if (k == 0 or k > dflash.MAX_S or step.ids.len != 3 * k) return error.BadStep;
+                if (k == 0 or k > dflash.MAX_S or step.ids.len != 4 * k) return error.BadStep;
                 var reqs: [dflash.MAX_S]dflash.Req = undefined;
-                for (reqs[0..k], 0..) |*q, i| q.* = .{ .slot = step.ids[3 * i], .pos = 0, .n = step.ids[3 * i + 1], .anchor = step.ids[3 * i + 2] };
-                try e.draftBlock(reqs[0..k]);
+                var keeps: [dflash.MAX_S]u32 = undefined;
+                for (reqs[0..k], keeps[0..k], 0..) |*q, *n, i| {
+                    q.* = .{ .slot = step.ids[4 * i], .pos = 0, .n = step.ids[4 * i + 1], .anchor = step.ids[4 * i + 2] };
+                    n.* = step.ids[4 * i + 3];
+                }
+                try keepThen(e, reqs[0..k], keeps[0..k]);
             },
             .image => {
                 const v = e.images orelse return error.NoVision; // the ranks agreed on --vision (cuda_ranks)

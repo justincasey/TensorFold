@@ -6,7 +6,7 @@ const Forward = fw.Forward;
 const Pieces = fw.Pieces;
 const Site = fw.Forward.Site;
 const room = fw.Forward.room;
-const share = fw.Forward.share;
+const share = @import("cuda").rank_scatter.share;
 
 /// overlap.Overlap.partials: each piece filled on the main stream, exchanged on the second (gathered or split).
 pub fn exchangePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut: []const [2]usize) !void {

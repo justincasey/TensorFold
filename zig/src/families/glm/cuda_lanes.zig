@@ -8,6 +8,7 @@ const fw = @import("cuda_forward.zig");
 const dflash = @import("dflash.zig");
 const prompt_lp = @import("cuda_prompt_logprobs.zig");
 const cuda = @import("cuda");
+const prof_mod = @import("cuda_prof.zig");
 
 const be = lanes.backend;
 
@@ -21,13 +22,21 @@ const max_held = dflash.BLOCK - 1; // a DFlash2 block's drafts (the MTP head's c
 
 /// With DFlash2: a window's ms by rows on two GB10s (EXL3, TF_GLM_PROF: 86 to 107 ms at 5 to 8), shared as glm_cuda's.
 const gb10_window_costs = costTable(max_rows, 52.0, 6.8);
-const gb10_shared_costs = costTable(engine.shared_rows, 76.0, 4.1);
 
 fn costTable(comptime n: usize, comptime one: f64, comptime row: f64) [n]lanes.config.Cost {
     var c: [n]lanes.config.Cost = undefined;
     for (&c, 0..) |*x, i| x.* = .{ .width = i + 1, .ms = one + row * @as(f64, @floatFromInt(i)) };
     return c;
 }
+
+/// A shared window's ms by total rows on two GB10s (TF_GLM_PROF_BY=rows; mul1 linears in one pass to 32 rows).
+const gb10_shared_ms = [_]f64{ 44, 52, 60, 66, 75, 84.5, 93, 101.5, 110, 117, 123.5, 129.5, 137.5, 144, 148.5, 155, 159.5, 164, 168.5, 175, 180 };
+const gb10_shared_costs = shared: {
+    var c: [gb10_shared_ms.len + 1]lanes.config.Cost = undefined;
+    for (c[0..gb10_shared_ms.len], gb10_shared_ms, 1..) |*x, ms, w| x.* = .{ .width = w, .ms = ms };
+    c[gb10_shared_ms.len] = .{ .width = engine.shared_rows, .ms = 180 + 6.0 * @as(f64, @floatFromInt(engine.shared_rows - gb10_shared_ms.len)) };
+    break :shared c;
+};
 
 /// A stream's place in the backend: its sequence's slot, the rows its last verify left uncommitted, its held drafts.
 const Lane = struct {
@@ -46,6 +55,7 @@ pub const Lanes = struct {
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
+    clock: prof_mod.Rounds = .{}, // TF_GLM_PROF=1: shared rounds' host time by call
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
     bits: ?cuda.HostBuffer = null, // structured output's grammar words (shared_rows rows), device-read, at first use
@@ -72,7 +82,9 @@ pub const Lanes = struct {
     }
 
     pub fn backend(self: *Lanes) be.Backend {
-        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else &steps_vt };
+        // the first token leaves before the first DFlash2 block (open_first): TTFT pays no draft pass
+        const early = self.x.e.drafter != null and !std.mem.eql(u8, std.mem.span(std.c.getenv("TF_GLM_FIRST_EARLY") orelse "1"), "0");
+        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else &steps_vt, .first_before_draft = early };
     }
 
     const whole_vt: be.Backend.VTable = .{
@@ -393,6 +405,9 @@ pub const Lanes = struct {
     /// Each window in its own forward on its stream's sequence (the core sends one when no forward is shared).
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const self = of(ptr);
+        self.clock.round(windows.len);
+        const t0 = self.clock.begin(self.x.e.io);
+        defer self.clock.end(self.x.e.io, .verify, t0);
         if (windows.len > 1) return self.verifyShared(windows, out);
         for (windows, out) |w, *o| {
             if (w.parents != null) return error.TreesNotBuilt;
@@ -457,6 +472,8 @@ pub const Lanes = struct {
 
     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
         const self = of(ptr);
+        const t0 = self.clock.begin(self.x.e.io);
+        defer self.clock.end(self.x.e.io, .keep, t0);
         for (windows, paths) |w, path| {
             if (path.len == 0) return error.EmptyPath;
             for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
@@ -466,6 +483,8 @@ pub const Lanes = struct {
 
     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const self = of(ptr);
+        const t0 = self.clock.begin(self.x.e.io);
+        defer self.clock.end(self.x.e.io, .draft, t0);
         if (self.x.e.drafter != null) return self.draftBlock(requests);
         if (!self.x.e.mtp) return error.NoDraftHead;
         for (requests) |r| {
@@ -484,14 +503,18 @@ pub const Lanes = struct {
         }
     }
 
-    /// DFlash2: every request's kept rows committed, then one block round for them all (cuda_follow's block step).
+    /// DFlash2: one block round for every request, each one's kept rows committed first (cuda_follow's block step).
     fn draftBlock(self: *Lanes, requests: []const be.DraftRequest) !void {
         if (requests.len > dflash.MAX_S) return error.TooManyStreams;
         var reqs: [dflash.MAX_S]dflash.Req = undefined;
+        var keeps: [dflash.MAX_S]u32 = undefined;
         var held: [dflash.MAX_S]*Lane = undefined;
         for (requests, 0..) |r, i| {
-            const l = try self.bind(r.stream, if (r.rows) |rows| rows.len else null);
-            if (r.position != self.x.e.pos() + 1) return error.PositionMismatch;
+            const l = self.lanes.getPtr(r.stream) orelse return error.UnknownStream;
+            const kept: usize = if (l.pending_rows) |rows| (if (r.rows) |rr| rr.len else rows) else 0;
+            l.pending_rows = null;
+            const seq = (if (l.slot < self.x.e.seqs.items.len) self.x.e.seqs.items[l.slot] else null) orelse return error.UnknownSlot;
+            if (r.position != seq.st.pos + kept + 1) return error.PositionMismatch;
             if (r.lanes != null) return error.TreesNotBuilt;
             var n: usize = 0;
             const anchor = if (r.rows) |rows| a: {
@@ -500,9 +523,10 @@ pub const Lanes = struct {
                 break :a r.follow[rows.len - 1];
             } else self.value(r.first orelse return error.NoFirstToken);
             reqs[i] = .{ .slot = l.slot, .pos = 0, .n = n, .anchor = anchor, .out = &l.held, .probs = &l.chances };
+            keeps[i] = @intCast(kept);
             held[i] = l;
         }
-        try self.x.block(reqs[0..requests.len]);
+        try self.x.block(reqs[0..requests.len], keeps[0..requests.len]);
         const cut = confidence();
         for (requests, held[0..requests.len]) |r, l| {
             l.held_n = @min(r.depth, max_held);

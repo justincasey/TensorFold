@@ -89,6 +89,7 @@ pub const Pages = struct {
         }
         try e.stream.synchronize();
         own.?.st.place(&e.w, at); // last: a failure before it leaves the engine's own as it was
+        e.graphs.clear(); // a graph of the engine's own sequence holds its old cache addresses
         return p;
     }
 

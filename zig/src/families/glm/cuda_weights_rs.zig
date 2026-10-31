@@ -266,7 +266,7 @@ pub fn headBf16(L: anytype, id: u64, n: usize, k: usize) !cuda.DeviceBuffer {
         @memset(eye, 0);
         for (0..pass) |j| eye[j * k + r0 + j] = 0x3F80; // bf16 1.0
         try xb.upload(0, std.mem.sliceAsBytes(eye));
-        try r.run(noBf16, undefined, L.stream, l, xb.ptr, k, yb.ptr, 0, pass, n, k, true);
+        try r.run(noBf16, undefined, L.stream, l, null, xb.ptr, k, yb.ptr, 0, pass, n, k, true);
         try L.stream.synchronize();
         try yb.download(0, std.mem.sliceAsBytes(y));
         for (0..pass) |j| for (0..n) |col| {

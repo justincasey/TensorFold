@@ -2,14 +2,10 @@
 const std = @import("std");
 const Engine = @import("cuda_engine.zig").Engine;
 pub fn freeProfs(e: *Engine) void {
-    for (&e.profs) |*p| {
+    for ([_][]?*@import("cuda_prof.zig").Prof{ &e.profs, &e.prompt_profs, &e.shared_profs }) |set| for (set) |*p| {
         if (p.*) |v| v.deinit();
         p.* = null;
-    }
-    for (&e.prompt_profs) |*p| {
-        if (p.*) |v| v.deinit();
-        p.* = null;
-    }
+    };
 }
 
 pub fn heatRoot() []const u8 {

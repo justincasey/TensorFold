@@ -10,6 +10,9 @@ pub const Part = union(enum) {
     b: u64, // bf16 [n][k] row-major, untiled
 };
 
+/// A part's kind: a window may run its EXL3 parts and its bf16 part on two streams.
+pub const Kind = std.meta.Tag(Part);
+
 pub const Lin = struct {
     id: u64,
     n: usize,
@@ -55,6 +58,7 @@ pub const Runner = struct {
     max_z: usize = 0,
     max_counters: usize = 0,
     streams: [max_streams]Scratch = @splat(.{}),
+    grown: u64 = 0, // scratch reallocations: a captured decode graph holds the old addresses (cuda_decode)
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver) !*Runner {
         const r = try gpa.create(Runner);
@@ -138,7 +142,16 @@ pub const Runner = struct {
         const nb = try cuda.DeviceBuffer.alloc(r.d, @max(bytes, 256));
         if (slot.*) |*old| old.free();
         slot.* = nb;
+        r.grown += 1;
         return nb.ptr;
+    }
+
+    /// The split-K counters, zeroed when allocated: each call's last block of a column block zeroes its own again.
+    fn zeroedCounters(r: *Runner, s: *Scratch, stream: cuda.Stream, bytes: usize) !u64 {
+        const before = r.grown;
+        const p = try r.grow(&s.counters, bytes);
+        if (r.grown != before) try stream.d.check(stream.d.api.cuMemsetD8Async(p, 0, s.counters.?.len, stream.handle), "EXL3 counters");
+        return p;
     }
 
     /// Grows each stream's scratch for `rows` rows a call (prompt chunks) before any decode window runs.
@@ -146,7 +159,7 @@ pub const Runner = struct {
         const s = try r.scratchFor(stream);
         _ = try r.grow(&s.xh, @max(rows, block_rows) * r.max_k * 2);
         _ = try r.grow(&s.z, r.max_z);
-        _ = try r.grow(&s.counters, r.max_counters);
+        _ = try r.zeroedCounters(s, stream, r.max_counters);
         _ = try r.grow(&s.xc, rows * r.max_k * 2);
         _ = try r.grow(&s.yt, rows * r.max_n * 4);
     }
@@ -156,14 +169,15 @@ pub const Runner = struct {
         try stream.d.check(stream.d.api.cuMemcpy2DAsync_v2(&m, stream.handle), "EXL3 linear rows");
     }
 
-    /// out [m][n] (fp32 when `wide`, else bf16) = x [m][k] (bf16 rows `x_stride` apart) through linear `l`.
-    pub fn run(r: *Runner, bf: Bf16Fn, ctx: *const anyopaque, stream: cuda.Stream, l: *const Lin, x: u64, x_stride: usize, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
+    /// out [m][n] (fp32 with `wide`, else bf16) = x [m][k] (`x_stride` apart) by `l`; `only`: that kind's parts alone.
+    pub fn run(r: *Runner, bf: Bf16Fn, ctx: *const anyopaque, stream: cuda.Stream, l: *const Lin, only: ?Kind, x: u64, x_stride: usize, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
         if (n != l.n or k != l.k) return error.Exl3LinearShape;
         const s = try r.scratchFor(stream);
         const ye: usize = if (wide) 4 else 2;
         const yd: exl3.DType = if (wide) .f32 else .bf16;
         var xc: ?u64 = if (x_stride == k) x else null; // contiguous rows, copied once when a part needs them
         for (l.parts[0..l.count], l.cols[0..l.count], l.widths[0..l.count]) |p, col, w| {
+            if (only) |o| if (p != o) continue;
             if (p == .q and m >= prompt_rows and exl3.denseIndex(p.q) != null) { // in place at its columns
                 const xh = try r.grow(&s.xh, m * k * 2);
                 try (try r.linear()).dense(stream, p.q, x, x_stride, m, out + col * ye, n, yd, xh);
@@ -196,13 +210,12 @@ pub const Runner = struct {
         const lin = try r.linear();
         const p = exl3.plan(w.k, w.n, 192, 8);
         const z: u64 = if (p.sk > 1) try r.grow(&s.z, @as(usize, p.sk) * block_rows * w.n * 4) else 0;
-        const counters = try r.grow(&s.counters, exl3.Linear.counterBytes(w));
+        const counters = try r.zeroedCounters(s, stream, exl3.Linear.counterBytes(w));
         const xh = try r.grow(&s.xh, block_rows * w.k * 2);
         const ye: u64 = if (yd == .f32) 4 else 2;
         var at: usize = 0;
         while (at < rows) : (at += block_rows) {
             const mm = @min(rows - at, block_rows);
-            try stream.d.check(stream.d.api.cuMemsetD8Async(counters, 0, exl3.Linear.counterBytes(w), stream.handle), "EXL3 counters");
             try lin.matmul(stream, w, x + @as(u64, at) * w.k * 2, .bf16, mm, y + @as(u64, at) * w.n * ye, yd, xh, z, counters);
         }
     }
