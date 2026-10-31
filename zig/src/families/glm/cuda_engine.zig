@@ -353,6 +353,7 @@ pub const Engine = struct {
         var f = e.view(&e.bp, &one);
         f.index_split = split;
         const as_i32: []const i32 = @ptrCast(part);
+        if (f.taps) |*t| t.keep = dflash.keepFrom(len) -| start; // a split piece's tap rows before it aren't swapped
         if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
         f.prof = e.prompt_profs[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3];
         const labels = [_][]const u8{ "prompt chunk to 64 rows", "prompt chunk to 256 rows", "prompt chunk to 1024 rows", "prompt chunk to 2048 rows" };
@@ -377,9 +378,6 @@ pub const Engine = struct {
         stamp = prof_mod.span(f.prof, e.stream, .prompt_score);
         if (e.prompt_logprobs) |p| if (part.len > 1) try prompt_lp.run(e, p, part[1..]);
         stamp.end();
-        stamp = prof_mod.span(f.prof, e.stream, .drafter);
-        if (e.drafter) |dr| try dr.prompt(e, e.slot, start, rows, len);
-        stamp.end();
         stamp = prof_mod.span(f.prof, e.stream, .draw);
         const last = start + rows == len;
         var first: ?u32 = null;
@@ -390,6 +388,9 @@ pub const Engine = struct {
         }
         stamp.end();
         if (f.prof) |p| p.mark(e.stream, .draw);
+        stamp = prof_mod.span(f.prof, e.stream, .drafter);
+        if (e.drafter) |dr| try dr.prompt(e, e.slot, start, rows, len); // after the draw: no first token waits on it
+        stamp.end();
         if (last) try e.holdPrompt(e.bp.fnormed + (rows - 1) * e.c.hidden * 2);
         stamp = prof_mod.span(f.prof, e.stream, .mtp);
         if (e.mtp and e.drafter == null) { // DFlash2 drafts without the MTP head: its rows are never read

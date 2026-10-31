@@ -79,6 +79,7 @@ const Fake = struct {
         f.e.capacity = 4096;
         f.e.seqs = .empty;
         f.e.pages = null;
+        f.e.graphs = .{ .gpa = std.testing.allocator, .on = false };
         f.e.images = null;
         f.e.settings = .{};
         f.e.w = undefined;

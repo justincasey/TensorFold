@@ -367,12 +367,12 @@ pub const Forward = struct {
             for (f.ranks) |r| try f.ffn(r, r.w.layers[j], R, null);
             try f.exchangePieces(p, j, .ffn, cut);
             try f.gluePieces(p, j, .ffn, cut);
-            if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, R);
             switch (layers[j].mixer) {
                 .kda => li += 1,
                 .mla => di += 1,
             }
         }
+        try taps_mod.swapped(f.taps, f.stream, p, 0, layers.len);
     }
 
     /// forward.forward of `ids`: logits in b.logits; a prompt chunk's KDA layers committed, a window's at `commit`.

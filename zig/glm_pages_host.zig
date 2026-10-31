@@ -83,6 +83,7 @@ const Fixture = struct {
         f.e.seqs = .empty;
         f.e.images = null;
         f.e.pages = null;
+        f.e.graphs = .{ .gpa = t.allocator, .on = false };
         f.e.w = undefined;
         f.e.w.config = .{ .layers = 2, .kv_lora = 16, .i_dim = 8, .hidden = 64 };
         f.e.w.share = try glm.shard.Share.of(&f.e.w.config, 0, 2);

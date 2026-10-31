@@ -534,7 +534,6 @@ const Loader = struct {
         return .{ .format = .nvfp4, .up = ptrs[0], .down = ptrs[1], .up_scale = ptrs[2], .down_scale = ptrs[3], .width = ni, .dims = d, .experts = count, .limit = c.swiglu_limit };
     }
 
-
     fn layer(L: *Loader, i: u32) !Layer {
         const c = &L.w.config;
         const in_norm = try L.norm("layers.{d}.input_layernorm.weight", .{i}, "layers.{d}.in_norm");

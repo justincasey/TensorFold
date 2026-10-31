@@ -19,6 +19,7 @@ const Fake = struct {
     fn backend(f: *Fake) Backend {
         var real: glm.lanes.Lanes = undefined;
         real.whole = false;
+        real.first_early = false;
         const caps = real.backend().vtable;
         f.table = f.target.backend().vtable.*;
         f.table.prefill = whole;
@@ -145,6 +146,7 @@ test "GLM CUDA admission: a live decoder runs between three eligible fresh promp
 test "GLM CUDA admission: whole-prompt mode retains its batch callback" {
     var real: glm.lanes.Lanes = undefined;
     real.whole = true;
+    real.first_early = false;
     const caps = real.backend().vtable;
     try std.testing.expect(caps.prefill_many != null);
     try std.testing.expect(caps.prefill_step == null);

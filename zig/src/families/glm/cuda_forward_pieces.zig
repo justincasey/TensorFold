@@ -2,6 +2,7 @@
 const relay = @import("cuda_relay.zig");
 const fw = @import("cuda_forward.zig");
 const prof = @import("cuda_prof.zig");
+const taps_mod = @import("cuda_taps.zig");
 const Forward = fw.Forward;
 const Pieces = fw.Pieces;
 const Site = fw.Forward.Site;
@@ -56,13 +57,15 @@ pub fn exchangePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site,
     }
 }
 
-/// overlap.Overlap.glue: each piece's glue once its exchange is in, its rows then shared on the second stream.
+/// overlap.Overlap.glue: each piece's glue and taps once its exchange is in, its rows then shared on the side.
 pub fn gluePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut: []const [2]usize) !void {
     defer prof.context(f.prof, j, null, if (site == .mixer) .mixer else .ffn);
     const c = &f.ranks[0].w.config;
     const D: usize = c.hidden;
     const world = f.ranks[0].w.share.world;
     const last = site == .ffn and j + 1 == f.ranks[0].w.layers.len;
+    const taps: ?taps_mod.Taps = if (site == .ffn) f.taps else null;
+    const tap_rows = taps != null and j == taps_mod.last; // hcsplit.glue: tap rows swapped with the peer's
     var sent: usize = 0;
     for (cut, 0..) |piece, q| {
         prof.context(f.prof, j, q, if (site == .mixer) .mixer else .ffn);
@@ -73,11 +76,13 @@ pub fn gluePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut
         stamp.end();
         if (!f.splits(n)) {
             for (f.ranks) |r| try f.glueRows(r, j, site, lo, piece[1], room(r, lo));
+            if (taps) |t| try t.rows(f.stream, j, f.ranks[0].b.x, lo, piece[1]);
             continue;
         }
         for (f.ranks) |r| {
             const mine = share(n, world, r.w.share.rank);
             try f.glueRows(r, j, site, lo + mine[0], lo + mine[1], room(r, lo));
+            if (taps) |t| try t.rows(f.stream, j, r.b.x, lo + mine[0], lo + mine[1]); // local ranks: disjoint rows of one buffer
         }
         try p.glues[q].record(f.stream);
         stamp = prof.span(f.prof, p.side, .wait_glues);
@@ -101,10 +106,12 @@ pub fn gluePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut
                 if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
             },
         }
+        if (tap_rows and piece[1] > taps.?.keep) try taps.?.swap(f.exchange, p.side, .{ .world = world, .rank = f.ranks[0].w.share.rank, .n = n }, lo, f.ring);
         stamp.end();
         try p.shared[q].record(p.side);
         sent |= @as(usize, 1) << @intCast(q);
     }
+    if (tap_rows) try p.tapped.record(p.side);
     for (0..cut.len) |q| if (sent >> @intCast(q) & 1 == 1) {
         prof.context(f.prof, j, q, if (site == .mixer) .mixer else .ffn);
         const stamp = prof.span(f.prof, f.stream, .wait_shared);

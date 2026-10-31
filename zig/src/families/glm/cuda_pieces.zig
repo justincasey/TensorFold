@@ -12,10 +12,11 @@ pub const Pieces = struct {
     gathered: [max_pieces]cuda.Event,
     glues: [max_pieces]cuda.Event, // split: a piece's own rows glued
     shared: [max_pieces]cuda.Event, // split: every rank's glued rows of a piece in
+    tapped: cuda.Event, // split: every rank's tap rows in (after the last tapped layer)
 
     pub fn init(d: *const cuda.Driver, count: usize) !Pieces {
         if (count == 0 or count > max_pieces) return error.BadPieces;
-        var p: Pieces = .{ .count = count, .side = try cuda.Stream.init(d, false), .filled = undefined, .gathered = undefined, .glues = undefined, .shared = undefined };
+        var p: Pieces = .{ .count = count, .side = try cuda.Stream.init(d, false), .filled = undefined, .gathered = undefined, .glues = undefined, .shared = undefined, .tapped = try cuda.Event.init(d, false) };
         for (&p.filled, &p.gathered, &p.glues, &p.shared) |*a, *b, *g, *s| {
             a.* = try cuda.Event.init(d, false);
             b.* = try cuda.Event.init(d, false);
@@ -32,6 +33,7 @@ pub const Pieces = struct {
             g.deinit();
             s.deinit();
         }
+        p.tapped.deinit();
         p.side.deinit();
         p.* = undefined;
     }

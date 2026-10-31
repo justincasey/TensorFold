@@ -27,7 +27,8 @@ pub const CH: usize = 16; // key chunks of the chunked attention (df_attn_part)
 pub const CW: usize = 2 * TOPK; // a row's gathered ints: 16 ids, then 16 values' bits
 pub const MAX_S: usize = 16; // streams one block pass drafts for
 pub const MAX_M: usize = MAX_S * BLOCK; // block rows at most
-pub const MAX_CTX: usize = 2048; // context rows one ingest takes (a prompt chunk's)
+pub const MAX_CTX: usize = 2048; // context rows one ingest takes (a prompt's last window at most)
+pub const TAP_ROWS: usize = @max(MAX_CTX, @import("cuda_state.zig").prefill_rows); // a prompt pass's tap rows
 pub const STEP_ROWS: usize = 32; // a verify's tap rows (the shared windows' rows at most)
 pub const TAP_ROW: usize = taps_mod.layers.len * D * 2; // bytes of one row's taps
 
@@ -298,11 +299,16 @@ pub const Drafter = struct {
     }
 };
 
+/// A `len`-id prompt's first position the drafter's context keeps (its last window's).
+pub fn keepFrom(len: usize) usize {
+    return len -| @as(usize, @intCast(WIN));
+}
+
 /// Prompt context retained in the window; row0 is only a tap-buffer offset, never a sequence position.
 pub fn promptRun(ring: u64, taps: u64, start: usize, rows: usize, len: usize, row0: usize) !?Run {
     if (start > len or rows > len - start) return error.BadPromptContext;
-    if (rows > MAX_CTX or row0 > MAX_CTX - rows) return error.DrafterContextTooWide;
-    const keep_from = len -| @as(usize, @intCast(WIN));
+    if (rows > TAP_ROWS or row0 > TAP_ROWS - rows) return error.DrafterContextTooWide;
+    const keep_from = keepFrom(len);
     if (start + rows <= keep_from) return null;
     const lo = keep_from -| start;
     return .{ .ring = ring, .taps = taps + (row0 + lo) * TAP_ROW, .n = rows - lo, .pos0 = @intCast(start + lo) };

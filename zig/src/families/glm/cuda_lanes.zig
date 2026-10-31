@@ -53,6 +53,7 @@ pub const Lanes = struct {
     x: follow.Leader,
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
+    first_early: bool = false, // the first token leaves before the first DFlash2 block (TF_GLM_FIRST_EARLY=0: after)
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
     clock: prof_mod.Rounds = .{}, // TF_GLM_PROF=1: shared rounds' host time by call
@@ -82,9 +83,7 @@ pub const Lanes = struct {
     }
 
     pub fn backend(self: *Lanes) be.Backend {
-        // the first token leaves before the first DFlash2 block (open_first): TTFT pays no draft pass
-        const early = self.x.e.drafter != null and !std.mem.eql(u8, std.mem.span(std.c.getenv("TF_GLM_FIRST_EARLY") orelse "1"), "0");
-        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else &steps_vt, .first_before_draft = early };
+        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else &steps_vt, .first_before_draft = self.first_early };
     }
 
     const whole_vt: be.Backend.VTable = .{
@@ -539,10 +538,10 @@ pub const Lanes = struct {
         }
     }
 
-    /// TF_GLM_DRAFT_CONFIDENCE: where a DFlash2 chain's chance product stops it (glm_cuda's 0.7).
+    /// TF_GLM_DRAFT_CONFIDENCE: where a DFlash2 chain's chance product stops it (0.6; glm_cuda's 0.7).
     fn confidence() f64 {
-        const v = std.c.getenv("TF_GLM_DRAFT_CONFIDENCE") orelse return 0.7;
-        return std.fmt.parseFloat(f64, std.mem.span(v)) catch 0.7;
+        const v = std.c.getenv("TF_GLM_DRAFT_CONFIDENCE") orelse return 0.6;
+        return std.fmt.parseFloat(f64, std.mem.span(v)) catch 0.6;
     }
 
     /// DFlash2's chance for each held draft (the MTP head gives none: the lane core's per-depth rates stand).
