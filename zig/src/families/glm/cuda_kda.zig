@@ -16,11 +16,62 @@ pub const Kernels = struct {
     prep: cuda.Function,
     step: cuda.Function,
     out: cuda.Function,
+    chunk: ?Chunk = null, // prompt chunks in chunked (WY) form (Modules.load), else the three-kernel chain
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
         inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "out" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
+        k.chunk = null;
         return k;
+    }
+};
+
+/// glm_kda_chunk.cu: a prompt chunk's KDA in chunked (WY) form, one 256-thread block a head, 32-row sub-chunks in
+/// order on the state in registers. Prompt chunks start on multiples of 32 (the 2,048-row grid), so a row's bits
+/// depend only on its sub-chunk and the entering state, never on where its prompt chunk started.
+pub const Chunk = struct {
+    mod: cuda.Module,
+    f: cuda.Function,
+    smem: u32,
+
+    pub fn load(d: *const cuda.Driver) !Chunk {
+        var m = try cuda.Module.load(d, cuda.kernels.glm_kda_chunk);
+        errdefer m.unload();
+        const g = try m.global("tf_glm_kda_chunk_smem_v");
+        var buf = try cuda.DeviceBuffer.alloc(d, 8);
+        defer buf.free();
+        try buf.copyFrom(0, g.ptr, 8, null);
+        var raw: [8]u8 = undefined;
+        try buf.download(0, &raw);
+        const smem: u32 = @intCast(std.mem.readInt(i64, &raw, .little));
+        const f = try m.function("tf_glm_kda_chunk");
+        try f.allowDynamicShared(smem);
+        return .{ .mod = m, .f = f, .smem = smem };
+    }
+
+    pub fn unload(c: *Chunk) void {
+        c.mod.unload();
+    }
+
+    /// `rows` prompt rows of chain `c` from state_in into s.out and s.state_out (no replay saves: a chunk commits whole).
+    pub fn run(k: *const Chunk, stream: cuda.Stream, c: Chain, rows: usize, s: Saves) !void {
+        var a: cuda.Args = .{};
+        a.add(@as(c_int, @intCast(c.heads)));
+        a.add(c.p);
+        a.add(@as(c_int, @intCast(c.p_stride)));
+        a.add(@as(c_int, @intCast(c.b_off)));
+        a.add(c.a);
+        a.add(@as(c_int, @intCast(c.a_stride)));
+        a.add(c.g);
+        a.add(@as(c_int, @intCast(c.g_stride)));
+        for ([_]u64{ c.conv_state, c.conv_w, c.state_in, c.a_log, c.dt_bias, c.norm_w }) |v| a.add(v);
+        a.add(c.eps);
+        a.add(c.lower);
+        a.add(@as(c_int, @intCast(rows)));
+        a.add(@as(c_int, 0)); // off: the chunk starts on a sub-chunk boundary
+        a.add(s.out);
+        a.add(s.state_out);
+        try cuda.launch.launch(k.f, .{ .grid = .{ .x = @intCast(c.heads) }, .block = .{ .x = 256 }, .shared = k.smem }, stream, &a);
     }
 };
 

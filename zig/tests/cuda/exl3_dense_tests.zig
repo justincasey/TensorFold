@@ -1,4 +1,4 @@
-//! EXL3 dense prompt path: qlinear's dispatch, float64 references, chunk invariance, the engine's prompt bytes.
+//! EXL3 dense prompt path: qlinear's dispatch, float64 references, chunk invariance, the engine's prompt bytes, dense.
 const std = @import("std");
 const cuda = @import("cuda");
 const check = @import("check.zig");
@@ -40,6 +40,14 @@ pub fn run(r: *Rig, state: *Run, dir: []const u8) !void {
         };
         if (ok) check.pass("exl3.prompt.linear.chunks", .{});
     }
+    inline for (.{ .{ "exl3.dense.f64", denseF64 }, .{ "exl3.dense.rows", denseRows } }) |c| {
+        var ok = true;
+        c[1](r, &dense.lin) catch |e| {
+            state.fail(e, c[0]);
+            ok = false;
+        };
+        if (ok) check.pass(c[0], .{});
+    }
     if (pythonPrompt(r, &dense, dir) catch |e| blk: {
         state.fail(e, "exl3.prompt.python");
         break :blk false;
@@ -48,6 +56,7 @@ pub fn run(r: *Rig, state: *Run, dir: []const u8) !void {
         state.fail(e, "exl3.load.redsnow");
         break :blk false;
     }) check.pass("exl3.load.redsnow", .{});
+    denseBench(r, &dense.lin) catch |e| state.fail(e, "exl3.dense.bench");
 }
 
 /// Through qlinear.Linear's decode and prompt dispatch, 1, 17 and 300 rows byte-equal the direct block loop.
@@ -280,6 +289,118 @@ fn weight(r: *Rig, trellis: []const i16, suh: []const u16, svh: []const u16, k: 
         .stride_k = st.k,
         .stride_nb = st.nb,
     };
+}
+
+/// A weight uploaded in the stored layout, or in RED-SNOW's strips [N/128][K/16][8][W] (cuda_weights_rs.strips).
+fn denseWeight(r: *Rig, trellis: []const i16, suh: []const u16, svh: []const u16, k: usize, n: usize, halves: u32, strips: bool) !exl3.Weight {
+    if (!strips) return weight(r, trellis, suh, svh, k, n, halves, .mul1);
+    const kt = k / 16;
+    const nt = n / 16;
+    const tw = (exl3fmt.Width{ .halves = @intCast(halves) }).tileWords();
+    const out = try r.a.alloc(i16, trellis.len);
+    for (0..nt / 8) |jb| for (0..kt) |i| {
+        @memcpy(out[(jb * kt + i) * 8 * tw ..][0 .. 8 * tw], trellis[(i * nt + jb * 8) * tw ..][0 .. 8 * tw]);
+    };
+    var w = try weight(r, out, suh, svh, k, n, halves, .mul1);
+    const st = exl3.strides(k, n, halves, true);
+    w.stride_k = st.k;
+    w.stride_nb = st.nb;
+    return w;
+}
+
+/// exl3.Linear.dense at RED-SNOW's widths (5 to 8 bits, mul1) against float64, 64- and 128-row blocks and tails.
+fn denseF64(r: *Rig, lin: *const exl3.Linear) !void {
+    const cfgs = [_]struct { halves: u32, k: usize, n: usize, m: usize, strips: bool }{
+        .{ .halves = 10, .k = 1024, .n = 384, .m = 300, .strips = true },
+        .{ .halves = 12, .k = 2048, .n = 256, .m = 1000, .strips = true },
+        .{ .halves = 14, .k = 1024, .n = 512, .m = 77, .strips = true },
+        .{ .halves = 16, .k = 512, .n = 4096, .m = 1000, .strips = true }, // 8 x 32 blocks: 128 rows a block
+        .{ .halves = 16, .k = 1024, .n = 384, .m = 1000, .strips = false },
+    };
+    for (cfgs) |c| {
+        const width: exl3fmt.Width = .{ .halves = @intCast(c.halves) };
+        const trellis, const suh, const svh = try tensors(r, c.k, c.n, width);
+        const w = try denseWeight(r, trellis, suh, svh, c.k, c.n, c.halves, c.strips);
+        const x = try r.bfs(c.m * c.k, 1.0);
+        const ref = try promptReference(r, width, .mul1, trellis, c.k, c.n, x, suh, svh, c.m);
+        const dy = try r.zeros(c.m * c.n * 2);
+        const xh = try r.zeros(c.m * c.k * 2);
+        try lin.dense(r.s, w, try r.dev(std.mem.sliceAsBytes(x)), c.k, c.m, dy, c.n, .bf16, xh);
+        const id = try std.fmt.allocPrint(r.a, "exl3.dense.f64 halves={d} k={d} n={d} m={d}{s}", .{ c.halves, c.k, c.n, c.m, if (c.strips) " strips" else "" });
+        try exl3_tests.closeOut(r, id, dy, c.m * c.n, ref.want, ref.tol);
+    }
+}
+
+/// A row's dense bytes whatever its call's rows, block size, start, x stride or output columns; repeats are equal.
+fn denseRows(r: *Rig, lin: *const exl3.Linear) !void {
+    const k = 512;
+    const n = 4096;
+    const rows = 777; // 7 x 32 blocks of 128 rows; the splits run 64-row blocks
+    const halves = 12;
+    const trellis, const suh, const svh = try tensors(r, k, n, .{ .halves = halves });
+    const w = try denseWeight(r, trellis, suh, svh, k, n, halves, true);
+    const xs = k + 128; // x rows with a gap between them
+    const dx = try r.dev(std.mem.sliceAsBytes(try r.bfs(rows * xs, 1.0)));
+    const xh = try r.zeros(rows * k * 2);
+    const bytes = rows * n * 2;
+    const y0 = try r.zeros(bytes);
+    try lin.dense(r.s, w, dx, xs, rows, y0, n, .bf16, xh);
+    const want = try r.back(y0, bytes);
+    const y1 = try r.zeros(bytes);
+    try lin.dense(r.s, w, dx, xs, rows, y1, n, .bf16, xh);
+    try check.sameBytes("exl3.dense.rows repeat", try r.back(y1, bytes), want);
+    const y2 = try r.zeros(bytes);
+    const bounds = [_]usize{ 0, 64, 200, 713, rows };
+    for (bounds[0..4], bounds[1..]) |a, b| try lin.dense(r.s, w, dx + a * xs * 2, xs, b - a, y2 + a * n * 2, n, .bf16, xh);
+    try check.sameBytes("exl3.dense.rows splits", try r.back(y2, bytes), want);
+    const wide = n + 512; // columns 256.. of a wider output, as a composite linear's part
+    const y3 = try r.zeros(rows * wide * 2);
+    try lin.dense(r.s, w, dx, xs, rows, y3 + 256 * 2, wide, .bf16, xh);
+    const raw = try r.back(y3, rows * wide * 2);
+    const cut = try r.a.alloc(u8, bytes);
+    for (0..rows) |i| @memcpy(cut[i * n * 2 ..][0 .. n * 2], raw[(i * wide + 256) * 2 ..][0 .. n * 2]);
+    try check.sameBytes("exl3.dense.rows columns", cut, want);
+    const y4 = try r.zeros(rows * n * 4);
+    try lin.dense(r.s, w, dx, xs, rows, y4, n, .f32, xh);
+    const f = try r.back(y4, rows * n * 4);
+    const rounded = try r.a.alloc(u8, bytes);
+    for (0..rows * n) |i| {
+        const b = std.mem.readInt(u32, f[4 * i ..][0..4], .little);
+        std.mem.writeInt(u16, rounded[2 * i ..][0..2], @intCast((b + 0x7fff + ((b >> 16) & 1)) >> 16), .little);
+    }
+    try check.sameBytes("exl3.dense.rows fp32", rounded, want);
+}
+
+/// A 2048-row prompt call's milliseconds through dense and through matmul's 128-row blocks at RED-SNOW's shapes.
+fn denseBench(r: *Rig, lin: *const exl3.Linear) !void {
+    const m = 2048;
+    const shapes = [_][3]usize{ .{ 4096, 12288, 12 }, .{ 4096, 1536, 10 }, .{ 4096, 1024, 14 }, .{ 4096, 2048, 16 }, .{ 4096, 4096, 16 }, .{ 8192, 4096, 12 }, .{ 2048, 4096, 12 }, .{ 1536, 4096, 12 }, .{ 16384, 4096, 12 } };
+    for (shapes) |sh| {
+        const k = sh[0];
+        const n = sh[1];
+        const halves: u32 = @intCast(sh[2]);
+        const ones = try r.a.alloc(u16, @max(k, n));
+        @memset(ones, 0x3C00);
+        const st = exl3.strides(k, n, halves, true);
+        const w: exl3.Weight = .{ .trellis = try r.zeros(k * n * halves / 16), .suh = try r.dev(std.mem.sliceAsBytes(ones[0..k])), .svh = try r.dev(std.mem.sliceAsBytes(ones[0..n])), .k = @intCast(k), .n = @intCast(n), .halves = halves, .codebook = .mul1, .stride_k = st.k, .stride_nb = st.nb };
+        const dx = try r.dev(std.mem.sliceAsBytes(try r.bfs(m * k, 1.0)));
+        const dy = try r.zeros(m * n * 2);
+        const xh = try r.zeros(m * k * 2);
+        const z: u64 = if (exl3.plan(k, n, 192, 8).sk > 1) try exl3_tests.zeroed(r, exl3.Linear.zBytes(w, 128)) else 0;
+        const counters = try exl3_tests.zeroed(r, exl3.Linear.counterBytes(w));
+        var ms: [2]f64 = @splat(1e30);
+        for (0..2) |path| for (0..4) |rep| { // the best of three after a warm-up
+            try r.s.synchronize();
+            const t0 = check.now(r.gpu.io);
+            if (path == 0) try lin.dense(r.s, w, dx, k, m, dy, n, .bf16, xh) else {
+                var at: usize = 0;
+                while (at < m) : (at += 128) try lin.matmul(r.s, w, dx + at * k * 2, .bf16, 128, dy + at * n * 2, .bf16, xh, z, counters);
+            }
+            try r.s.synchronize();
+            if (rep > 0) ms[path] = @min(ms[path], @as(f64, @floatFromInt(check.now(r.gpu.io) - t0)) / 1e6);
+        };
+        std.debug.print("RESULT exl3.bench.dense k={d} n={d} halves={d} rows={d}: dense {d:.3} ms, 128-row blocks {d:.3} ms\n", .{ k, n, halves, m, ms[0], ms[1] });
+    }
 }
 
 /// The Python engine's f64 reference, with the row count a parameter.

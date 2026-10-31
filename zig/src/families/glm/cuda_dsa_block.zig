@@ -21,6 +21,7 @@ pub const Layer = struct {
     kv_norm: u64,
     q_b: projection.Proj,
     wk: u64,
+    wkt: u64 = 0, // wk per head transposed, [heads][lw][qk]: prompt rows' tensor-core absorb (RED-SNOW's loader), else 0
     wv: u64,
     o: projection.Proj,
     index: Index,
@@ -91,7 +92,7 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x:
     try attend(k, stream, l, c, s, 0, rows, pos, host_pos, nch, part_rows);
     const stamp = prof.span(k.prof, stream, .projections);
     defer stamp.end();
-    try latent.expandV(k.set, stream, s.ol, l.wv, s.vn, rows, l.heads, l.dv, l.lw);
+    try latent.expandV(k.set, stream, s.ol, l.wv, s.vn, rows, l.heads, l.dv, l.lw, l.wkt != 0);
 }
 
 /// Whether a sequence at `host_pos` has rows past the dense limit among its next `rows` (the sparse pass).
@@ -117,7 +118,7 @@ pub fn prepareProfile(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, 
     const ix = l.index;
     try projection.matmul(set, stream, ix.kw, x, x_stride, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
     try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);
-    try latent.absorbQ(set, stream, s.q, l.wk, s.qa, rows, l.heads, l.qk, l.lw);
+    try latent.absorbQ(set, stream, s.q, l.wk, l.wkt, s.qa, rows, l.heads, l.qk, l.lw);
     if (qi) try projection.matmul(set, stream, ix.qb, s.qr, l.q_lora, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
 }
 
@@ -151,7 +152,15 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
         try sparse.selectTokensProfile(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, t, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.split, k.prof);
         stamp = prof.span(k.prof, stream, .mla);
         defer stamp.end();
-        try latent.sparseAttentionFormat(set, stream, v.qa, c.lc, c.ls, t, v.tokens, v.counts, sparse.width, v.partials, v.ol, rows, l.heads, l.lw, scale);
+        // part_rows-row calls (a prompt chunk's partials stay 512 rows deep); each row's sums are its own and every
+        // call keeps the whole call's head block, so the bits are those of one call over all rows
+        const hb = latent.headBlock(rows);
+        var r: usize = 0;
+        while (r < rows) : (r += part_rows) {
+            const n = @min(part_rows, rows - r);
+            const off = r * l.heads * l.lw * 2;
+            try latent.sparseAttentionBlock(set, stream, v.qa + off, c.lc, c.ls, t, v.tokens + r * sparse.width * 4, v.counts + r * 4, sparse.width, v.partials, v.ol + off, n, l.heads, l.lw, scale, hb);
+        }
     }
 }
 

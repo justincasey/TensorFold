@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 
 #include "exl3_decode.cuh"
+#include "exl3_stage.cuh"
 
 namespace tf_exl3 {
 
@@ -31,6 +32,29 @@ struct RotInArgs {
     half* xh;                // fp16 [m, k] out
     int x_dtype;
     int m, k;
+};
+
+// Prompt rows: x's rows `x_stride` apart (bf16) rotated as tf_exl3_rot_in rotates them into contiguous xh.
+struct RotRowsArgs {
+    const __nv_bfloat16* x;
+    long long x_stride;
+    const half* suh;
+    half* xh;
+    int m, k;
+};
+
+struct DenseArgs {
+    const half* xh;          // fp16 [m, k], the hadamard-rotated inputs
+    const uint32_t* t;       // trellis words
+    long long stride_k;      // words between k tiles
+    long long stride_nb;     // words between 128-column blocks
+    const half* svh;         // fp16 [n], output hadamard scales
+    const half* bias;        // fp16 [n] or null
+    void* y;                 // output rows, y_stride elements apart
+    long long y_stride;
+    int y_dtype;
+    int n, m, k;
+    int group;               // row blocks a column block sweeps before the next column block starts
 };
 
 __device__ __forceinline__ void load4(const void* p, int dtype, size_t i, float (&v)[4]) {
@@ -114,6 +138,115 @@ extern "C" __global__ void __launch_bounds__(128) tf_exl3_rot_in(RotInArgs a) {
 #pragma unroll
     for (int j = 0; j < 4; ++j) v[j] *= HAD_SCALE;
     store4(a.xh, F16, (size_t)row * a.k + k, v);
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_exl3_rot_rows(RotRowsArgs a) {
+    const int blk = blockIdx.x * 4 + (threadIdx.x >> 5), row = blockIdx.y, lane = threadIdx.x & 31;
+    if (blk * 128 >= a.k) return;
+    const int k = blk * 128 + 4 * lane;
+    float v[4], s[4];
+    load4(a.x + (size_t)row * a.x_stride, BF16, k, v);
+    load4(a.suh, F16, k, s);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] *= s[j];
+    fwht128(v, lane);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] *= HAD_SCALE;
+    store4(a.xh, F16, (size_t)row * a.k + k, v);
+}
+
+constexpr int DBK = 32, DKT = DBK / 16, DXS = DBK + 8, DSTAGES = 3, DES = 132;   // dense stages; DES: sums' row stride
+
+// Prompt rows (mul1): warp j sums column tile j over all K in k order, each tile decoded once per BM rows.
+template <int K2, int BM>
+__device__ __forceinline__ void dense_body(const DenseArgs& a) {
+    using namespace tf_exl3_prompt;
+    constexpr int TW = tile_words<K2>(), MT = BM / 16;
+    constexpr int XB = BM * DXS * 2, SB = XB + DKT * 8 * TW * 4;   // a stage's x bytes, then its weight tiles
+    extern __shared__ __align__(16) unsigned char dsm[];
+    const int NB = a.n >> 7, RB = (a.m + BM - 1) / BM, K = a.k;
+    const int span = a.group * NB, first = (int)blockIdx.x / span * a.group, inner = (int)blockIdx.x % span;
+    const int rows = imin(a.group, RB - first);
+    const int rb = first + inner % rows, nb = inner / rows;
+    const int row0 = rb * BM, MB = imin(BM, a.m - row0);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const half* xh = a.xh + (size_t)row0 * K;
+    const uint32_t* T = a.t + nb * a.stride_nb;
+    const int chunks = K / DBK;
+    auto load = [&](int c) {
+        unsigned char* st = dsm + (c % DSTAGES) * SB;
+        half* xs = reinterpret_cast<half*>(st);
+        for (int i = threadIdx.x; i < BM * (DBK / 8); i += 256) {
+            const int r = i / (DBK / 8), j = i % (DBK / 8);
+            cp_async16(xs + r * DXS + j * 8, xh + (size_t)(r < MB ? r : 0) * K + c * DBK + j * 8, r < MB);
+        }
+        uint32_t* ws = reinterpret_cast<uint32_t*>(st + XB);
+        for (int i = threadIdx.x; i < DKT * 2 * TW; i += 256) {   // a k tile's 8 tiles: 8 TW words in 2 TW pieces
+            const int kk = i / (2 * TW), p = i % (2 * TW);
+            cp_async16(ws + kk * 8 * TW + p * 4, T + (size_t)(c * DKT + kk) * a.stride_k + p * 4, true);
+        }
+    };
+    float acc[MT][2][4];
+#pragma unroll
+    for (int q = 0; q < MT; ++q)
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[q][h][e] = 0.f;
+#pragma unroll
+    for (int c = 0; c < DSTAGES - 1; ++c) {
+        if (c < chunks) load(c);
+        cp_async_commit();
+    }
+#pragma unroll 1
+    for (int c = 0; c < chunks; ++c) {
+        cp_async_wait<DSTAGES - 2>();
+        __syncthreads();
+        if (c + DSTAGES - 1 < chunks) load(c + DSTAGES - 1);
+        cp_async_commit();
+        const unsigned char* st = dsm + (c % DSTAGES) * SB;
+        const half* xs = reinterpret_cast<const half*>(st);
+        const uint32_t* ws = reinterpret_cast<const uint32_t*>(st + XB);
+#pragma unroll
+        for (int kk = 0; kk < DKT; ++kk) {
+            uint32_t b0[2], b1[2];
+            decode_tile_k<K2, CB_MUL1>(ws + (kk * 8 + warp) * TW, lane, b0, b1);
+#pragma unroll
+            for (int q = 0; q < MT; ++q) {
+                if (q * 16 < MB) {
+                    uint32_t u[4];
+                    ldmatrix_x4(u, xs + (q * 16 + (lane & 15)) * DXS + kk * 16 + (lane >> 4) * 8);
+                    mma16816(acc[q][0], u, b0);
+                    mma16816(acc[q][1], u, b1);
+                }
+            }
+        }
+    }
+    cp_async_wait<0>();
+    __syncthreads();   // the stages become the epilogue's sums
+    float* E = reinterpret_cast<float*>(dsm);
+    const int col0 = nb * 128;
+#pragma unroll
+    for (int hf = 0; hf < BM / 64; ++hf) {
+        if (hf * 64 < MB) {
+            if (hf) __syncthreads();   // the previous half's rows are read
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    float* p = E + (q * 16 + g) * DES + warp * 16 + h * 8 + 2 * t;
+                    *reinterpret_cast<float2*>(p) = make_float2(acc[hf * 4 + q][h][0], acc[hf * 4 + q][h][1]);
+                    *reinterpret_cast<float2*>(p + 8 * DES) = make_float2(acc[hf * 4 + q][h][2], acc[hf * 4 + q][h][3]);
+                }
+            __syncthreads();
+            for (int r = warp; r < 64 && hf * 64 + r < MB; r += 8) {
+                const float4 u = *reinterpret_cast<const float4*>(E + r * DES + 4 * lane);
+                float v[4] = {u.x, u.y, u.z, u.w};
+                finish(v, lane, a.svh, a.bias, col0 + 4 * lane);
+                store4(a.y, a.y_dtype, (size_t)(row0 + hf * 64 + r) * a.y_stride + col0 + 4 * lane, v);
+            }
+        }
+    }
 }
 
 
@@ -271,4 +404,17 @@ TF_EXL3_CODEBOOK(1) // mcg
 TF_EXL3_CODEBOOK(0) // inst3
 #undef TF_EXL3_CODEBOOK
 #undef TF_EXL3_WIDTHS
+
+// The prompt kernels: mul1, every width the decode kernels serve but 15 halves, 64- and 128-row blocks of 8 warps.
+#define TF_EXL3_DENSE(K2)                                                                                            \
+    extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_dense_##K2##_64(tf_exl3::DenseArgs a) {             \
+        tf_exl3::dense_body<K2, 64>(a);                                                                              \
+    }                                                                                                                \
+    extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_dense_##K2##_128(tf_exl3::DenseArgs a) {            \
+        tf_exl3::dense_body<K2, 128>(a);                                                                             \
+    }
+TF_EXL3_DENSE(2) TF_EXL3_DENSE(3) TF_EXL3_DENSE(4) TF_EXL3_DENSE(5) TF_EXL3_DENSE(6) TF_EXL3_DENSE(7)
+TF_EXL3_DENSE(8) TF_EXL3_DENSE(9) TF_EXL3_DENSE(10) TF_EXL3_DENSE(11) TF_EXL3_DENSE(12) TF_EXL3_DENSE(13)
+TF_EXL3_DENSE(14) TF_EXL3_DENSE(16)
+#undef TF_EXL3_DENSE
 }  // namespace tf_exl3

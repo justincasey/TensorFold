@@ -61,6 +61,7 @@ pub const Experts = struct {
     dk2: u64,
     book: common.Codebook = .mcg, // one codebook a layer (its every expert's marker)
     uniform: u32 = 0, // the one half-bit width of every projection of every expert, else 0
+    widest: u32 = 16, // the widest half-bit width of any projection of any expert (the prompt kernels' tile stride)
     shx: bool, // every expert's gate and up share one input rotation: a prompt rotates a row once, not once a pick
 };
 
@@ -73,6 +74,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
     var book: ?common.Codebook = null;
     var uniform: ?i32 = null;
     var mixed = false;
+    var widest: i32 = 0;
     const Mat = struct { k: usize, n: usize, by_cols: bool };
     const mats = [_]Mat{
         .{ .k = dims, .n = inter, .by_cols = true },
@@ -100,6 +102,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
                 mixed = true;
             }) else uniform = k2;
             k2s[e] = k2;
+            widest = @max(widest, k2);
             offs[e] = at;
             const tile: usize = 16 * @as(usize, @intCast(k2)); // a 16 x 16 tile's bytes (the trellis's last axis, in bytes)
             if (tile != t.dim(2) * 2) return error.NotExl3Experts;
@@ -138,6 +141,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
     }
     out.book = book orelse return error.NotExl3Experts;
     out.uniform = if (mixed) 0 else @intCast(uniform.?);
+    out.widest = @intCast(widest);
     return out;
 }
 
@@ -163,9 +167,10 @@ const common = cuda.exl3_experts;
 pub const Scratch = struct { picks: u64, xg: u64, xu: u64, z: u64 };
 pub const top_k = 8;
 /// Rows a call to the common experts takes: each call reads every expert's weights, so a prompt pass needs few calls.
-pub const chunk_rows = 1024;
+/// A whole prompt chunk is one call (each weight read once a chunk).
+pub const chunk_rows = @import("cuda_state.zig").prefill_rows;
 fn layer(w: Experts, count: usize, dims: usize, width: usize, limit: f32) common.Layer {
-    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.gk2, .up_k2 = w.uk2, .down_k2 = w.dk2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = w.book, .limit = limit, .act_mode = 0, .uniform_k2 = w.uniform, .shared_input = w.shx };
+    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.gk2, .up_k2 = w.uk2, .down_k2 = w.dk2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = w.book, .limit = limit, .act_mode = 0, .uniform_k2 = w.uniform, .max_k2 = w.widest, .shared_input = w.shx };
 }
 fn shape(dims: usize, width: usize, book: common.Codebook, uniform: u32) common.Layer {
     const w: Experts = .{ .gt = 0, .ut = 0, .dt = 0, .gk2 = 0, .uk2 = 0, .dk2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .book = book, .uniform = uniform, .shx = false };
@@ -181,14 +186,18 @@ pub fn scratchBytes(rows: usize, dims: usize, width: usize, prefill: bool, shx: 
     const n: usize = @min(rows, chunk_rows);
     var l = shape(dims, width, book, uniform);
     l.shared_input = shx;
-    const slots_ = picksBytes(rows) + (common.scratchBytes(shape(dims, width, book, 0), n, top_k) catch unreachable);
-    if (prefill and common.prompt.eligible(l)) return .{ @max(slots_, picksBytes(rows) + (common.prompt.bytes(l, n, top_k) catch unreachable)), 4, 4, 4 };
-    return .{ slots_, 4, 4, 4 };
+    // a prompt chunk on eligible experts runs only the fused kernels (run: fused = prompt and eligible)
+    if (prefill and common.prompt.eligible(l)) return .{ picksBytes(rows) + (common.prompt.bytes(l, n, top_k) catch unreachable), 4, 4, 4 };
+    return .{ picksBytes(rows) + (common.scratchBytes(shape(dims, width, book, 0), n, top_k) catch unreachable), 4, 4, 4 };
 }
 /// `height` rows of `width` bytes, `spitch` apart at `src`, to `dpitch` apart at `dst`, in one call.
 fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usize, width: usize, height: usize, what: []const u8) !void {
     const m: cuda.abi.Memcpy2D = .{ .src = src, .src_pitch = spitch, .dst = dst, .dst_pitch = dpitch, .width = width, .height = height };
     try stream.d.check(stream.d.api.cuMemcpy2DAsync_v2(&m, stream.handle), what);
+}
+/// Bytes of a slot row's element in `ey`: bf16 when a prompt call takes the fused kernels, else fp32.
+pub fn slotBytes(w: Experts, count: usize, dims: usize, width: usize, prompt: bool) usize {
+    return if (prompt and common.prompt.eligible(layer(w, count, dims, width, 0))) 2 else 4;
 }
 pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, prompt: bool, ey: u64, xd: u64) !void {
     _ = xd;
@@ -202,16 +211,14 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
     while (at < rows) : (at += chunk_rows) {
         const n: usize = @min(chunk_rows, rows - at);
         try copyRows(stream, sc.picks, top_k * 4, picks + at * slots * 4, slots * 4, top_k * 4, n, "EXL3 compact route rows");
-        const output = if (fused) blk: {
+        if (fused) {
             const scratch = try common.prompt.scratch(arena, l, cap, top_k);
-            try k.prompt.run(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, sc.picks, n, scratch, plan_buf);
-            break :blk scratch.y;
-        } else blk: {
-            const scratch = try common.scratch(arena, l, cap, top_k);
-            try k.runSlots(stream, l, x + at * x_stride * 2, x_stride, .bf16, sc.picks, n, scratch);
-            break :blk scratch.y;
-        };
-        try copyRows(stream, ey + at * slots * dims * 4, slots * dims * 4, output, top_k * dims * 4, top_k * dims * 4, n, "EXL3 routed output slots");
+            try k.prompt.run(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, sc.picks, n, scratch, plan_buf, ey + at * slots * dims * 2, slots);
+            continue;
+        }
+        const scratch = try common.scratch(arena, l, cap, top_k);
+        try k.runSlots(stream, l, x + at * x_stride * 2, x_stride, .bf16, sc.picks, n, scratch);
+        try copyRows(stream, ey + at * slots * dims * 4, slots * dims * 4, scratch.y, top_k * dims * 4, top_k * dims * 4, n, "EXL3 routed output slots");
     }
 }
 

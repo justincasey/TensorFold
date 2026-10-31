@@ -164,6 +164,20 @@ pub fn dsa(L: anytype, i: u32) !dsa_block.Layer {
     const total = c.mla_heads * per;
     for (h.lo..h.hi) |head| try L.rows(kv_b, head * per, head * per + qk, total, .bf16);
     const wk = try L.put("layers.{d}.dsa.absorb.wk", .{i});
+    // wk per head transposed ([heads][lw][qk]) for the prompt rows' tensor-core absorb: the same rows, rewritten
+    for (h.lo..h.hi) |head| try L.rows(kv_b, head * per, head * per + qk, total, .bf16);
+    {
+        const nh = h.len();
+        const lw: usize = c.kv_lora;
+        const src = try L.gpa.dupe(u8, L.host.items);
+        defer L.gpa.free(src);
+        const s16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, src));
+        const d16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, L.host.items));
+        for (0..nh) |hh| for (0..qk) |kk| for (0..lw) |nn| {
+            d16[(hh * lw + nn) * qk + kk] = s16[(hh * qk + kk) * lw + nn];
+        };
+    }
+    const wkt = try L.put("layers.{d}.dsa.absorb.wkt", .{i});
     for (h.lo..h.hi) |head| try L.rows(kv_b, head * per + qk, (head + 1) * per, total, .bf16);
     const wv = try L.put("layers.{d}.dsa.absorb.wv", .{i});
     const o = try one(L, try layerGroup(L, i, "self_attn.o_proj", .{ .in = heads(h, c.v_dim) }));
@@ -185,6 +199,7 @@ pub fn dsa(L: anytype, i: u32) !dsa_block.Layer {
         .kv_norm = kv_norm,
         .q_b = .{ .bf16 = q_b },
         .wk = wk,
+        .wkt = wkt,
         .wv = wv,
         .o = .{ .bf16 = o },
         .index = .{ .kw = .{ .bf16 = kw }, .gate = gate, .ln_w = ln_w, .ln_b = ln_b, .ape = ape, .qb = .{ .bf16 = qb }, .heads = c.i_heads, .d = c.i_dim },
@@ -231,11 +246,11 @@ fn noBf16(_: *const anyopaque, _: cuda.Stream, _: u64, _: usize, _: u64, _: u64,
 }
 
 /// The head's rank rows as bf16 [n][k] for the 4-bit draft head: the identity's rows through the EXL3 linear
-/// (fp32 W[k][n] in 128-row passes), transposed and rounded on the host. The caller frees the buffer.
+/// (fp32 W[k][n] in 32-row passes), transposed and rounded on the host. The caller frees the buffer.
 pub fn headBf16(L: anytype, id: u64, n: usize, k: usize) !cuda.DeviceBuffer {
     const r = L.w.xl.?;
     const l = r.find(id) orelse return error.Exl3LinearMissing;
-    const pass = 128;
+    const pass = 32; // under xlin.prompt_rows: the decode kernel's bits
     const host = try L.gpa.alloc(u16, n * k);
     defer L.gpa.free(host);
     const eye = try L.gpa.alloc(u16, pass * k);

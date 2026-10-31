@@ -136,7 +136,8 @@ struct Tile {
 
 template <int BM, int BN, int KS, int STAGES, int WM, int WN, bool SPLIT, bool SLICE = false>
 __device__ void bmm_tiles(const __nv_bfloat16* x, const __nv_bfloat16* w, void* out, int64_t m, int64_t x_stride,
-                          int64_t n, int64_t k, int sk, int f32) {
+                          int64_t n, int64_t k, int sk, int f32, int64_t ldo = 0) {
+  if (ldo == 0) ldo = n;  // out's row stride (elements)
   using T = Tile<BM, BN, KS, STAGES, WM, WN>;
   constexpr int MT = BM / WM / 16, NT = BN / WN / 8;
   static_assert(MT >= 1 && (NT == 1 || NT % 2 == 0), "a warp's tile is whole m16 rows and one or pairs of n8 columns");
@@ -280,10 +281,10 @@ __device__ void bmm_tiles(const __nv_bfloat16* x, const __nv_bfloat16* w, void* 
     const int64_t row = bm0 + r, col = bn0 + v * (f32 ? 4 : 8);
     if (row >= m || col >= n) continue;
     if (f32)
-      *reinterpret_cast<float4*>(static_cast<float*>(out) + row * n + col) =
+      *reinterpret_cast<float4*>(static_cast<float*>(out) + row * ldo + col) =
           *reinterpret_cast<const float4*>(&so[r * T::LDO + v * 4]);
     else
-      *reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(out) + row * n + col) =
+      *reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(out) + row * ldo + col) =
           *reinterpret_cast<const uint4*>(&sh[r * T::LDH + v * 8]);
   }
 }
@@ -302,6 +303,15 @@ extern "C" __global__ void __launch_bounds__(256, 2)
     tf_glm_bmm_tile1(const __nv_bfloat16* x, const __nv_bfloat16* w, void* out, int64_t m, int64_t x_stride,
                      int64_t n, int64_t k, int sk, int f32) {
   glm_bmm::bmm_tiles<128, 128, 32, 3, 2, 4, false>(x, w, out, m, x_stride, n, k, sk, f32);
+}
+
+// One small bf16 matmul per head (blockIdx.z): out_h [m][n] (row stride ldo) = x_h [m][k] (stride x_stride) . w_h [n][k];
+// heads xh, wh, oh elements apart. The latent absorb and expand of prompt rows (tf_glm_bmm_tile1's tiles).
+extern "C" __global__ void __launch_bounds__(256, 2)
+    tf_glm_bmm_heads(const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* out, int64_t m, int64_t x_stride,
+                     int64_t n, int64_t k, int64_t xh, int64_t wh, int64_t oh, int64_t ldo) {
+  const int64_t h = blockIdx.z;
+  glm_bmm::bmm_tiles<128, 128, 32, 3, 2, 4, false>(x + h * xh, w + h * wh, out + h * oh, m, x_stride, n, k, 1, 0, ldo);
 }
 
 // glue._router_part on aligned rows: part[s][m][e] = x[m] . w[e] over K slice s, tf_glm_router_part's chain, tiled.
